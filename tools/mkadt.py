@@ -2,7 +2,13 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the sweet live FDT. Usage:
+
+  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]                  # sweet
+  mkadt.py OUT.adt --board apollo --phys-base HEX --mem-size HEX  # Mi 10T (Pro)
+
+For apollo the RAM window has no default on purpose: take it from the
+phone's live FDT with tools/fdtmem.py (see PORTING-APOLLO.md).
 """
 import hashlib, os, struct, sys
 
@@ -34,6 +40,34 @@ QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
+
+# Per-board differences. 'xiaomi,sweet' stays in every root compatible:
+# SweetPlatformExpert and the SWEET drivers match on it.
+# apollo values: mainline sm8250.dtsi + sm8250-xiaomi-apollo.dts (PORTING-APOLLO.md).
+BOARDS = {
+    'sweet': dict(
+        soc_compat=['xiaomi,sweet', 'qcom,sm7150'],
+        vtimer_intid=VTIMER_INTID,
+        cpu_compat='qcom,kryo470',
+        # cores 0-5 Cortex-A55, 6-7 Cortex-A76
+        cpu_hz=[1804800000] * 6 + [2304000000] * 2,
+        memory_hz=1866000000,
+        keys=None,  # kernel defaults: PM6150L GPIO2 (SID 4) for volume up
+    ),
+    'apollo': dict(
+        soc_compat=['xiaomi,sweet', 'xiaomi,apollo', 'qcom,sm8250'],
+        # sm8250.dtsi timer: virtual timer <GIC_PPI 11> = INTID 27 (sweet: 19).
+        # The shim's no-payload probe confirms it on the phone.
+        vtimer_intid=27,
+        cpu_compat='qcom,kryo585',
+        # cores 0-3 Cortex-A55, 4-6 Cortex-A77, 7 Cortex-A77 prime
+        cpu_hz=[1804800000] * 4 + [2419200000] * 3 + [2841600000],
+        memory_hz=2750000000,
+        # Volume up: PM8150 GPIO6 (SID 0, peripheral 0xc5, gpio-keys in the
+        # apollo DTS). Power / volume down: PM8150 PON (PPID 0x008), as on sweet.
+        keys=dict(volup_ppid=0x0c5, volup_base=0xc500),
+    ),
+}
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
@@ -68,10 +102,16 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, mem_size=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    b = BOARDS[board]
+    if phys_base is None or mem_size is None:
+        if board != 'sweet' and not qemu:
+            raise SystemExit(f'--board {board}: give --phys-base and --mem-size '
+                             '(tools/fdtmem.py LIVE.dtb prints them)')
+        phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+    vtimer_intid = QEMU_VTIMER_INTID if qemu else b['vtimer_intid']
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -128,7 +168,7 @@ def build(seed=None, qemu=False, highmem=False):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
+            ('compatible', cstr(b['cpu_compat']) + cstr('ARM,v8')),
             ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
@@ -139,9 +179,9 @@ def build(seed=None, qemu=False, highmem=False):
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
+            ('clock-frequency', u32(b['cpu_hz'][core])),
             ('bus-frequency', u32(100000000)),
-            ('memory-frequency', u32(1866000000)),
+            ('memory-frequency', u32(b['memory_hz'])),
             ('peripheral-frequency', u32(timebase)),
             ('fixed-frequency', u32(timebase)),
         ]))
@@ -152,7 +192,7 @@ def build(seed=None, qemu=False, highmem=False):
         ph(),
         ('compatible', cstr('arm,gic-v3')),
         ('interrupt-controller', b''),
-        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
+        ('virtual-timer-intid', u32(vtimer_intid)),
         ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
     ])
     arm_io = node('arm-io', [
@@ -209,6 +249,15 @@ def build(seed=None, qemu=False, highmem=False):
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
+    # Board key wiring for bsd/dev/sweet_keys.c (patch 0082); absent = sweet.
+    extra = []
+    if b['keys']:
+        extra.append(node('sweet-keys', [
+            ph(),
+            ('volup-ppid', u32(b['keys']['volup_ppid'])),
+            ('volup-base', u32(b['keys']['volup_base'])),
+        ]))
+
     product_props = d22ap_product()
     product = [node('product', [ph()] + product_props)] if product_props else []
 
@@ -217,18 +266,32 @@ def build(seed=None, qemu=False, highmem=False):
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + b''.join(cstr(c) for c in b['soc_compat']) + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + extra + product + ([] if qemu else [ufs]))
+
+
+def _opt(name, conv=str, default=None):
+    if name in sys.argv:
+        i = sys.argv.index(name)
+        if i + 1 >= len(sys.argv):
+            raise SystemExit(f'{name} needs a value')
+        return conv(sys.argv[i + 1])
+    return default
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    board = _opt('--board', default='sweet')
+    if board not in BOARDS:
+        raise SystemExit(f'unknown --board {board} ({", ".join(BOARDS)})')
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, board=board,
+                 phys_base=_opt('--phys-base', lambda x: int(x, 0)),
+                 mem_size=_opt('--mem-size', lambda x: int(x, 0)))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

@@ -11,13 +11,8 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "board.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
-#define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0c264000UL
-
-#define GICD_BASE		0x17a00000UL
-#define GICR_BASE		0x17a60000UL
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -30,8 +25,6 @@
 #define GICR_ISPENDR0		(GICR_SGI + 0x200)
 #define GICR_ISACTIVER0		(GICR_SGI + 0x300)
 #define GICR_ICFGR1		(GICR_SGI + 0xc04)
-#define VTIMER_INTID		19	/* DT: <GIC_PPI 3 ...>, not the usual 27 */
-#define PTIMER_INTID		18	/* DT: <GIC_PPI 2 ...> */
 #define SGI_INTID		1
 
 #define PSCI_VERSION		0x84000000UL
@@ -44,8 +37,6 @@
 #define PSCI_SYSTEM_SUSPEND	0xc400000eUL
 #define PSCI_SYSTEM_RESET2	0xc4000012UL
 #define SMCCC_VERSION		0x80000000UL
-
-#define NR_CPUS			8
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #define wsr(r, v) __asm__ volatile("msr " r ", %0" : : "r"((uint64_t)(v)))
@@ -60,6 +51,7 @@ extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
 static volatile uint64_t sec_mpidr[NR_CPUS];
+static volatile uint64_t sec_midr[NR_CPUS], sec_mmfr0[NR_CPUS], sec_isar0[NR_CPUS];
 static volatile uint64_t sec_probe[4];	/* CPU1 redistributor write test */
 static volatile uint32_t irq_count, irq_other, irq_last;
 static volatile int irq_src;
@@ -106,10 +98,14 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 	con_skip();
 	con_str("RESET", after_s > 20 ? "in 40s" : "in 20s");
 	delay_ms(after_s * 1000);
+#if HAVE_IMEM_RESTART
 	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
+#endif
 	__asm__ volatile("dsb sy" ::: "memory");
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+#if HAVE_PSHOLD
 	wr32(PSHOLD, 0);
+#endif
 	for (;;)
 		__asm__ volatile("wfe");
 }
@@ -128,7 +124,7 @@ static void irq_handler(void)
 		irq_count++;
 	else
 		irq_other++;
-	if (id == VTIMER_INTID)
+	if (id == VTIMER_INTID || id == ALT_VTIMER_INTID)
 		wsr("cntv_tval_el0", rsr("cntfrq_el0") / 100);	/* 10 ms */
 	else if (id == PTIMER_INTID)
 		wsr("cntp_tval_el0", rsr("cntfrq_el0") / 100);
@@ -167,6 +163,10 @@ static uintptr_t find_gicr(void);
 
 void secondary_main(uint64_t idx)
 {
+	sec_midr[idx] = rsr("midr_el1");
+	sec_mmfr0[idx] = rsr("id_aa64mmfr0_el1");
+	sec_isar0[idx] = rsr("id_aa64isar0_el1");
+	__asm__ volatile("dsb sy" ::: "memory");
 	sec_mpidr[idx] = rsr("mpidr_el1") | (1ULL << 63);
 	if (idx == 1) {
 		uintptr_t r = find_gicr();
@@ -183,23 +183,40 @@ void secondary_main(uint64_t idx)
 	smc(PSCI_CPU_OFF, 0, 0, 0);
 }
 
-static void __attribute__((unused)) test_smp(void)
+/*
+ * Per-core features that decide the iOS port: 16K granule (TGran16,
+ * ID_AA64MMFR0[23:20], 1 or 2 = supported) and LSE atomics (ID_AA64ISAR0
+ * [23:20] = 2), which the A11 userland uses. "f=" packs tg16<<4 | atomic.
+ */
+static uint32_t feat(uint64_t mmfr0, uint64_t isar0)
+{
+	return (uint32_t)(((mmfr0 >> 20) & 0xf) << 4 | ((isar0 >> 20) & 0xf));
+}
+
+static void test_smp(void)
 {
 	stage = "smp";
 	uint64_t self = rsr("mpidr_el1") & 0xffffff;
 	int64_t ret[NR_CPUS];
 
+	con_hex2("CPU0", "midr=", (uint32_t)rsr("midr_el1"), "f=",
+		 feat(rsr("id_aa64mmfr0_el1"), rsr("id_aa64isar0_el1")));
 	for (int i = 1; i < NR_CPUS; i++)
 		ret[i] = smc(PSCI_CPU_ON, (uint64_t)i << 8, (uintptr_t)secondary_entry, i);
 	delay_ms(500);
 	for (int i = 1; i < NR_CPUS; i++) {
 		char label[] = "CPU0";
 		label[3] = '0' + i;
-		if (((uint64_t)i << 8) == self)
+		if (((uint64_t)i << 8) == self) {
 			con_str(label, "is boot cpu");
-		else
-			con_hex2(label, "ret=", (uint32_t)ret[i], "mpidr=",
-				 (uint32_t)sec_mpidr[i] | (sec_mpidr[i] ? 0 : 0xdead0000));
+			continue;
+		}
+		if (!sec_mpidr[i]) {
+			con_hex2(label, "ret=", (uint32_t)ret[i], "mpidr=", 0xdead0000);
+			continue;
+		}
+		con_hex2(label, "midr=", (uint32_t)sec_midr[i], "f=",
+			 feat(sec_mmfr0[i], sec_isar0[i]));
 	}
 }
 
@@ -319,7 +336,10 @@ static void test_gic(void)
 	uint32_t pri_before = rd32(r + GICR_IPRIORITYR + 16);	/* INTIDs 16..19 */
 	for (int id = 0; id < 32; id++)
 		wr8(r + GICR_IPRIORITYR + id, 0xa0);
-	wr32(r + GICR_ISENABLER0, (1U << VTIMER_INTID) | (1U << PTIMER_INTID) | (1U << SGI_INTID));
+	/* Both vtimer numberings: the board's and the other Qualcomm one, so a
+	 * wrong guess shows up as "last=" instead of a silent hang. */
+	wr32(r + GICR_ISENABLER0, (1U << VTIMER_INTID) | (1U << ALT_VTIMER_INTID) |
+	     (1U << PTIMER_INTID) | (1U << SGI_INTID));
 	con_hex2("ENABLE", "was=", en_before, "now=", rd32(r + GICR_ISENABLER0));
 	(void)grp;
 	(void)pri_before;
@@ -383,11 +403,28 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 
-	/* No payload: probe the internal UFS while the MMU is still off. */
+	/*
+	 * No payload: hardware probe, two screens, MMU off, nothing written
+	 * to storage. Page 1: CPU features of every core (PSCI CPU_ON),
+	 * PSCI version, GICv3 + virtual timer + SGI. Page 2: internal UFS.
+	 */
+	con_str("BOARD", BOARD_NAME);
+	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "smccc=", smc(SMCCC_VERSION, 0, 0, 0));
+	con_skip();
+	test_smp();
+	con_skip();
+	test_gic();
+	con_skip();
+	con_str("PAGE1", "done, UFS page in 60s");
+	delay_ms(60000);
+
 	stage = "ufs";
+	con_clear(RED);
+	con_str("BOARD", BOARD_NAME);
+	con_skip();
 	test_ufs();
 	con_skip();
-	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
+	/* Keep the probe results on screen; reset after 3 min. */
 	con_str("UFS", "probe done, reset in ~3 min");
 	delay_ms(180000);
 	reset(20);
