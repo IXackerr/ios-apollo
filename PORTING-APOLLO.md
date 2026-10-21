@@ -80,7 +80,7 @@ noted, otherwise from the mainline-based apollo kernel
 ## Boot args for the first apollo kernel boots
 
 ```
-debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress
+debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress
 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1
 wdt_test=no_user_checkin wdt=-1 launchd_unsecure_cache=1
 sweettouch=0 sweetusb=0
