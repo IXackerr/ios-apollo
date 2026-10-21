@@ -1,0 +1,740 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/sweet_nt36675.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_nt36675.c
+@@ -0,0 +1,706 @@
++/*
++ * apollo touch: Novatek NT36675 in-cell controller on QUP0 SE4 (GENI SPI).
++ *
++ * Selected by an ADT /sweet-touch node with compatible "novatek,nt36675";
++ * its "firmware" property holds the IC firmware (the IC has no flash, so
++ * the firmware goes to its SRAM on every boot). One kernel thread brings
++ * the IC up and polls the TLMM edge latch of the interrupt pin, reading a
++ * report on each rising edge. Same sequence as shim/touch.c, which was
++ * verified on the phone. Panel power comes from the bootloader.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++bool sweet_nt36675_start(void);
++
++#define GCC_PA		0x00100000u
++#define GCC_VOTE	0x52008u
++#define GCC_SE4_RCG	0x174d0u
++#define SE_PA		0x00990000u
++#define NORTH_PA	0x0f900000u	/* GPIO 8-11: SPI lines and CS */
++#define SOUTH_PA	0x0f500000u	/* GPIO 38/39: reset and interrupt */
++#define PIN(n)		((uint32_t)(n) * 0x1000u)
++#define PIN_CFG		0x0u
++#define PIN_IO		0x4u
++#define PIN_INTR_CFG	0x8u
++#define PIN_INTR_STS	0xcu
++#define CS_PIN		11u
++#define RST_PIN		38u
++#define INT_PIN		39u
++
++#define GENI_FORCE_DEFAULT	0x020u
++#define GENI_OUTPUT_CTRL	0x024u
++#define GENI_CGC_CTRL		0x028u
++#define GENI_STATUS		0x040u
++#define GENI_M_CLK_CFG		0x048u
++#define GENI_IF_DISABLE		0x064u
++#define GENI_FW_REV		0x068u
++#define GENI_CLK_SEL		0x07cu
++#define SPI_CPHA		0x224u
++#define SPI_LOOPBACK		0x22cu
++#define SPI_CPOL		0x230u
++#define SPI_DEMUX_INV		0x24cu
++#define SPI_DEMUX_SEL		0x250u
++#define GENI_BYTE_GRAN		0x254u
++#define GENI_DMA_MODE		0x258u
++#define SPI_TRANS_CFG		0x25cu
++#define GENI_TX_PACK0		0x260u
++#define GENI_TX_PACK1		0x264u
++#define SPI_WORD_LEN		0x268u
++#define SPI_TX_LEN		0x26cu
++#define SPI_RX_LEN		0x270u
++#define GENI_RX_PACK0		0x284u
++#define GENI_RX_PACK1		0x288u
++#define GENI_M_CMD		0x600u
++#define GENI_M_CMD_CTRL		0x604u
++#define GENI_M_IRQ		0x610u
++#define GENI_M_IRQ_EN		0x614u
++#define GENI_M_IRQ_CLR		0x618u
++#define GENI_S_IRQ_EN		0x644u
++#define GENI_S_IRQ_CLR		0x648u
++#define GENI_TX_FIFO		0x700u
++#define GENI_RX_FIFO		0x780u
++#define GENI_TX_STATUS		0x800u
++#define GENI_RX_STATUS		0x804u
++#define GENI_RX_WM		0x810u
++#define GENI_RX_RFR		0x814u
++#define SE_DMA_TX_IRQ_CLR	0xc44u
++#define SE_DMA_RX_IRQ_CLR	0xd44u
++#define SE_GSI_EVENT_EN		0xe18u
++#define SE_IRQ_EN		0xe1cu
++#define SE_HW_PARAM_0		0xe24u
++#define SE_DMA_GENERAL_CFG	0xe30u
++
++#define M_CMD_DONE	(1u << 0)
++#define M_ERRORS	0x3300000eu
++#define OP_TX_ONLY	1u
++#define OP_FULL_DUPLEX	3u
++#define FRAGMENTATION	(1u << 2)
++
++/* NT36675 memory map */
++#define ENG_RST		0x7fff80u
++#define SWRST_N8	0x03f0feu
++#define SPI_RD_FAST	0x03f310u
++#define TRIM_ID		0x01f64eu
++#define TRIM_ID_NEW	0x03f004u
++#define BOOT_RDY	0x03f10du
++#define ILM_CRC		0x03f100u
++#define DLM_CRC		0x03f104u
++#define ILM_LEN		0x03f118u
++#define ILM_DES		0x03f128u
++#define DLM_DES		0x03f12cu
++#define DLM_LEN		0x03f130u
++#define BLD_CRC_FLAG	0x03f133u
++#define BLD_CRC_EN	0x03f30eu
++#define EVENT_BUF	0x022d00u
++#define HOST_CMD	(EVENT_BUF + 0x50u)
++#define RESET_STATE	(EVENT_BUF + 0x60u)
++#define FW_INFO		(EVENT_BUF + 0x78u)
++
++#define FW_SIZE		0x22000u
++#define CHUNK		64512u
++#define POINT_LEN	65u
++#define FINGERS		10u
++#define PANEL_W		1080
++#define PANEL_H		2400
++
++struct part {
++	uint32_t bin, sram, size, crc;
++};
++
++static struct {
++	vm_offset_t gcc, se, north, south;
++	const uint8_t *fw;
++	unsigned fw_size;
++	unsigned depth;
++	bool started;
++	uint32_t active;
++	int x[FINGERS], y[FINGERS];
++	uint8_t rx[2 + 128];
++} nt;
++
++static int nt_sleep_chan;
++static const uint8_t nt_zeros[128];
++
++static uint32_t
++nt_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++nt_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++nt_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&nt_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++nt_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask, unsigned us)
++{
++	for (unsigned i = 0; i < us; i++) {
++		if (!(nt_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static uint32_t
++nt_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/* Returns the SE4 clock level for GENI_CLK_SEL (TCXO, 19.2 MHz), or -1. */
++static int
++nt_clocks(void)
++{
++	static const uint32_t branches[] = { 0x17004, 0x17008, 0x23000, 0x23008, 0x174cc };
++
++	nt_wr(nt.gcc, GCC_VOTE, nt_rd(nt.gcc, GCC_VOTE) | 0x43c0u);
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
++		/* Under hardware gating (HW_CTL) CLK_OFF reads set while idle. */
++		if (nt_rd(nt.gcc, branches[i]) & 2u) {
++			continue;
++		}
++		if (!nt_wait_clear(nt.gcc, branches[i], 1u << 31, 1000)) {
++			printf("SWEET NT36675: clock %#x halted (%#x)\n", branches[i],
++			    nt_rd(nt.gcc, branches[i]));
++			return -1;
++		}
++	}
++	if (!(nt_rd(nt.gcc, GCC_SE4_RCG + 0x14u) & 1u)) {
++		uint32_t cfg = nt_rd(nt.gcc, GCC_SE4_RCG + 4u);
++		nt_wr(nt.gcc, GCC_SE4_RCG + 4u, (cfg & ~0x10371fu) | 1u);
++		nt_wr(nt.gcc, GCC_SE4_RCG, nt_rd(nt.gcc, GCC_SE4_RCG) | 1u);
++		return nt_wait_clear(nt.gcc, GCC_SE4_RCG, 1u, 1000) ? 0 : -1;
++	}
++	/* DFS: the SE selects a level; pick the undivided TCXO one. */
++	for (unsigned l = 0; l < 8; l++) {
++		if ((nt_rd(nt.gcc, GCC_SE4_RCG + 0x1cu + 4u * l) & 0x371fu) <= 1u) {
++			return (int)l;
++		}
++	}
++	return -1;
++}
++
++static void
++nt_pins(void)
++{
++	for (unsigned n = 8; n <= 10; n++) {
++		nt_wr(nt.north, PIN(n) + PIN_CFG, 0x084u);	/* qup4, 6 mA */
++	}
++	nt_wr(nt.north, PIN(CS_PIN) + PIN_IO, 2u);		/* CS idle high */
++	nt_wr(nt.north, PIN(CS_PIN) + PIN_CFG, 0x280u);		/* gpio, out, 6 mA */
++	nt_wr(nt.south, PIN(RST_PIN) + PIN_IO, 0u);
++	nt_wr(nt.south, PIN(RST_PIN) + PIN_CFG, 0x2c3u);	/* gpio, out, 8 mA, pull-up */
++	nt_wr(nt.south, PIN(INT_PIN) + PIN_CFG, 0x1c1u);	/* gpio, in, pull-down */
++	nt_wr(nt.south, PIN(INT_PIN) + PIN_INTR_CFG, 0x76u);	/* latch rising edges */
++	nt_wr(nt.south, PIN(INT_PIN) + PIN_INTR_STS, 0u);
++}
++
++static bool
++nt_spi_init(int clk_sel)
++{
++	uint32_t proto = (nt_rd(nt.se, GENI_FW_REV) >> 8) & 0xffu;
++	uint32_t ifdis = nt_rd(nt.se, GENI_IF_DISABLE);
++
++	nt.depth = (nt_rd(nt.se, SE_HW_PARAM_0) >> 16) & 0x3fu;
++	if (proto != 1u || (ifdis & 1u) || nt.depth < 4u) {
++		printf("SWEET NT36675: SE4 proto=%u if_disable=%#x depth=%u; not a FIFO SPI engine\n",
++		    proto, ifdis, nt.depth);
++		return false;
++	}
++	nt_wr(nt.se, SE_GSI_EVENT_EN, 0);
++	nt_wr(nt.se, GENI_M_IRQ_CLR, ~0u);
++	nt_wr(nt.se, GENI_S_IRQ_CLR, ~0u);
++	nt_wr(nt.se, SE_DMA_TX_IRQ_CLR, ~0u);
++	nt_wr(nt.se, SE_DMA_RX_IRQ_CLR, ~0u);
++	nt_wr(nt.se, SE_IRQ_EN, ~0u);
++	nt_wr(nt.se, GENI_CGC_CTRL, nt_rd(nt.se, GENI_CGC_CTRL) | 0x7fu);
++	nt_wr(nt.se, SE_DMA_GENERAL_CFG, nt_rd(nt.se, SE_DMA_GENERAL_CFG) | 0xfu);
++	nt_wr(nt.se, GENI_OUTPUT_CTRL, 0x7fu);
++	nt_wr(nt.se, GENI_FORCE_DEFAULT, 1u);
++	nt_wr(nt.se, GENI_DMA_MODE, nt_rd(nt.se, GENI_DMA_MODE) & ~1u);
++	nt_wr(nt.se, GENI_RX_WM, nt.depth - 3u);
++	nt_wr(nt.se, GENI_RX_RFR, nt.depth - 2u);
++	nt_wr(nt.se, GENI_M_IRQ_EN, nt_rd(nt.se, GENI_M_IRQ_EN) | 0x7fc0007fu);
++	nt_wr(nt.se, GENI_S_IRQ_EN, nt_rd(nt.se, GENI_S_IRQ_EN) | 0x03003e3eu);
++	nt_wr(nt.se, SPI_TRANS_CFG, nt_rd(nt.se, SPI_TRANS_CFG) & ~2u);
++	/* 8-bit words, four per FIFO entry, byte 0 first, MSB first */
++	nt_wr(nt.se, GENI_TX_PACK0, 0x0007f8feu);
++	nt_wr(nt.se, GENI_TX_PACK1, 0x000ffefeu);
++	nt_wr(nt.se, GENI_RX_PACK0, 0x0007f8feu);
++	nt_wr(nt.se, GENI_RX_PACK1, 0x000ffefeu);
++	nt_wr(nt.se, GENI_BYTE_GRAN, 0);
++	nt_wr(nt.se, SPI_WORD_LEN, 8u - 4u);
++	/* SPI mode 0; the GENI chip select is unused, CS is a GPIO */
++	nt_wr(nt.se, SPI_LOOPBACK, 0);
++	nt_wr(nt.se, SPI_DEMUX_SEL, 0);
++	nt_wr(nt.se, SPI_CPHA, 0);
++	nt_wr(nt.se, SPI_CPOL, 0);
++	nt_wr(nt.se, SPI_DEMUX_INV, 0);
++	/* 19.2 MHz / 2 = 9.6 MHz SCLK */
++	nt_wr(nt.se, GENI_CLK_SEL, (uint32_t)clk_sel & 7u);
++	nt_wr(nt.se, GENI_M_CLK_CFG, (2u << 4) | 1u);
++	return true;
++}
++
++static void
++nt_spi_abort(void)
++{
++	nt_wr(nt.se, GENI_M_CMD_CTRL, 4u);			/* cancel */
++	if (!nt_wait_clear(nt.se, GENI_STATUS, 1u, 10000)) {
++		nt_wr(nt.se, GENI_M_CMD_CTRL, 2u);		/* abort */
++		(void)nt_wait_clear(nt.se, GENI_STATUS, 1u, 10000);
++	}
++	for (unsigned i = 0; i < 64 && (nt_rd(nt.se, GENI_RX_STATUS) & 0x1ffffffu); i++) {
++		(void)nt_rd(nt.se, GENI_RX_FIFO);
++	}
++	nt_wr(nt.se, GENI_M_IRQ_CLR, ~0u);
++}
++
++/*
++ * One chip-select frame: hdr[0..nh) then data[0..nd) on MOSI. With rx the
++ * frame is full duplex and rx receives every byte clocked in.
++ */
++static int
++nt_spi_frame(const uint8_t *hdr, unsigned nh, const uint8_t *data, unsigned nd, uint8_t *rx)
++{
++	unsigned n = nh + nd, sent = 0, got = 0;
++	uint64_t deadline;
++	int err = ETIMEDOUT;
++
++	if (!nt_wait_clear(nt.se, GENI_STATUS, 1u, 10000)) {
++		nt_spi_abort();
++	}
++	nt_wr(nt.se, GENI_M_IRQ_CLR, ~0u);
++	nt_wr(nt.north, PIN(CS_PIN) + PIN_IO, 0);
++	nt_wr(nt.se, SPI_TX_LEN, n);
++	if (rx) {
++		nt_wr(nt.se, SPI_RX_LEN, n);
++	}
++	nt_wr(nt.se, GENI_M_CMD, ((rx ? OP_FULL_DUPLEX : OP_TX_ONLY) << 27) | FRAGMENTATION);
++	clock_interval_to_deadline(100 + n / 500, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		while (sent < n && (nt_rd(nt.se, GENI_TX_STATUS) & 0x0fffffffu) < nt.depth) {
++			uint32_t w = 0;
++			for (unsigned b = 0; b < 4 && sent < n; b++, sent++) {
++				uint8_t v = sent < nh ? hdr[sent] : data[sent - nh];
++				w |= (uint32_t)v << (8u * b);
++			}
++			nt_wr(nt.se, GENI_TX_FIFO, w);
++		}
++		if (rx) {
++			uint32_t wc = nt_rd(nt.se, GENI_RX_STATUS) & 0x1ffffffu;
++			while (wc--) {
++				uint32_t w = nt_rd(nt.se, GENI_RX_FIFO);
++				for (unsigned b = 0; b < 4 && got < n; b++) {
++					rx[got++] = (uint8_t)(w >> (8u * b));
++				}
++			}
++		}
++		uint32_t m = nt_rd(nt.se, GENI_M_IRQ);
++		if (m & M_ERRORS) {
++			err = EIO;
++			break;
++		}
++		if ((m & M_CMD_DONE) && sent == n &&
++		    (!rx || got == n || !(nt_rd(nt.se, GENI_RX_STATUS) & 0x1ffffffu))) {
++			nt_wr(nt.se, GENI_M_IRQ_CLR, m);
++			err = (!rx || got == n) ? 0 : EIO;
++			break;
++		}
++	}
++	nt_wr(nt.north, PIN(CS_PIN) + PIN_IO, 2u);
++	if (err) {
++		nt_spi_abort();
++	}
++	return err;
++}
++
++static int
++nt_page(uint32_t addr)
++{
++	uint8_t c[3] = { 0xff, (uint8_t)(addr >> 15), (uint8_t)(addr >> 7) };
++	return nt_spi_frame(c, 3, NULL, 0, NULL);
++}
++
++static int
++nt_write(uint32_t addr, const uint8_t *data, unsigned n)
++{
++	uint8_t c = (uint8_t)((addr & 0x7fu) | 0x80u);
++	int err = nt_page(addr);
++	return err ? err : nt_spi_frame(&c, 1, data, n, NULL);
++}
++
++static int
++nt_write1(uint32_t addr, uint8_t v)
++{
++	return nt_write(addr, &v, 1);
++}
++
++/* Reads n <= 128 bytes; the first two bytes clocked in are command and dummy. */
++static int
++nt_read(uint32_t addr, uint8_t *out, unsigned n)
++{
++	uint8_t c = (uint8_t)(addr & 0x7fu);
++	int err = nt_page(addr);
++	if (!err) {
++		err = nt_spi_frame(&c, 1, nt_zeros, n + 1, nt.rx);
++	}
++	if (!err) {
++		memcpy(out, nt.rx + 2, n);
++	}
++	return err;
++}
++
++static void
++nt_bootloader_reset(void)
++{
++	(void)nt_write1(SWRST_N8, 0x69);
++	nt_wait(5);
++	(void)nt_write1(SPI_RD_FAST, 0x00);
++}
++
++static bool
++nt_chip_id(void)
++{
++	static const uint32_t addrs[2] = { TRIM_ID, TRIM_ID_NEW };
++	uint8_t id[6];
++
++	for (int t = 0; t < 5; t++) {
++		nt_bootloader_reset();
++		for (unsigned a = 0; a < 2; a++) {
++			if (nt_read(addrs[a], id, sizeof(id))) {
++				continue;
++			}
++			if (id[4] == 0x66 && id[5] == 0x03 && (id[3] == 0x72 || id[3] == 0x75)) {
++				printf("SWEET NT36675: trim id %02x %02x %02x %02x %02x %02x\n",
++				    id[0], id[1], id[2], id[3], id[4], id[5]);
++				return true;
++			}
++		}
++		nt_wait(10);
++	}
++	return false;
++}
++
++/* ILM, DLM, then the non-empty info sections of the 256-byte header. */
++static int
++nt_fw_parts(struct part *p, unsigned max)
++{
++	const uint8_t *fw = nt.fw;
++	uint32_t end;
++	unsigned n = 0;
++
++	if (nt.fw_size < FW_SIZE || (end = nt_le32(fw)) != 0x100u ||
++	    memcmp(fw + 0x1fffd, "NVT", 3) != 0 || (uint8_t)(fw[0x1f000] + fw[0x1f001]) != 0xffu) {
++		return -1;
++	}
++	p[n++] = (struct part){ nt_le32(fw + 0x00), nt_le32(fw + 0x04), nt_le32(fw + 0x08), nt_le32(fw + 0x18) };
++	p[n++] = (struct part){ nt_le32(fw + 0x0c), nt_le32(fw + 0x10), nt_le32(fw + 0x14), nt_le32(fw + 0x1c) };
++	for (uint32_t off = 0x30; off < end && n < max; off += 16) {
++		uint32_t size = nt_le32(fw + off + 4);
++		if (size) {
++			p[n++] = (struct part){ nt_le32(fw + off + 8), nt_le32(fw + off), size, nt_le32(fw + off + 12) };
++		}
++	}
++	for (unsigned i = 0; i < n; i++) {
++		if (p[i].bin + p[i].size + 1 > nt.fw_size) {
++			return -1;
++		}
++	}
++	return (int)n;
++}
++
++/* The vendor driver writes size + 1 bytes of every section. */
++static int
++nt_write_part(const struct part *p)
++{
++	uint32_t sram = p->sram, bin = p->bin, left = p->size + 1;
++
++	while (left) {
++		uint32_t len = left > CHUNK ? CHUNK : left;
++		int err = nt_write(sram, nt.fw + bin, len);
++		if (err) {
++			return err;
++		}
++		sram += len;
++		bin += len;
++		left -= len;
++	}
++	return 0;
++}
++
++static int
++nt_crc_bank(uint32_t des, uint32_t len_reg, uint32_t crc_reg, const struct part *p)
++{
++	uint8_t a[3] = { (uint8_t)p->sram, (uint8_t)(p->sram >> 8), (uint8_t)(p->sram >> 16) };
++	uint8_t l[3] = { (uint8_t)p->size, (uint8_t)(p->size >> 8), (uint8_t)((p->size >> 16) & 1u) };
++	uint8_t c[4] = { (uint8_t)p->crc, (uint8_t)(p->crc >> 8), (uint8_t)(p->crc >> 16), (uint8_t)(p->crc >> 24) };
++
++	if (nt_write(des, a, sizeof(a)) || nt_write(len_reg, l, sizeof(l)) ||
++	    nt_write(crc_reg, c, sizeof(c))) {
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++nt_reset_state(uint8_t lo, unsigned tries)
++{
++	uint8_t s[5];
++
++	for (unsigned i = 0; i < tries; i++) {
++		if (!nt_read(RESET_STATE, s, sizeof(s)) && s[0] >= lo && s[0] <= 0xafu) {
++			return s[0];
++		}
++		nt_wait(10);
++	}
++	return -1;
++}
++
++static int
++nt_download_once(const struct part *p, int n)
++{
++	uint8_t v;
++
++	nt_bootloader_reset();
++	for (int i = 0; i < n; i++) {
++		if (nt_write_part(&p[i])) {
++			return -1;
++		}
++	}
++	if (nt_crc_bank(ILM_DES, ILM_LEN, ILM_CRC, &p[0]) ||
++	    nt_crc_bank(DLM_DES, DLM_LEN, DLM_CRC, &p[1])) {
++		return -1;
++	}
++	if (nt_read(BLD_CRC_EN, &v, 1) || nt_write1(BLD_CRC_EN, v | 0x80u)) {
++		return -1;
++	}
++	(void)nt_write1(RESET_STATE, 0);
++	(void)nt_write1(HOST_CMD, 0xae);	/* enable the firmware CRC check */
++	(void)nt_write1(BOOT_RDY, 1);
++	nt_wait(5);
++	return nt_reset_state(0xa0, 11);
++}
++
++static bool
++nt_download(void)
++{
++	struct part p[16];
++	int n = nt_fw_parts(p, 16);
++	uint8_t flag = 0, info[8];
++
++	if (n < 2) {
++		printf("SWEET NT36675: firmware image rejected\n");
++		return false;
++	}
++	for (int attempt = 0; attempt < 3; attempt++) {
++		uint64_t t0 = mach_absolute_time(), ns;
++		int st = nt_download_once(p, n);
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		if (st >= 0) {
++			int rek = nt_reset_state(0xa1, 51);
++			if (!nt_read(FW_INFO, info, sizeof(info))) {
++				printf("SWEET NT36675: firmware %#x running in %llu ms, %ux%u, state %#x\n",
++				    info[0], ns / NSEC_PER_MSEC, info[4] << 8 | info[5],
++				    info[6] << 8 | info[7], rek);
++			}
++			return true;
++		}
++		(void)nt_read(BLD_CRC_FLAG, &flag, 1);
++		printf("SWEET NT36675: download attempt %d failed, crc flags %#x\n", attempt, flag);
++	}
++	return false;
++}
++
++static bool
++nt_bring_up(void)
++{
++	int clk_sel = nt_clocks();
++	if (clk_sel < 0) {
++		printf("SWEET NT36675: no 19.2 MHz SE4 clock\n");
++		return false;
++	}
++	nt_pins();
++	if (!nt_spi_init(clk_sel)) {
++		return false;
++	}
++	/* Vendor sequence: engineering reset while RESX is low, then release. */
++	(void)nt_write1(ENG_RST, 0x5a);
++	nt_wait(1);
++	nt_wr(nt.south, PIN(RST_PIN) + PIN_IO, 2u);
++	nt_wait(10);
++	if (!nt_chip_id()) {
++		printf("SWEET NT36675: no answer to the chip ID read\n");
++		return false;
++	}
++	return nt_download();
++}
++
++static void
++nt_report(const uint8_t *p)
++{
++	uint32_t mask = 0;
++	int x[FINGERS], y[FINGERS];
++
++	for (unsigned i = 0; i < FINGERS; i++) {
++		const uint8_t *f = p + 6 * i;
++		unsigned id = f[0] >> 3, state = f[0] & 7u;
++		if (id == 0 || id > FINGERS || (state != 1 && state != 2)) {
++			continue;
++		}
++		int px = f[1] << 4 | f[3] >> 4, py = f[2] << 4 | (f[3] & 0x0f);
++		if (px >= PANEL_W || py >= PANEL_H) {
++			continue;
++		}
++		mask |= 1u << (id - 1);
++		x[id - 1] = px;
++		y[id - 1] = py;
++	}
++	for (unsigned id = 0; id < FINGERS; id++) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(nt.active & bit) || x[id] != nt.x[id] || y[id] != nt.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			nt.x[id] = x[id];
++			nt.y[id] = y[id];
++		} else if (nt.active & bit) {
++			sweet_hid_touch((int)id, 0, nt.x[id], nt.y[id]);
++		}
++	}
++	nt.active = mask;
++}
++
++/* The firmware reports 0xFD/0xFE fill after a watchdog reset of the IC. */
++static bool
++nt_crashed(const uint8_t *p)
++{
++	for (unsigned i = 0; i < 6; i++) {
++		if (p[i] != 0xfd && p[i] != 0xfe) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++nt_thread(void *arg __unused, wait_result_t result __unused)
++{
++	unsigned delay_s = 45, errors = 0, crashes = 0;
++	uint8_t pkt[POINT_LEN];
++
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	printf("SWEET NT36675: starting in %u s\n", delay_s);
++	nt_wait(delay_s * 1000u);
++	nt.gcc = ml_io_map(GCC_PA, 0x60000);
++	nt.se = ml_io_map(SE_PA, 0x4000);
++	nt.north = ml_io_map(NORTH_PA, PIN(12));
++	nt.south = ml_io_map(SOUTH_PA, PIN(40));
++	if (!nt.gcc || !nt.se || !nt.north || !nt.south) {
++		printf("SWEET NT36675: MMIO mapping failed\n");
++		goto out;
++	}
++	if (!nt_bring_up()) {
++		goto out;
++	}
++	(void)nt_page(EVENT_BUF);
++	nt_wr(nt.south, PIN(INT_PIN) + PIN_INTR_STS, 0);
++	for (;;) {
++		if (!(nt_rd(nt.south, PIN(INT_PIN) + PIN_INTR_STS) & 1u)) {
++			nt_wait(4);
++			continue;
++		}
++		nt_wr(nt.south, PIN(INT_PIN) + PIN_INTR_STS, 0);
++		if (nt_read(EVENT_BUF, pkt, sizeof(pkt))) {
++			if ((errors++ % 100u) == 0) {
++				printf("SWEET NT36675: report read failed\n");
++			}
++			if (errors == 10) {
++				nt_report(nt_zeros);	/* release every finger */
++			}
++			continue;
++		}
++		errors = 0;
++		if (nt_crashed(pkt)) {
++			if (++crashes > 10) {
++				printf("SWEET NT36675: firmware stopped; reloading\n");
++				nt_report(nt_zeros);
++				crashes = 0;
++				if (!nt_download()) {
++					break;
++				}
++				(void)nt_page(EVENT_BUF);
++			}
++			continue;
++		}
++		crashes = 0;
++		nt_report(pkt);
++	}
++	nt_report(nt_zeros);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Starts the driver if the ADT describes this controller; false otherwise. */
++bool
++sweet_nt36675_start(void)
++{
++	DTEntry node;
++	void const *prop;
++	unsigned int size;
++	thread_t thread;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-touch", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "compatible", &prop, &size) != kSuccess ||
++	    size < sizeof("novatek,nt36675") ||
++	    strncmp((const char *)prop, "novatek,nt36675", size) != 0) {
++		return false;
++	}
++	if (nt.started) {
++		return true;
++	}
++	nt.started = true;
++	if (SecureDTGetProperty(node, "firmware", &prop, &size) != kSuccess) {
++		printf("SWEET NT36675: no firmware in /sweet-touch\n");
++		return true;
++	}
++	nt.fw = prop;
++	nt.fw_size = size;
++	if (kernel_thread_start(nt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET NT36675: kernel_thread_start failed\n");
++	}
++	return true;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -20,6 +20,7 @@
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern bool sweet_nt36675_start(void);
+ void sweet_touch_init(void);
+ 
+ #define TOUCH_SE_PA      0x00a84000u
+@@ -650,6 +651,10 @@
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
+ 	}
++	/* Boards that describe their controller in the ADT (apollo). */
++	if (sweet_nt36675_start()) {
++		return;
++	}
+ 	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
