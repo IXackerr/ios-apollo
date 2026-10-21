@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the shim and wrap it in a boot.img v2 that mirrors the stock PixelOS header.
 #   BOARD=sweet|apollo (default sweet)  selects shim/board.h constants
-#   DIAG=1|2  black-screen diagnostics (shim.c diag_main)
+#   DIAG=1|2|3 black-screen diagnostics (shim.c diag_main)
 #   DTB=path  DTB appended to boot.img (default ../dtb/boot_unpacked/dtb,
 #             the stock DTB unpacked from the phone's own boot.img)
 set -euo pipefail
@@ -13,7 +13,7 @@ case "$BOARD" in
 	apollo)	BOARD_CFLAGS="-DBOARD_APOLLO" ;;
 	*)	echo "error: unknown BOARD=$BOARD (sweet|apollo)" >&2; exit 1 ;;
 esac
-# DIAG=1|2: black-screen diagnostics (see diag_main in shim.c)
+# DIAG=1|2|3: black-screen diagnostics (see diag_main in shim.c)
 [ -n "${DIAG:-}" ] && BOARD_CFLAGS="$BOARD_CFLAGS -DDIAG=$DIAG"
 CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
