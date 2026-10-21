@@ -392,10 +392,10 @@ static uint32_t to_us(uint64_t ticks)
 
 #if defined(DIAG)
 /*
- * Black-screen diagnostics (BOARD=apollo builds with DIAG=1 or DIAG=2).
+ * Black-screen diagnostics (BOARD=apollo builds with DIAG=1, 2 or 3).
  * DIAG=1: PSCI SYSTEM_RESET as the very first action. A reboot within
  *         seconds proves ABL started the shim.
- * DIAG=3: reset ladder (PSCI, PSCI RESET2, watchdog bite), 3 s apart.
+ * DIAG=3: reset ladder (PSCI, PSCI RESET2, watchdog bite, PS_HOLD), 3 s apart.
  * DIAG=2: A) fill the whole cont_splash region with 0xff bytes (white in
  *         any RGB format) and hold 15 s; B) read the display engine's
  *         source pipes (DPU SSPP, sm8250 catalog) to find the buffer that
@@ -444,22 +444,35 @@ static void __attribute__((noreturn)) diag_main(void)
 #elif DIAG == 3
 	/*
 	 * Reset ladder, 3 s apart, so the moment of the reboot tells which
-	 * method works (and that the shim runs at all):
+	 * method works (and that the shim runs at all). The IMEM restart
+	 * reason is written first, so any of them should end in fastboot:
 	 *   ~0 s  PSCI SYSTEM_RESET      ~3 s  PSCI SYSTEM_RESET2 (warm)
-	 *   ~6 s  APSS watchdog bite (watchdog@17c10000, kpss layout, as
+	 *   ~6 s  APSS watchdog bite (qcom,wdt@17c10000, kpss layout, as
 	 *         Linux qcom_wdt_restart; 32768 Hz sleep clock, 128 ms)
+	 *   ~9 s  PS_HOLD low (restart@c264000)
 	 * No reboot at all: the shim never ran or hangs in its first steps.
 	 */
+#if HAVE_IMEM_RESTART
+	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
+	__asm__ volatile("dsb sy" ::: "memory");
+#endif
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
 	delay_ms(3000);
 	smc(PSCI_SYSTEM_RESET2, 0, 0, 0);
 	delay_ms(3000);
-	wr32(0x17c10000UL + 0x08, 0);		/* WDT_EN */
-	wr32(0x17c10000UL + 0x04, 1);		/* WDT_RST */
-	wr32(0x17c10000UL + 0x10, 4194);	/* WDT_BARK_TIME */
-	wr32(0x17c10000UL + 0x14, 4194);	/* WDT_BITE_TIME */
-	wr32(0x17c10000UL + 0x08, 1);		/* WDT_EN */
+#if defined(APSS_WDT)
+	wr32(APSS_WDT + 0x08, 0);		/* WDT_EN */
+	wr32(APSS_WDT + 0x04, 1);		/* WDT_RST */
+	wr32(APSS_WDT + 0x10, 4194);		/* WDT_BARK_TIME */
+	wr32(APSS_WDT + 0x14, 4194);		/* WDT_BITE_TIME */
+	wr32(APSS_WDT + 0x08, 1);		/* WDT_EN */
 	__asm__ volatile("dsb sy" ::: "memory");
+#endif
+	delay_ms(3000);
+#if HAVE_PSHOLD
+	wr32(PSHOLD, 0);
+	__asm__ volatile("dsb sy" ::: "memory");
+#endif
 	for (;;)
 		__asm__ volatile("wfe");
 #else

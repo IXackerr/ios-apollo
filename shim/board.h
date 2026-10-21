@@ -5,10 +5,9 @@
  *
  * Sources:
  *   sweet  - live FDT of the Redmi Note 10 Pro (NOTES.md)
- *   apollo - mainline sm8250.dtsi + sm8250-xiaomi-apollo.dts
- *            (github.com/royka1/apollo-linux, branch apollo-6.17).
- *            Everything marked "verify" must be checked against the
- *            phone's live FDT (/sys/firmware/fdt) before relying on it.
+ *   apollo - stock kona DTB from the phone's boot.img and its live FDT;
+ *            mainline sm8250.dtsi + sm8250-xiaomi-apollo.dts
+ *            (github.com/royka1/apollo-linux) for the rest
  */
 
 #if defined(BOARD_APOLLO)
@@ -22,12 +21,15 @@
 /* intc@17a00000: GICD 0x17a00000, GICR 0x17a60000 (8 x 0x20000) */
 #define GICD_BASE		0x17a00000UL
 #define GICR_BASE		0x17a60000UL
-/* No verified IMEM restart-reason address for SM8250 yet: reset only
- * through PSCI SYSTEM_RESET (always tried first anyway). */
-#define HAVE_IMEM_RESTART	0
-/* No PS_HOLD address in sm8250.dtsi (Linux resets through PSCI): if
- * SYSTEM_RESET ever returns, the shim just parks instead of poking MMIO. */
-#define HAVE_PSHOLD		0
+/* qcom,msm-imem@146bf000 restart_reason@65c and restart@c264000 (pshold).
+ * ABL reads the same magic as on sweet and stays in fastboot. */
+#define HAVE_IMEM_RESTART	1
+#define IMEM_RESTART_REASON	0x146bf65cUL
+#define RESTART_BOOTLOADER	0x77665500U
+#define HAVE_PSHOLD		1
+#define PSHOLD			0x0c264000UL
+/* qcom,wdt@17c10000, kpss register layout (DIAG=3) */
+#define APSS_WDT		0x17c10000UL
 /* cpu@0..@300 Cortex-A55, cpu@400..@600 Cortex-A77, cpu@700 A77 prime */
 #define NR_CPUS			8
 

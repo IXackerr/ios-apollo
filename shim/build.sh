@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build the shim and wrap it in a boot.img v2 that mirrors the stock PixelOS header.
+# Build the shim and wrap it in a boot.img v2 that mirrors the stock header
+# (sweet: PixelOS; apollo: the phone's Android 14 boot.img, gzip kernel).
 #   BOARD=sweet|apollo (default sweet)  selects shim/board.h constants
 #   DIAG=1|2|3 black-screen diagnostics (shim.c diag_main)
 #   DTB=path  DTB appended to boot.img (default ../dtb/boot_unpacked/dtb,
@@ -13,6 +14,13 @@ case "$BOARD" in
 	apollo)	BOARD_CFLAGS="-DBOARD_APOLLO" ;;
 	*)	echo "error: unknown BOARD=$BOARD (sweet|apollo)" >&2; exit 1 ;;
 esac
+# Header values of each phone's stock boot.img. apollo's is an Android 14
+# image with a gzip kernel.
+case "$BOARD" in
+	apollo)	GZIP_KERNEL=${GZIP_KERNEL:-1}; OS_VERSION=${OS_VERSION:-14.0.0}; OS_PATCH=${OS_PATCH:-2024-04} ;;
+	*)	GZIP_KERNEL=${GZIP_KERNEL:-0}; OS_VERSION=${OS_VERSION:-17.0.0}; OS_PATCH=${OS_PATCH:-2035-06} ;;
+esac
+[ -f "$DTB" ] || { echo "error: DTB $DTB not found (tools/unpack_bootv2.py BOOT.img dtb/boot_unpacked)" >&2; exit 1; }
 # DIAG=1|2|3: black-screen diagnostics (see diag_main in shim.c)
 [ -n "${DIAG:-}" ] && BOARD_CFLAGS="$BOARD_CFLAGS -DDIAG=$DIAG"
 CC=aarch64-linux-gnu-gcc
@@ -32,6 +40,11 @@ $OBJCOPY -O binary out/shim.elf out/Image
 # ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
 size=$((0x$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print $1}')))	# no gawk needed
 truncate -s "$size" out/Image
+KERNEL=out/Image
+if [ "$GZIP_KERNEL" = 1 ]; then
+	gzip -9 -n -c out/Image > out/Image.gz
+	KERNEL=out/Image.gz
+fi
 # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
 # newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
 if [ -n "${1:-}" ]; then
@@ -39,11 +52,11 @@ if [ -n "${1:-}" ]; then
 else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
-mkbootimg --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
+mkbootimg --header_version 2 --kernel "$KERNEL" --ramdisk out/ramdisk.bin \
 	--dtb "$DTB" --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
 	--tags_offset 0x100 --dtb_offset 0x1f00000 --pagesize 4096 \
-	--os_version 17.0.0 --os_patch_level 2035-06 \
+	--os_version "$OS_VERSION" --os_patch_level "$OS_PATCH" \
 	--cmdline "console=null" -o out/shim-boot.img
 # Host render of the console layout.
 gcc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test
-ls -l out/Image out/shim-boot.img
+ls -l "$KERNEL" out/shim-boot.img
