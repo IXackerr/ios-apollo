@@ -50,7 +50,9 @@ noted, otherwise from the mainline-based apollo kernel
 | `build.sh`: `BOARD=` and `DTB=` variables, no gawk dependency; apollo builds a gzip kernel with the stock os_version 14.0.0 / 2024-04 | `shim/build.sh` | the apollo ABL boots it |
 | `mkadt.py --board apollo --phys-base --mem-size`: kryo585 cores (4×A55 1.8 GHz, 3×A77 2.42, 1×A77 2.84), vtimer 27, root compatible `…xiaomi,sweet|xiaomi,apollo|qcom,sm8250`, `/sweet-keys` node | `tools/mkadt.py` | sweet output byte-identical to before (all 4 flag combos) |
 | `fdtmem.py`: picks the XNU RAM window from a live FDT (banks minus fixed carve-outs, prefers ≥ 4 GiB, caps at the size known to boot on sweet) | `tools/fdtmem.py` | tested on the apollo DTB with a fake 8 GiB map |
-| Kernel patch 0082: volume-up GPIO read from `/sweet-keys` (apollo: PM8150 GPIO6, PPID 0x0c5, base 0xc500); sweet unchanged when the node is absent | `xnu/patches/0082-…` | applies with `patch --dry-run`; syntax-checked with stub headers; **not built by CI yet** |
+| Kernel patch 0082: volume-up GPIO read from `/sweet-keys` (apollo: PM8150 GPIO6, PPID 0x0c5, base 0xc500); sweet unchanged when the node is absent | `xnu/patches/0082-…` | on the phone: GPIO found, enabled, input |
+| Kernel patch 0083: interrupt counts and GIC state before and after the IORTC wait | `xnu/patches/0083-…` | on the phone: ~100 timer interrupts per second |
+| Kernel patch 0084: SweetCPU also matches `qcom,kryo585` | `xnu/patches/0084-…` | on the phone: CPU0 registers, boot reaches userspace |
 
 ## Hardware map: sweet → apollo
 
@@ -97,10 +99,12 @@ only after the read-only boot works.
 3. **First kernel boot** — done: `rd=md0` with the static test init, `cpus=1`.
    The CPU nodes need patch 0084 (SweetCPU matched only `qcom,kryo470`;
    without it the boot thread waits for CPU registration forever).
-4. **UFS root, read-only**: the same payload with `rd=ufsroot0` and no
-   RAM disk. With Android still in `userdata` the expected result is
-   `unknown Volume Signature` and mountroot retrying, without a panic.
-   Never pass `ufsrw=1` while Android data is on the partition.
+4. **UFS root, read-only** — done: with `rd=ufsroot0` the kernel's UFS
+   driver finds `userdata` (LUN 0, first block 0x2c0000, 109575 MiB, DMA
+   buffer above 4 GiB) and, with Android's f2fs still there, HFS reports
+   `unknown Volume Signature` while mountroot retries without a panic.
+   The same boot shows the volume-up GPIO (PM8150 GPIO6) enabled as an
+   input. Never pass `ufsrw=1` while Android data is on the partition.
 5. **Root image**: same `tools/mkiosroot.sh` image as sweet, flashed to
    `userdata` (erases Android data; back up first).
 6. **Touch driver** (NT36675 over GENI SPI), then the WLED backlight for
