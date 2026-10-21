@@ -1,5 +1,7 @@
 # ios-sweet
 
+> **This repository ports ios-sweet to the Xiaomi Mi 10T / 10T Pro** (`apollo`, Snapdragon 865 / SM8250). The upstream project is [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet). Progress, probe results and the hardware differences are in [PORTING-APOLLO.md](PORTING-APOLLO.md). The rest of this README describes the original Redmi Note 10 Pro port that the apollo work builds on.
+
 **Apple's iOS 16 running on a Redmi Note 10 Pro.**
 
 This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`sweet`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
