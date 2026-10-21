@@ -111,6 +111,23 @@ only after the read-only boot works.
 6. **Touch driver** (NT36675 over GENI SPI), then the WLED backlight for
    display power, then the USB live log with the 7nm PHY.
 
+## NT36675 touch: bare-metal probe works (2026-10-22)
+
+`BOARD=apollo TOUCHFW=<firmware> shim/build.sh` boots a touch probe
+(`shim/touch.c`) instead of the hardware probe, with the NT36675 firmware
+as the ramdisk. On the phone: QUP0 v2.5, SE4 loaded as SPI with FIFO
+access (16 words), DFS enabled on the SE4 clock with level 0 = TCXO
+(19.2 MHz, SCLK 9.6 MHz), trim ID `.. .. .. 72 66 03`, firmware download
+in ~116 ms (reset state 0xA0, then 0xA1), firmware 0x11 reporting
+1080×2400, and touch reports in panel pixels with the panel's
+orientation, several fingers at once. The `s_ahb` branch runs under
+hardware gating and reads CLK_OFF while idle; its halt bit is not checked.
+
+The firmware (`novatek_nt36675_j3s_fw01.bin`, 139264 bytes) is not a file
+on any partition: Xiaomi's kernel builds it in (`firmware/Makefile`,
+`CONFIG_TOUCHSCREEN_NT36xxx_HOSTDL_SPI`). Extract it from the phone's own
+boot.img kernel; it is not part of this repository.
+
 ## NT36675 touch driver plan
 
 - Clocks (GCC base 0x00100000): branch votes at 0x52008, bits 6 (wrap0 m-ahb),

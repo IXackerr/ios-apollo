@@ -11,6 +11,7 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "touch.h"
 #include "board.h"
 
 #define GICR_SIZE		0x100000UL
@@ -548,6 +549,16 @@ void shim_main(uint64_t dtb)
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
+
+#if defined(TOUCH_PROBE)
+	stage = "touch";
+	con_str("BOARD", BOARD_NAME);
+	test_touch(dtb, 240);
+	con_skip();
+	con_str("TOUCH", "done, reset in ~3 min");
+	delay_ms(180000);
+	reset(20);
+#endif
 
 	/*
 	 * No payload: hardware probe, two screens, MMU off, nothing written
