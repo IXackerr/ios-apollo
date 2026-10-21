@@ -6,9 +6,12 @@ address comes from the sweet live FDT. Usage:
 
   mkadt.py OUT.adt [--dump] [--qemu] [--highmem]                  # sweet
   mkadt.py OUT.adt --board apollo --phys-base HEX --mem-size HEX  # Mi 10T (Pro)
+           [--touch-fw novatek_nt36675_j3s_fw01.bin]
 
 For apollo the RAM window has no default on purpose: take it from the
-phone's live FDT with tools/fdtmem.py (see PORTING-APOLLO.md).
+phone's live FDT with tools/fdtmem.py (see PORTING-APOLLO.md). The touch
+firmware is built into the phone's stock kernel; without --touch-fw the
+/sweet-touch node still names the controller, and the driver stays idle.
 """
 import hashlib, os, struct, sys
 
@@ -53,6 +56,7 @@ BOARDS = {
         cpu_hz=[1804800000] * 6 + [2304000000] * 2,
         memory_hz=1866000000,
         keys=None,  # kernel defaults: PM6150L GPIO2 (SID 4) for volume up
+        touch=None,  # kernel probes GT9896 / FT on QUP1 SE7
     ),
     'apollo': dict(
         soc_compat=['xiaomi,sweet', 'xiaomi,apollo', 'qcom,sm8250'],
@@ -66,6 +70,8 @@ BOARDS = {
         # Volume up: PM8150 GPIO6 (SID 0, peripheral 0xc5, gpio-keys in the
         # apollo DTS). Power / volume down: PM8150 PON (PPID 0x008), as on sweet.
         keys=dict(volup_ppid=0x0c5, volup_base=0xc500),
+        # NT36675 on QUP0 SE4 (bsd/dev/sweet_nt36675.c, patch 0086)
+        touch='novatek,nt36675',
     ),
 }
 
@@ -102,7 +108,8 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, mem_size=None):
+def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, mem_size=None,
+          touch_fw=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     b = BOARDS[board]
     if phys_base is None or mem_size is None:
@@ -257,6 +264,11 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
             ('volup-ppid', u32(b['keys']['volup_ppid'])),
             ('volup-base', u32(b['keys']['volup_base'])),
         ]))
+    if b['touch']:
+        extra.append(node('sweet-touch', [
+            ph(),
+            ('compatible', cstr(b['touch'])),
+        ] + ([('firmware', touch_fw)] if touch_fw else [])))
 
     product_props = d22ap_product()
     product = [node('product', [ph()] + product_props)] if product_props else []
@@ -291,7 +303,8 @@ if __name__ == '__main__':
         raise SystemExit(f'unknown --board {board} ({", ".join(BOARDS)})')
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, board=board,
                  phys_base=_opt('--phys-base', lambda x: int(x, 0)),
-                 mem_size=_opt('--mem-size', lambda x: int(x, 0)))
+                 mem_size=_opt('--mem-size', lambda x: int(x, 0)),
+                 touch_fw=_opt('--touch-fw', lambda f: open(f, 'rb').read()))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
