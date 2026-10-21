@@ -240,6 +240,13 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
         ('compatible', cstr('qcom,ufshc')),
         ('reg', u64(UFS, UFS_SIZE)),
     ])
+    # PMIC arbiter (same on sweet and apollo): the platform expert reads the
+    # PMIC RTC through it only when this node exists. Absent under QEMU.
+    spmi = node('spmi', [
+        ph(),
+        ('compatible', cstr('qcom,spmi-pmic-arb')),
+        ('reg', u64(0x0c440000, 0x1100)),
+    ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
@@ -285,7 +292,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + extra + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + extra + product + ([] if qemu else [ufs, spmi]))
 
 
 def _opt(name, conv=str, default=None):

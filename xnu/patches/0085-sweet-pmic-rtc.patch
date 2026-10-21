@@ -28,10 +28,12 @@
  	IOLockLock(sp_lock);
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -10,6 +10,14 @@
+@@ -9,6 +9,15 @@
+ #include <IOKit/IOPlatformExpert.h>
  #include <IOKit/IODeviceTreeSupport.h>
  #include <IOKit/IOLib.h>
- 
++#include <pexpert/device_tree.h>
++
 +extern "C" int sweet_spmi_init(void);
 +extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
 +
@@ -39,11 +41,10 @@
 +#define RTC_CTRL        0x6046u
 +#define RTC_CTRL_EN     0x80u
 +#define RTC_READ        0x6048u
-+
+ 
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
- 
-@@ -18,6 +26,8 @@
+@@ -18,6 +27,8 @@
  	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
  	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
  	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
@@ -52,23 +53,25 @@
  };
  
  OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
-@@ -29,6 +39,15 @@
+@@ -29,6 +40,17 @@
  	if (!IODTPlatformExpert::start(provider)) {
  		return false;
  	}
 +	/*
 +	 * IOKitInitializeTime waits up to 30 s for an IORTC resource before it
 +	 * reads the time through the platform expert. The PMIC RTC needs no
-+	 * driver of its own: read it here and let the wait end at once.
++	 * driver of its own: read it here and let the wait end at once. The
++	 * ADT's /spmi node says the arbiter exists (absent under QEMU).
 +	 */
-+	if (sweet_spmi_init() == 0) {
++	DTEntry spmi;
++	if (SecureDTLookupEntry(NULL, "/spmi", &spmi) == kSuccess && sweet_spmi_init() == 0) {
 +		IOLog("SWEET: PMIC RTC reads %ld\n", getGMTTimeOfDay());
 +	}
 +	publishResource("IORTC");
  	registerService();
  	IOLog("SWEET: platform expert registered\n");
  	return true;
-@@ -74,6 +93,37 @@
+@@ -74,6 +96,37 @@
  	}
  }
  
