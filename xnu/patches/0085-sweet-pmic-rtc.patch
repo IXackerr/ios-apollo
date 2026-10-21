@@ -1,0 +1,108 @@
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -2,8 +2,9 @@
+  * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
+  * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+  * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+- * Init is serialized by the single built-in SweetBattery personality.
+- * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
++ * Init runs first from SweetPlatformExpert::start, before any driver that
++ * reads through it can match. Battery and RTC APIDs are disjoint from the
++ * existing keys' 008/4c1 APIDs.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -86,11 +87,11 @@
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
++	/* Restrict access to the battery and RTC blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -10,6 +10,14 @@
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ 
++extern "C" int sweet_spmi_init(void);
++extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++
++/* PMIC RTC (PM6150 / PM8150, SID 0): seconds counter, little endian. */
++#define RTC_CTRL        0x6046u
++#define RTC_CTRL_EN     0x80u
++#define RTC_READ        0x6048u
++
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+ 
+@@ -18,6 +26,8 @@
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+@@ -29,6 +39,15 @@
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
++	/*
++	 * IOKitInitializeTime waits up to 30 s for an IORTC resource before it
++	 * reads the time through the platform expert. The PMIC RTC needs no
++	 * driver of its own: read it here and let the wait end at once.
++	 */
++	if (sweet_spmi_init() == 0) {
++		IOLog("SWEET: PMIC RTC reads %ld\n", getGMTTimeOfDay());
++	}
++	publishResource("IORTC");
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+@@ -74,6 +93,37 @@
+ 	}
+ }
+ 
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	uint8_t ctrl = 0, b[4], first;
++	if (sweet_spmi_read(0, RTC_CTRL, &ctrl) || !(ctrl & RTC_CTRL_EN)) {
++		return 0;
++	}
++	/* The counter may carry between byte reads: retry while byte 0 moves. */
++	for (int tries = 0; tries < 3; tries++) {
++		for (unsigned i = 0; i < 4; i++) {
++			if (sweet_spmi_read(0, RTC_READ + i, &b[i])) {
++				return 0;
++			}
++		}
++		if (sweet_spmi_read(0, RTC_READ, &first)) {
++			return 0;
++		}
++		if (first == b[0]) {
++			return (long)((uint32_t)b[0] | (uint32_t)b[1] << 8 |
++			       (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24);
++		}
++	}
++	return 0;
++}
++
++/* Keep the RTC as the bootloader and Android left it: never write it. */
++void
++SweetPlatformExpert::setGMTTimeOfDay(long secs __unused)
++{
++}
++
+ /*
+  * hw.target / hw.product come from IODTPlatformExpert: the first root
+  * "compatible" string and "model" (D22AP / iPhone10,3 in the ADT), which
