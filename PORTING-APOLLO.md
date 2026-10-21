@@ -58,7 +58,7 @@ noted, otherwise from the mainline-based apollo kernel
 
 | Item | sweet (SM7150) | apollo (SM8250) | Action |
 |---|---|---|---|
-| CPUs | 6×A55 + 2×A76, MPIDR Aff1 = core | 4×A55 (cpu@0–300) + 4×A77 (cpu@400–700) | same MPIDR layout, SMP patch 0078 should work as is; 16K + LSE confirmed on all 8 |
+| CPUs | 6×A55 + 2×A76, MPIDR Aff1 = core | 4×A55 (cpu@0–300) + 4×A77 (cpu@400–700) | same MPIDR layout; patch 0078 brings up all 8 cores (`cpus=8`); 16K + LSE confirmed on all 8 |
 | GICv3 | GICD 0x17a00000, GICR 0x17a60000 | same | none |
 | Virtual timer | PPI 3 → INTID 19 | `<GIC_PPI 11>` → **INTID 27** | ADT `virtual-timer-intid` (done); confirmed by the probe |
 | Timer clock | 19.2 MHz | 19.2 MHz | none |
@@ -88,17 +88,18 @@ sweettouch=0 sweetusb=0
 
 `sweettouch=0`: the sweet touch driver would program QUP1 SE7 and probe a
 Goodix address, which is a different device on SM8250. `sweetusb=0`: the
-USB probe reads the sweet QUSB2 PHY address. Start with `cpus=1`, then
-`cpus=4` (A55), then `cpus=8`. Writes to userdata (`ufsrw=1 rootrw=1`)
+USB probe reads the sweet QUSB2 PHY address. `cpus=8` works. Writes to userdata (`ufsrw=1 rootrw=1`)
 only after the read-only boot works.
 
 ## Bring-up order
 
 1. **Probe boot** — done (see above).
 2. **Live FDT** — done: RAM window 0x1_0000_0000 + 0xfcc00000.
-3. **First kernel boot** — done: `rd=md0` with the static test init, `cpus=1`.
+3. **First kernel boot** — done: `rd=md0` with the static test init.
    The CPU nodes need patch 0084 (SweetCPU matched only `qcom,kryo470`;
    without it the boot thread waits for CPU registration forever).
+   `cpus=4` (the A55s) and `cpus=8` (all four A77s too) bring every core up
+   through PSCI CPU_ON with SGI1 verified, with patch 0078 unchanged.
 4. **UFS root, read-only** — done: with `rd=ufsroot0` the kernel's UFS
    driver finds `userdata` (LUN 0, first block 0x2c0000, 109575 MiB, DMA
    buffer above 4 GiB) and, with Android's f2fs still there, HFS reports
