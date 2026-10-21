@@ -390,9 +390,120 @@ static uint32_t to_us(uint64_t ticks)
 	return ticks * 10 / 192;	/* 19.2 MHz */
 }
 
+#if defined(DIAG)
+/*
+ * Black-screen diagnostics (BOARD=apollo builds with DIAG=1 or DIAG=2).
+ * DIAG=1: PSCI SYSTEM_RESET as the very first action. A reboot within
+ *         seconds proves ABL started the shim.
+ * DIAG=2: A) fill the whole cont_splash region with 0xff bytes (white in
+ *         any RGB format) and hold 15 s; B) read the display engine's
+ *         source pipes (DPU SSPP, sm8250 catalog) to find the buffer that
+ *         is really scanned out, draw the console there and hold 60 s;
+ *         then reset. Reading the MDP hangs if its clocks are off: then
+ *         the phone stays at stage A and must be reset by hand.
+ */
+#if DIAG == 2
+#define SPLASH_BASE	0x9c000000UL
+#define SPLASH_SIZE	0x2300000UL
+#define MDP_BASE	0x0ae01000UL	/* display-controller@ae01000 "mdp" */
+#define SSPP_SRC_SIZE	0x00
+#define SSPP_SRC0_ADDR	0x14
+#define SSPP_YSTRIDE0	0x24
+#define SSPP_FORMAT	0x30
+
+static const uint32_t sspp_off[8] = {
+	0x4000, 0x6000, 0x8000, 0xa000,		/* VIG0-3 */
+	0x24000, 0x26000, 0x28000, 0x2a000,	/* DMA0-3 */
+};
+/* names as one string: the shim may hold no absolute pointers in data */
+static const char sspp_names[] = "VIG0VIG1VIG2VIG3DMA0DMA1DMA2DMA3";
+
+static void sspp_name(int i, char out[5])
+{
+	for (int k = 0; k < 4; k++)
+		out[k] = sspp_names[i * 4 + k];
+	out[4] = 0;
+}
+
+static void fill64(uintptr_t base, uint64_t size, uint64_t v)
+{
+	volatile uint64_t *p = (volatile uint64_t *)base;
+	for (uint64_t i = 0; i < size / 8; i++)
+		p[i] = v;
+}
+
+#endif /* DIAG == 2 */
+
+static void __attribute__((noreturn)) diag_main(void)
+{
+#if DIAG == 1
+	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+	for (;;)
+		__asm__ volatile("wfe");
+#else
+	uint32_t size[8], addr[8], stride[8], fmt[8];
+	char name[5];
+	int pick = -1;
+
+	fill64(SPLASH_BASE, SPLASH_SIZE, ~0ULL);
+	delay_ms(15000);
+
+	for (int i = 0; i < 8; i++) {
+		uintptr_t b = MDP_BASE + sspp_off[i];
+		size[i] = rd32(b + SSPP_SRC_SIZE);
+		addr[i] = rd32(b + SSPP_SRC0_ADDR);
+		stride[i] = rd32(b + SSPP_YSTRIDE0) & 0xffff;
+		fmt[i] = rd32(b + SSPP_FORMAT);
+		if (pick < 0 && addr[i] && size[i] && stride[i])
+			pick = i;
+	}
+
+	if (pick >= 0) {
+		int w = size[pick] & 0xffff, h = size[pick] >> 16;
+		int bpp = ((fmt[pick] >> 9) & 3) + 1;
+		uintptr_t a = addr[pick];
+		if (bpp == 4 && a >= 0x80000000UL) {
+			con_fb = (volatile uint32_t *)a;
+			con_w = w;
+			con_h = h;
+			con_stride = stride[pick];
+			con_clear(RED);
+			con_str("DIAG", "scanout found");
+			sspp_name(pick, name);
+			con_str("PIPE", name);
+			con_skip();
+			for (int i = 0; i < 8; i++) {
+				sspp_name(i, name);
+				con_hex2(name, "addr=", addr[i], "size=", size[i]);
+				con_hex2("", "strd=", stride[i], "fmt=", fmt[i]);
+			}
+		} else if (a >= 0x80000000UL) {
+			/* not 32 bpp: horizontal white/black bands, 64 lines each */
+			for (int y = 0; y < h; y++)
+				fill64(a + (uint64_t)y * stride[pick], (uint64_t)stride[pick] & ~7UL,
+				       (y / 64) & 1 ? 0 : ~0ULL);
+		}
+	} else {
+		/* no active pipe: alternate black/white over the splash region */
+		fill64(SPLASH_BASE, SPLASH_SIZE, 0);
+		delay_ms(2000);
+		fill64(SPLASH_BASE, SPLASH_SIZE, ~0ULL);
+	}
+	delay_ms(60000);
+	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+	for (;;)
+		__asm__ volatile("wfe");
+#endif
+}
+#endif
+
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
+
+#if defined(DIAG)
+	diag_main();
+#endif
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
