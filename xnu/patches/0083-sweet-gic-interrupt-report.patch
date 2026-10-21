@@ -1,0 +1,156 @@
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -68,6 +68,9 @@
+ 
+ #include <kern/clock.h>
+ #include <sys/time.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern "C" void sweet_gic_report(const char *when);
++#endif
+ 
+ void
+ IOKitInitializeTime( void )
+@@ -77,11 +80,17 @@
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_gic_report("before IORTC wait");
++#endif
+ // RTC is not present on this target
+ #ifndef BCM2837
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+ #endif
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_gic_report("after IORTC wait");
++#endif
+ #if defined(__i386__) || defined(__x86_64__)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IONVRAM"), &t );
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1868,6 +1868,7 @@
+ 		return; /* spurious */
+ 	}
+ 	if (intid == sweet_vtimer_intid) {
++		os_atomic_inc(&sweet_irq_count.timer, relaxed);
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+@@ -1875,12 +1876,15 @@
+ 		INTERRUPT_MASKED_DEBUG_END();
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 	} else if (intid < 16) {
++		os_atomic_inc(&sweet_irq_count.ipi, relaxed);
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
+ 	} else {
++		os_atomic_inc(&sweet_irq_count.other, relaxed);
++		os_atomic_store(&sweet_irq_count.other_last, intid, relaxed);
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 		if (cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -11,6 +11,8 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/arm64/board_config.h>
++#include <pexpert/protos.h>
++#include <pexpert/arm/protos.h>
+ 
+ 
+ #if HAS_GIC_V3
+@@ -20,6 +22,8 @@
+ #if defined(SWEET)
+ /* Phone default; QEMU virt wires the architected virtual timer to INTID 27. */
+ SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
++/* Interrupts taken by sleh_irq, by kind. */
++struct sweet_irq_count sweet_irq_count;
+ #endif
+ 
+ static vm_offset_t gicd_base;
+@@ -222,6 +226,61 @@
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++
++#if defined(SWEET)
++#define GICD_TYPER      0x004
++#define GICD_ISENABLER  0x100
++#define GICD_ISPENDR    0x200
++#define GICR_ISPENDR0   0x10200
++#define GICR_ISACTIVER0 0x10300
++
++/*
++ * Interrupt state of the boot CPU, for bringing up a new board: after one
++ * second with interrupts enabled the timer count must have grown by about
++ * a hundred. Also lists SPIs that are both enabled and pending, which is
++ * what a firmware-enabled level interrupt nobody handles looks like.
++ */
++void
++sweet_gic_report(const char *when)
++{
++	struct sweet_irq_count before = sweet_irq_count;
++	boolean_t istate = ml_set_interrupts_enabled(TRUE);
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &deadline);
++	deadline += mach_absolute_time();
++	while (mach_absolute_time() < deadline) {
++		;
++	}
++	uint64_t daif = __builtin_arm_rsr64("DAIF");
++	(void)ml_set_interrupts_enabled(istate);
++
++	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++	printf("SWEET GIC %s: 1 s: timer +%llu ipi +%llu other +%llu (last %u); total timer %llu\n",
++	    when, sweet_irq_count.timer - before.timer,
++	    sweet_irq_count.ipi - before.ipi,
++	    sweet_irq_count.other - before.other,
++	    sweet_irq_count.other_last, sweet_irq_count.timer);
++	printf("SWEET GIC %s: intid %u daif %#llx cntv_ctl %#llx tval %#llx isr %#llx hppir1 %#llx pmr %#llx\n",
++	    when, sweet_vtimer_intid, daif,
++	    __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("CNTV_TVAL_EL0"),
++	    __builtin_arm_rsr64("ISR_EL1"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"),
++	    __builtin_arm_rsr64("ICC_PMR_EL1"));
++	printf("SWEET GIC %s: gicd_ctlr %#x gicr enable %#x pend %#x active %#x group %#x waker %#x\n",
++	    when, gicd_read32(GICD_CTLR), gicr_read32(GICR_ISENABLER0),
++	    gicr_read32(GICR_ISPENDR0), gicr_read32(GICR_ISACTIVER0),
++	    gicr_read32(GICR_IGROUPR0), gicr_read32(GICR_WAKER));
++
++	unsigned int lines = ((gicd_read32(GICD_TYPER) & 0x1f) + 1) * 32;
++	for (unsigned int n = 1; n < lines / 32; n++) {
++		uint32_t live = gicd_read32(GICD_ISENABLER + 4 * n) &
++		    gicd_read32(GICD_ISPENDR + 4 * n);
++		if (live) {
++			printf("SWEET GIC %s: SPIs %u-%u enabled and pending %#x\n",
++			    when, 32 * n, 32 * n + 31, live);
++		}
++	}
++}
++#endif /* SWEET */
+ #else
+ void
+ pe_init_fiq()
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -38,6 +38,15 @@
+ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern uint32_t sweet_vtimer_intid;
++
++struct sweet_irq_count {
++	uint64_t timer;
++	uint64_t ipi;
++	uint64_t other;
++	uint32_t other_last;
++};
++extern struct sweet_irq_count sweet_irq_count;
++void sweet_gic_report(const char *when);
+ #endif
+ 
+ #ifdef PRIVATE
