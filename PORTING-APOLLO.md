@@ -1,7 +1,7 @@
 # Porting ios-sweet to the Xiaomi Mi 10T / 10T Pro (apollo, SM8250)
 
-Status: **the shim probe runs on the phone (2026-10-21); no XNU boot yet.**
-Branch `apollo`.
+Status: **XNU boots on the phone to a userspace init from a RAM disk
+(2026-10-21).** Branch `apollo`.
 
 Values below come from the phone's stock boot.img DTB and live FDT where
 noted, otherwise from the mainline-based apollo kernel
@@ -94,13 +94,16 @@ only after the read-only boot works.
 
 1. **Probe boot** — done (see above).
 2. **Live FDT** — done: RAM window 0x1_0000_0000 + 0xfcc00000.
-3. **Kernel**: fork the repo, run the `xnu` workflow on this branch
-   (`gh workflow run xnu.yml --ref apollo`), build the payload with
-   `mkadt.py --board apollo …` and the boot args above, boot it with
-   a RAM disk first (as sweet did), then `rd=ufsroot0`.
-4. **Root image**: same `tools/mkiosroot.sh` image as sweet, flashed to
+3. **First kernel boot** — done: `rd=md0` with the static test init, `cpus=1`.
+   The CPU nodes need patch 0084 (SweetCPU matched only `qcom,kryo470`;
+   without it the boot thread waits for CPU registration forever).
+4. **UFS root, read-only**: the same payload with `rd=ufsroot0` and no
+   RAM disk. With Android still in `userdata` the expected result is
+   `unknown Volume Signature` and mountroot retrying, without a panic.
+   Never pass `ufsrw=1` while Android data is on the partition.
+5. **Root image**: same `tools/mkiosroot.sh` image as sweet, flashed to
    `userdata` (erases Android data; back up first).
-5. **Touch driver** (NT36675 over GENI SPI), then the WLED backlight for
+6. **Touch driver** (NT36675 over GENI SPI), then the WLED backlight for
    display power, then the USB live log with the 7nm PHY.
 
 ## NT36675 touch driver plan
