@@ -37,6 +37,7 @@
 #include <sys/proc.h>
 #include <sys/errno.h>
 
+#include "SweetAccelerator.h"
 #include "SweetSurface.h"
 
 extern "C" {
@@ -175,7 +176,12 @@ sgpu_ioreturn(int err)
 
 /* ---------------------------------------------------------------- */
 
-class SweetAdreno : public IOService {
+/*
+ * An IOAcceleratorES, because that is the class Metal and QuartzCore match
+ * the GPU by; the user client, though, is IOService's (IOUserClientClass),
+ * not the placeholder's refusal.
+ */
+class SweetAdreno : public IOAcceleratorES {
 	OSDeclareDefaultStructors(SweetAdreno);
 
 	uint32_t fStage;
@@ -186,9 +192,18 @@ class SweetAdreno : public IOService {
 
 public:
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
+	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 };
 
-OSDefineMetaClassAndStructors(SweetAdreno, IOService);
+OSDefineMetaClassAndStructors(SweetAdreno, IOAcceleratorES);
+
+IOReturn
+SweetAdreno::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+    IOUserClient **handler)
+{
+	return IOService::newUserClient(owningTask, securityID, type, handler);
+}
 
 void
 SweetAdreno::publishStatus()
@@ -215,21 +230,19 @@ SweetAdreno::bringupThread(void *arg, __unused wait_result_t wr)
 	if (!err && sgpu_dev.stage_reached >= SGPU_STAGE_USER) {
 		self->setProperty(kIOUserClientClassKey, "SweetAdrenoUserClient");
 		/*
-		 * Metal plugin discovery (docs/METAL.md). Metal.framework reads
-		 * these from the accelerator service and loads
-		 * /System/Library/Extensions/<MetalPluginName>.bundle, then
-		 * instantiates <MetalPluginClassName> with -initWithAcceleratorPort:.
-		 * Off unless sweetmetal=1: as soon as a Metal device exists,
-		 * QuartzCore switches from its working software renderer to Metal,
-		 * so this must stay off until SweetMetal can render the UI.
+		 * Metal plug-in discovery (docs/METAL.md): Metal matches every
+		 * IOAcceleratorES, loads /System/Library/Extensions/
+		 * <MetalPluginName>.bundle and instantiates <MetalPluginClassName>
+		 * (a _MTLDevice subclass) with -initWithAcceleratorPort:. Off
+		 * unless sweetmetal=1: as soon as a Metal device exists, QuartzCore
+		 * leaves its working software renderer for Metal.
 		 */
 		uint32_t metal = 0;
 		PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal));
 		if (metal == 1) {
 			self->setProperty("MetalPluginName", "SweetMetal");
 			self->setProperty("MetalPluginClassName", "SweetMetalDevice");
-			self->setProperty("MetalStatisticsName", "SweetMetalStatistics");
-			IOLog("SWEET GPU: Metal plugin properties published (sweetmetal=1)\n");
+			IOLog("SWEET GPU: Metal plug-in named (sweetmetal=1)\n");
 		}
 		self->registerService();
 		IOLog("SWEET GPU: SweetAdreno published\n");

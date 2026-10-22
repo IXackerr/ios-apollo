@@ -4800,9 +4800,79 @@
  IODataQueue.cpo_CXXWARNFLAGS_ADD += -Wno-cast-align
  IOHibernateIO.cpo_CXXWARNFLAGS_ADD += -Wno-cast-align
  IOHibernateRestoreKernel.o_CWARNFLAGS_ADD += -Wno-cast-align
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -6,33 +6,28 @@
+  * Without a GPU that costs backboardd 30 s before the first frame. This
+  * service ends the wait at once. It names no Metal or GL plug-in, so
+  * Metal still finds no device and CoreAnimation renders on the CPU as
+- * before. Boot-arg sweetaccel=0 leaves it out.
++ * before. Boot-arg sweetaccel=0 leaves it out, and so does sweetmetal=1:
++ * Metal accepts one device only, and with the plug-in on, the GPU's own
++ * service (SweetAdreno, a subclass) is the accelerator QuartzCore must
++ * find, a little later in boot.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+ #if defined(SWEET)
+-#include <IOKit/IOService.h>
+ #include <IOKit/IOLib.h>
+ #include <pexpert/pexpert.h>
+-
+-class IOAcceleratorES : public IOService {
+-	OSDeclareDefaultStructors(IOAcceleratorES);
+-
+-public:
+-	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+-	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
+-	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+-};
++#include "SweetAccelerator.h"
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ 
+ bool
+ IOAcceleratorES::start(IOService *provider)
+ {
+-	int enabled = 1;
++	int enabled = 1, metal = 0;
+ 
+ 	(void)PE_parse_boot_argn("sweetaccel", &enabled, sizeof(enabled));
+-	if (!enabled || !IOService::start(provider)) {
++	(void)PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal));
++	if (!enabled || metal == 1 || !IOService::start(provider)) {
+ 		return false;
+ 	}
+ 	registerService();
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAccelerator.h
+@@ -0,0 +1,23 @@
++/*
++ * IOAcceleratorES, the class Metal and QuartzCore look the GPU up by
++ * (IOServiceMatching("IOAcceleratorES"), subclasses included).
++ *
++ * SweetAccelerator.cpp registers a placeholder instance that names no
++ * plug-in; SweetAdreno (the Adreno driver) derives from it and names the
++ * SweetMetal plug-in when boot-arg sweetmetal=1.
++ */
++#ifndef SWEET_ACCELERATOR_H
++#define SWEET_ACCELERATOR_H
++
++#include <IOKit/IOService.h>
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,767 @@
+@@ -0,0 +1,780 @@
 +/*
 + * SweetAdreno - IOKit front end of the SWEET Adreno 650 driver.
 + *
@@ -4842,6 +4912,7 @@
 +#include <sys/proc.h>
 +#include <sys/errno.h>
 +
++#include "SweetAccelerator.h"
 +#include "SweetSurface.h"
 +
 +extern "C" {
@@ -4980,7 +5051,12 @@
 +
 +/* ---------------------------------------------------------------- */
 +
-+class SweetAdreno : public IOService {
++/*
++ * An IOAcceleratorES, because that is the class Metal and QuartzCore match
++ * the GPU by; the user client, though, is IOService's (IOUserClientClass),
++ * not the placeholder's refusal.
++ */
++class SweetAdreno : public IOAcceleratorES {
 +	OSDeclareDefaultStructors(SweetAdreno);
 +
 +	uint32_t fStage;
@@ -4991,9 +5067,18 @@
 +
 +public:
 +	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 +};
 +
-+OSDefineMetaClassAndStructors(SweetAdreno, IOService);
++OSDefineMetaClassAndStructors(SweetAdreno, IOAcceleratorES);
++
++IOReturn
++SweetAdreno::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++    IOUserClient **handler)
++{
++	return IOService::newUserClient(owningTask, securityID, type, handler);
++}
 +
 +void
 +SweetAdreno::publishStatus()
@@ -5020,21 +5105,19 @@
 +	if (!err && sgpu_dev.stage_reached >= SGPU_STAGE_USER) {
 +		self->setProperty(kIOUserClientClassKey, "SweetAdrenoUserClient");
 +		/*
-+		 * Metal plugin discovery (docs/METAL.md). Metal.framework reads
-+		 * these from the accelerator service and loads
-+		 * /System/Library/Extensions/<MetalPluginName>.bundle, then
-+		 * instantiates <MetalPluginClassName> with -initWithAcceleratorPort:.
-+		 * Off unless sweetmetal=1: as soon as a Metal device exists,
-+		 * QuartzCore switches from its working software renderer to Metal,
-+		 * so this must stay off until SweetMetal can render the UI.
++		 * Metal plug-in discovery (docs/METAL.md): Metal matches every
++		 * IOAcceleratorES, loads /System/Library/Extensions/
++		 * <MetalPluginName>.bundle and instantiates <MetalPluginClassName>
++		 * (a _MTLDevice subclass) with -initWithAcceleratorPort:. Off
++		 * unless sweetmetal=1: as soon as a Metal device exists, QuartzCore
++		 * leaves its working software renderer for Metal.
 +		 */
 +		uint32_t metal = 0;
 +		PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal));
 +		if (metal == 1) {
 +			self->setProperty("MetalPluginName", "SweetMetal");
 +			self->setProperty("MetalPluginClassName", "SweetMetalDevice");
-+			self->setProperty("MetalStatisticsName", "SweetMetalStatistics");
-+			IOLog("SWEET GPU: Metal plugin properties published (sweetmetal=1)\n");
++			IOLog("SWEET GPU: Metal plug-in named (sweetmetal=1)\n");
 +		}
 +		self->registerService();
 +		IOLog("SWEET GPU: SweetAdreno published\n");

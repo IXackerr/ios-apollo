@@ -56,6 +56,31 @@ What to check on iOS 16 (section 4) before writing more: whether the
 mechanism is the same (`MetalPluginName` → `initWithAcceleratorPort:`), what
 class the real `AGXMetalA11` has, and who checks the device class.
 
+### 2.1 What iOS 16 actually does (20H392, read from the binaries)
+
+- `MTLCreateSystemDefaultDevice` registers devices once per process: it
+  matches `IOServiceMatching("IOAcceleratorES")` (subclasses too), reads
+  `MetalPluginName` from each match, loads
+  `/System/Library/Extensions/<name>.bundle`, and takes the class named by
+  `MetalPluginClassName` (or the bundle's principal class).
+- That class must be a subclass of `_MTLDevice`, or Metal drops it before
+  calling `-initWithAcceleratorPort:`. The device must conform to both
+  `MTLDevice` and `MTLDeviceSPI`; `featureProfile` decides the limits Metal
+  computes for it. More than one plug-in device makes the default-device
+  call fail.
+- Apple's own driver sits on `IOGPUMetalDevice : _MTLDevice`; `_MTLDevice`
+  itself does no IOKit work in `-init`, so a direct `_MTLDevice` subclass
+  that calls `[super init]` is enough (option A above, `NSObject`, is not).
+- QuartzCore waits for an `IOAcceleratorES` up to 30 s, then uses Metal if a
+  device exists. A nil `default.metallib` library aborts the render server.
+  `MetalStatisticsName` is never read.
+- QuartzCore's `default.metallib` (141 functions) parses with metal2vulkan,
+  and with an Adreno 650 profile all but `inplace_copy` (raster order
+  groups, which need fragment shader interlock) translated in a first sweep.
+
+So SweetAdreno is an `IOAcceleratorES` and names the plug-in with
+`sweetmetal=1`; the placeholder accelerator of patch 0089 stays out then.
+
 ## 3. Architecture
 
 ```
