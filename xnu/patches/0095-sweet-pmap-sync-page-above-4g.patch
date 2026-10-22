@@ -1,0 +1,18 @@
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6881,7 +6881,14 @@
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	/*
++	 * SWEET: ptoa, not pp << PAGE_SHIFT: the shift is done in 32 bits
++	 * (ppnum_t) and drops the high bits of any page above 4 GiB, which
++	 * on apollo is all of the kernel's RAM. It runs when a page of a
++	 * write-combined user mapping is faulted in, and panicked in
++	 * phystokv_range with the truncated address.
++	 */
++	flush_dcache((vm_offset_t) ptoa(pp), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP
