@@ -1600,18 +1600,18 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
  * or layout has none.
  */
 - (id<MTLTexture>)newSurfaceTexture:(MTLTextureDescriptor *)desc surface:(IOSurfaceRef)surface
-    base:(uint8_t *)base size:(size_t)size bytesPerRow:(size_t)bpr
+    base:(uint8_t *)base size:(size_t)size offset:(uint64_t)offset bytesPerRow:(size_t)bpr
 {
 	BOOL write = (desc.usage & MTLTextureUsageShaderWrite) != 0;
-	NSString *key = [NSString stringWithFormat:@"%u:%p:%zu:%lu:%lux%lu:%d",
-	    IOSurfaceGetID(surface), base, size, (unsigned long)desc.pixelFormat,
+	NSString *key = [NSString stringWithFormat:@"%u:%p:%zu:%llu:%lu:%lux%lu:%d",
+	    IOSurfaceGetID(surface), base, size, offset, (unsigned long)desc.pixelFormat,
 	    (unsigned long)desc.width, (unsigned long)desc.height, write];
 	SweetSurfaceImage *image;
 	@synchronized (self) {
 		image = _surfaces[key];
 	}
 	if (image == nil) {
-		smtl_surface_image *s = smtl_device_new_surface_image(_d, base, size, 0, bpr,
+		smtl_surface_image *s = smtl_device_new_surface_image(_d, base, size, offset, bpr,
 		    (uint32_t)desc.pixelFormat, desc.width, desc.height, (uint32_t)desc.usage);
 		if (s == NULL) {
 			SMLOG(@"iosurface %u (%lux%lu format %lu): copied, no image: %s",
@@ -1637,9 +1637,10 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 	tex->_usage = desc.usage;
 	tex->_iosurface = (IOSurfaceRef)CFRetain(surface);
 	tex->_image = image;
-	tex->_cpu = base;
+	tex->_cpu = base + offset;
 	tex->_cpuRow = bpr;
-	tex->_cpuTexel = IOSurfaceGetBytesPerElement(surface);
+	tex->_cpuTexel = desc.pixelFormat == MTLPixelFormatR8Unorm ? 1 :
+	    desc.pixelFormat == MTLPixelFormatRG8Unorm ? 2 : IOSurfaceGetBytesPerElement(surface);
 	smtl_texture_info(tex->_t, &tex->_info);
 	return tex;
 }
@@ -1669,10 +1670,26 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 	 * last (a texture keeps its own alive too) and reuse them while the
 	 * surface is still mapped at the same place.
 	 */
-	if (planes == 0 && base != NULL && !_noSurfaceImages) {
+	if (planes > 0) {
+		static unsigned logged;
+		if (logged < 24) {
+			logged++;
+			OSType f = IOSurfaceGetPixelFormat(surface);
+			SMLOG(@"iosurface %u '%c%c%c%c' plane %lu of %zu: %lux%lu format %lu usage %#lx",
+			    IOSurfaceGetID(surface), (char)(f >> 24), (char)(f >> 16), (char)(f >> 8),
+			    (char)f, (unsigned long)plane, planes, (unsigned long)desc.width,
+			    (unsigned long)desc.height, (unsigned long)desc.pixelFormat,
+			    (unsigned long)desc.usage);
+		}
+	}
+	/* a plane of a YCbCr surface read as R8 / RG8 lies in the surface as a 2D image too */
+	BOOL plain = planes == 0 || desc.pixelFormat == MTLPixelFormatR8Unorm ||
+	    desc.pixelFormat == MTLPixelFormatRG8Unorm;
+	if (plain && base != NULL && !_noSurfaceImages) {
 		id<MTLTexture> tex = [self newSurfaceTexture:desc surface:surface base:base
-		    size:size bytesPerRow:bpr];
+		    size:size offset:offset bytesPerRow:bpr];
 		if (tex != nil) {
+			((SweetMetalTexture *)tex)->_plane = plane;
 			return tex;
 		}
 	}
