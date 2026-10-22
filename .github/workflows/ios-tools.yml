@@ -1,5 +1,6 @@
 # Small iOS programs for the phone: ios/sweetrun (runs a program handed
-# over in the boot image) and the GPU user-space test (gpu/userland/gputest).
+# over in the boot image) and the GPU user-space tests (gpu/userland/gputest,
+# gpu/hosttest/vktest.c; turnip itself comes from gpu-userland).
 name: ios-tools
 on:
   workflow_dispatch:
@@ -10,6 +11,7 @@ on:
       - "gpu/userland/libsweetgpu/**"
       - "gpu/userland/gputest/**"
       - "gpu/kernel/sweet_gpu_uapi.h"
+      - "gpu/hosttest/vktest.c"
       - ".github/workflows/ios-tools.yml"
 jobs:
   build:
@@ -25,6 +27,10 @@ jobs:
           $CC -Igpu/kernel -Igpu/userland/libsweetgpu -o out/gputest \
             gpu/userland/gputest/gputest.c gpu/userland/libsweetgpu/sweetgpu.c ios/sweetrun/sweetlog.c \
             -framework IOKit -framework CoreFoundation
+          # vktest dlopens turnip; the Khronos headers are enough to build it
+          brew list vulkan-headers >/dev/null 2>&1 || brew install vulkan-headers
+          $CC -I"$(brew --prefix vulkan-headers)/include" -Iios/sweetrun -o out/vktest \
+            gpu/hosttest/vktest.c ios/sweetrun/sweetlog.c -framework IOKit -framework CoreFoundation
           for f in out/*; do codesign -f -s - "$f"; done
           file out/*
       - uses: actions/upload-artifact@v4

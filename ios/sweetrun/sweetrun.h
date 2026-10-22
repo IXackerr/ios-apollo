@@ -5,9 +5,9 @@
 #define SWEETRUN_H
 
 /*
- * Write property `prop` of the device tree node /sweet-run (an extra file
- * from the boot image, mkadt.py --run-lib) to `path`; returns path, or
- * NULL when the property is missing or cannot be written.
+ * Write the extra file `prop` from the boot image (mkadt.py --run-lib:
+ * properties PROP-0, PROP-1, ... of the device tree node /sweet-run) to
+ * `path`; returns path, or NULL when it is missing or cannot be written.
  */
 const char *sweetrun_file(const char *prop, const char *path);
 

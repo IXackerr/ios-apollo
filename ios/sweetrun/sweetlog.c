@@ -50,6 +50,35 @@ sweetlog_init(void)
 	}
 }
 
+static CFDataRef
+run_prop(io_registry_entry_t node, const char *name)
+{
+	CFStringRef key = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+	CFTypeRef v = IORegistryEntryCreateCFProperty(node, key, NULL, 0);
+	CFRelease(key);
+	if (v != NULL && CFGetTypeID(v) != CFDataGetTypeID()) {
+		CFRelease(v);
+		v = NULL;
+	}
+	return v;
+}
+
+static int
+write_all(int fd, CFDataRef data)
+{
+	const UInt8 *p = CFDataGetBytePtr(data);
+	CFIndex left = CFDataGetLength(data);
+	while (left > 0) {
+		ssize_t n = write(fd, p, (size_t)left);
+		if (n <= 0) {
+			return -1;
+		}
+		p += n;
+		left -= n;
+	}
+	return 0;
+}
+
 const char *
 sweetrun_file(const char *prop, const char *path)
 {
@@ -57,34 +86,28 @@ sweetrun_file(const char *prop, const char *path)
 	if (node == MACH_PORT_NULL) {
 		return NULL;
 	}
-	CFStringRef key = CFStringCreateWithCString(NULL, prop, kCFStringEncodingUTF8);
-	CFTypeRef v = IORegistryEntryCreateCFProperty(node, key, NULL, 0);
-	CFRelease(key);
-	IOObjectRelease(node);
-	if (v == NULL || CFGetTypeID(v) != CFDataGetTypeID()) {
-		if (v != NULL) {
-			CFRelease(v);
-		}
-		return NULL;
-	}
-	const UInt8 *p = CFDataGetBytePtr(v);
-	CFIndex left = CFDataGetLength(v);
 	unlink(path);
 	int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0755);
-	while (fd >= 0 && left > 0) {
-		ssize_t n = write(fd, p, (size_t)left);
-		if (n <= 0) {
-			close(fd);
-			fd = -1;
+	int chunks = 0, err = fd < 0;
+	/* the file is split into properties PROP-0, PROP-1, ... (mkadt.py) */
+	for (; fd >= 0 && !err; chunks++) {
+		char name[32];
+		snprintf(name, sizeof(name), "%s-%d", prop, chunks);
+		CFDataRef d = run_prop(node, name);
+		if (d == NULL) {
 			break;
 		}
-		p += n;
-		left -= n;
+		err = write_all(fd, d);
+		CFRelease(d);
 	}
-	CFRelease(v);
-	if (fd < 0) {
+	IOObjectRelease(node);
+	if (fd >= 0) {
+		close(fd);
+	}
+	if (err || chunks == 0) {
+		printf("sweetrun_file: %s: %s\n", prop, err ? "cannot write" : "not in the boot image");
+		unlink(path);
 		return NULL;
 	}
-	close(fd);
 	return path;
 }

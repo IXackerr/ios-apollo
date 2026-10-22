@@ -18,8 +18,9 @@ ADT is a local build product.
 --run PROGRAM adds /sweet-run: ios/sweetrun, started by launchd at boot,
 runs PROGRAM (an iOS Mach-O) with ARGS after SECONDS and its output goes
 to the console. Tests reach the phone in the boot image, the root stays
-as it is. --run-lib FILE adds one more file for the program (property
-"lib", ios/sweetrun/sweetrun.h sweetrun_file), e.g. the Vulkan driver.
+as it is. --run-lib FILE adds one more file for the program (properties
+lib-0, lib-1, ...; ios/sweetrun/sweetrun.h sweetrun_file), e.g. the
+Vulkan driver.
 
 For apollo the RAM window has no default on purpose: take it from the
 phone's live FDT with tools/fdtmem.py (see PORTING-APOLLO.md). The touch
@@ -118,6 +119,11 @@ def d22ap_product(path=D22AP_ADT):
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
+
+
+# Large files in /sweet-run are split: one 17 MB property never reached
+# user space through IORegistryEntryCreateCFProperty.
+RUN_CHUNK = 512 * 1024
 
 
 def node(name, props=(), children=()):
@@ -345,7 +351,8 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
             ('program', program),
             ('args', b''.join(cstr(a) for a in args)),
             ('delay', u32(delay)),
-        ] + ([('lib', lib)] if lib else [])))
+        ] + [(f'lib-{i}', lib[o:o + RUN_CHUNK])
+             for i, o in enumerate(range(0, len(lib or b''), RUN_CHUNK))]))
     if b['touch']:
         extra.append(node('sweet-touch', [
             ph(),
