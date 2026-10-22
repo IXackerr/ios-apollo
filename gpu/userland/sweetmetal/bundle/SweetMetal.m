@@ -110,6 +110,7 @@ smcount(Class c, int delta)
 }
 
 static unsigned smCompleted;
+static sgpu_dev *smGpu;         /* the device's kernel client, for SURFACE_BUSY */
 static uint64_t smLatencySum, smLatencyMax;    /* commit to completion, mach ticks */
 
 /*
@@ -610,6 +611,8 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 	NSMutableArray<MTLCommandBufferHandler> *_scheduled;
 	dispatch_semaphore_t _slot;     /* the queue's in-flight slot this buffer holds */
 	uint64_t _seq;                  /* smSeqTake, until its completion takes it */
+	uint32_t _surfaces[8];          /* IOSurfaces it renders into */
+	unsigned _surfaceCount;
 }
 @property (copy, atomic) NSString *label;
 @end
@@ -864,6 +867,17 @@ runHandler(void *ctx)
 			continue;
 		}
 		n = i + 1;
+		SweetMetalTexture *t = (SweetMetalTexture *)a.texture;
+		if (t->_image != nil && t->_iosurface != NULL) {
+			uint32_t sid = IOSurfaceGetID(t->_iosurface);
+			unsigned k = 0;
+			while (k < _surfaceCount && _surfaces[k] != sid) {
+				k++;
+			}
+			if (k == _surfaceCount && k < 8) {
+				_surfaces[_surfaceCount++] = sid;
+			}
+		}
 		ca[i] = (struct smtl_color_attachment){
 			.texture = ((SweetMetalTexture *)a.texture)->_t,
 			.load_action = (uint32_t)a.loadAction,
@@ -920,6 +934,8 @@ struct smDone {
 	uint64_t seq;
 	uint64_t committed;     /* mach_absolute_time */
 	int given;              /* the slot and seq went back already */
+	uint32_t surfaces[8];   /* IOSurfaces marked busy for the framebuffer */
+	unsigned surfaceCount;
 };
 
 static void
@@ -930,6 +946,9 @@ smGiveBack(struct smDone *d)
 	}
 	if (d->slot != NULL) {
 		dispatch_semaphore_signal((__bridge_transfer dispatch_semaphore_t)d->slot);
+	}
+	for (unsigned i = 0; i < d->surfaceCount; i++) {
+		sgpu_surface_busy(smGpu, d->surfaces[i], -1);
 	}
 	smSeqDone(d->seq);
 }
@@ -967,6 +986,12 @@ countCompleted(void *ctx)
 	} else {
 		_slot = nil;
 		_seq = 0;
+		/* the framebuffer shows these surfaces only once this completes */
+		for (unsigned i = 0; smGpu != NULL && i < _surfaceCount; i++) {
+			if (sgpu_surface_busy(smGpu, _surfaces[i], 1) == 0) {
+				d->surfaces[d->surfaceCount++] = _surfaces[i];
+			}
+		}
 	}
 	if (smtl_cmdbuf_commit(_c) != 0) {
 		/* a refused commit runs no handler (which keeps d, unused) */
@@ -1219,7 +1244,10 @@ processAllowed(void)
 		return nil;
 	}
 	_name = [NSString stringWithUTF8String:smtl_device_name(_d)];
-	sgpu_open(&_gpu);       /* for IOSurface import (IMPORT_SURFACE) */
+	sgpu_open(&_gpu);       /* for IOSurface import and SURFACE_BUSY */
+	if (smGpu == NULL) {
+		smGpu = _gpu;
+	}
 	_noSurfaceImages = getenv("SWEETMETAL_COPY_SURFACES") != NULL;
 	SMLOG(@"device %@ ready in %s", _name, getprogname());
 	return self;
