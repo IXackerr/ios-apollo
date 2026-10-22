@@ -8,8 +8,10 @@
  * memory entry of a kernel buffer is not a VM object, so the cache-mode
  * change it asks for can fail and leave the map cacheable (the GMU then
  * faulted on page tables the CPU had already written). The pages are
- * therefore mapped a second time with ml_io_map_wcomb, whose pmap_map
- * applies the attribute to managed pages too.
+ * therefore mapped a second time, write-combined, with io_map's kernel_map
+ * variant (ml_io_map_unmappable): its pmap_map applies the attribute to
+ * managed pages too, and unlike ml_io_map_wcomb it does not draw on the
+ * 8 MiB I/O submap, which the GMU's 16 MiB of code space alone exceeds.
  *
  * Aliasing rule (the same one Linux follows for non-coherent DMA): the
  * descriptor's own cacheable kernel mapping is zeroed, cleaned and
@@ -26,11 +28,12 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <sys/errno.h>
+#include <vm/memory_types.h>
 
 extern "C" {
 #include "../../../bsd/dev/sweet_gpu.h"
 void flush_dcache64(addr64_t addr, unsigned count, int phys);
-vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
 void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 }
 
@@ -75,7 +78,7 @@ sgpu_dma_alloc(size_t size, size_t align, uint32_t flags, struct sgpu_dma *out)
 	out->size = size;
 	out->os_md = md;
 	if (flags & SGPU_DMA_WC) {
-		vm_offset_t va = ml_io_map_wcomb((vm_offset_t)pa, size);
+		vm_offset_t va = ml_io_map_unmappable((vm_offset_t)pa, size, VM_WIMG_WCOMB);
 		if (va == 0) {
 			md->complete();
 			md->release();
