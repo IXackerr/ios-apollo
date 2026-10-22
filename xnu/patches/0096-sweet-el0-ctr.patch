@@ -1,0 +1,27 @@
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -651,11 +651,23 @@
+ #define SCTLR_JOP_KEYS_DEFAULT  0
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: user space may read CTR_EL0. Mesa (util/cache_ops_aarch64.c)
++ * takes its cache line size from it before cleaning GPU buffers with the
++ * DC instructions UCI already allows; without UCT the read is an
++ * undefined instruction (SIGILL). Both core types report 64-byte lines.
++ */
++#define SCTLR_UCT_DEFAULT       SCTLR_UCT_ENABLED
++#else
++#define SCTLR_UCT_DEFAULT       0
++#endif
++
+ #define SCTLR_EL1_DEFAULT \
+ 	(SCTLR_RESERVED | SCTLR_UCI_ENABLED | SCTLR_nTWE_WFE_ENABLED | SCTLR_DZE_ENABLED | \
+ 	 SCTLR_I_ENABLED | SCTLR_SED_DISABLED | SCTLR_CP15BEN_ENABLED |                    \
+ 	 SCTLR_SA0_ENABLED | SCTLR_SA_ENABLED | SCTLR_C_ENABLED | SCTLR_M_ENABLED |        \
+-	 SCTLR_CSEH_DEFAULT | SCTLR_DSSBS_DEFAULT |                                        \
++	 SCTLR_CSEH_DEFAULT | SCTLR_DSSBS_DEFAULT | SCTLR_UCT_DEFAULT |                    \
+ 	 SCTLR_ROP_KEYS_DEFAULT | SCTLR_JOP_KEYS_DEFAULT)
+ 
+ /*
