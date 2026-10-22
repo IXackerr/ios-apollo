@@ -1305,24 +1305,19 @@ countCompleted(void *ctx)
 - (void)enqueue { }
 - (NSError *)error { return nil; }
 /*
- * QuartzCore renders a snapshot (CARenderServerRenderDisplay) and replies
- * as soon as these return, and the requester reads the surface on the CPU
- * at once: on Apple's GPUs the surface's lock waits for the GPU's writes.
- * Here they return once the GPU is done. The method returns a BOOL, which
- * QuartzCore tests (MetalContext::flush).
+ * Submitted at commit: these return at once. QuartzCore flushes every
+ * frame through commitAndWaitUntilSubmitted, and waiting there for the GPU
+ * held its render thread for the whole of the GPU's work. A surface
+ * rendered for another process (a snapshot read on the CPU) is waited for
+ * by the surface's lock instead, as on Apple's GPUs (xnu 0107). The method
+ * returns a BOOL, which QuartzCore tests (MetalContext::flush).
  */
 - (BOOL)commitAndWaitUntilSubmitted
 {
 	[self commit];
-	smtl_cmdbuf_wait(_c, UINT32_MAX);
 	return YES;
 }
-- (void)waitUntilScheduled
-{
-	if (smtl_cmdbuf_status(_c) >= 2) {      /* committed */
-		smtl_cmdbuf_wait(_c, UINT32_MAX);
-	}
-}
+- (void)waitUntilScheduled { }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)h
 {
 	/* scheduled at commit: call it then (and at once when already committed) */
