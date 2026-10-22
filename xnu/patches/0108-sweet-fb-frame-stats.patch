@@ -1,0 +1,54 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -144,6 +144,9 @@
+ 	uint32_t      fActiveStart, fActiveEnd;     /* the visible lines */
+ 	uint32_t      fLineNS;        /* time per line */
+ 	uint32_t      fFrames;        /* panel frames per tick */
++	/* per 10 s, logged: swaps, frames shown, ticks a frame waited for the GPU, copy time */
++	uint32_t      fStatSwaps, fStatShown, fStatBusy;
++	uint64_t      fStatCopyNS, fStatStart;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -413,14 +416,33 @@
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		uint64_t t0 = mach_absolute_time();
+ 		if (!fb->present(rec)) {
+ 			/* not rendered yet: show it (or a newer one) next tick */
+ 			IOLockLock(fb->fLock);
+ 			fb->fDirty = true;
+ 			IOLockUnlock(fb->fLock);
++			fb->fStatBusy++;
++		} else {
++			uint64_t ns;
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			fb->fStatShown++;
++			fb->fStatCopyNS += ns;
+ 		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
++	uint64_t elapsed;
++	absolutetime_to_nanoseconds(mach_absolute_time() - fb->fStatStart, &elapsed);
++	if (elapsed >= 10ull * NSEC_PER_SEC) {
++		if (fb->fStatSwaps != 0) {
++			IOLog("SWEET FB: 10 s: %u swaps, %u frames shown (copy %llu us), %u ticks waited "
++			    "for the GPU\n", fb->fStatSwaps, fb->fStatShown,
++			    fb->fStatShown ? fb->fStatCopyNS / fb->fStatShown / 1000 : 0, fb->fStatBusy);
++		}
++		fb->fStatSwaps = fb->fStatShown = fb->fStatBusy = 0;
++		fb->fStatCopyNS = 0;
++		fb->fStatStart = mach_absolute_time();
++	}
+ 	sender->setTimeoutUS(fb->nextTickUS());
+ }
+ 
+@@ -467,6 +489,7 @@
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	fStatSwaps++;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
