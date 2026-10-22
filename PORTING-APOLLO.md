@@ -236,6 +236,10 @@ Results on the phone (kernel and bare-metal shim agree):
   QuartzCore's own default.metallib loads, its kernels compile, and its
   render pipelines compile once they get the vertex descriptor QuartzCore
   passes.
+- SweetMetal.bundle, loaded the way Metal loads plug-ins (gpu/userland/
+  mtltest): its device class passes Metal's checks (a `_MTLDevice`
+  subclass conforming to `MTLDeviceSPI`), and compute, rendering and
+  QuartzCore's library work through Metal's own descriptor objects.
 - GPU clock: the GMU sets the levels from the HFI perf table (305 to
   587 MHz on this speed bin); 587 MHz measured 1.93x the compute
   throughput of 305 MHz. The driver raises the level on submission and
