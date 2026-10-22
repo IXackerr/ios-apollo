@@ -40,6 +40,7 @@ typedef struct smtl_compute_encoder smtl_compute_encoder;
 typedef struct smtl_render_encoder smtl_render_encoder;
 typedef struct smtl_blit_encoder smtl_blit_encoder;
 typedef struct smtl_depth_stencil_state smtl_depth_stencil_state;
+typedef struct smtl_sampler_state smtl_sampler_state;
 
 const char *smtl_last_error(void);
 
@@ -77,7 +78,21 @@ smtl_texture *smtl_device_new_texture_2d(smtl_device *d, uint32_t pixel_format, 
 smtl_texture *smtl_buffer_new_iosurface_texture(smtl_buffer *surface, uint32_t pixel_format,
     uint64_t width, uint64_t height, uint32_t usage, uint64_t offset, uint64_t bytes_per_row,
     int planar);
+/* a 2D texture over a buffer's bytes; linear: newLinearTextureWithDescriptor: */
+smtl_texture *smtl_buffer_new_texture(smtl_buffer *b, uint32_t pixel_format, uint64_t width,
+    uint64_t height, uint32_t usage, uint64_t offset, uint64_t bytes_per_row, int linear);
 void          smtl_texture_release(smtl_texture *t);
+
+/* MTLSamplerDescriptor, raw Metal values */
+struct smtl_sampler_desc {
+	uint32_t min_filter, mag_filter, mip_filter;
+	uint32_t s_address, t_address, r_address;
+	uint32_t border_color, normalized_coordinates;
+	float    lod_min_clamp, lod_max_clamp;
+	uint32_t max_anisotropy, compare_function;
+};
+smtl_sampler_state *smtl_device_new_sampler_state(smtl_device *d, const struct smtl_sampler_desc *s);
+void smtl_sampler_state_release(smtl_sampler_state *s);
 /* region: x, y, z, width, height, depth; len: bytes readable/writable at bytes */
 int smtl_texture_replace_region(smtl_texture *t, const uint64_t region[6], uint64_t level,
     uint64_t slice, const void *bytes, uint64_t len, uint64_t bytes_per_row,
@@ -191,6 +206,21 @@ int smtl_render_set_fragment_buffer(smtl_render_encoder *e, smtl_buffer *b, uint
 int smtl_render_set_fragment_texture(smtl_render_encoder *e, smtl_texture *t, uint32_t index);
 int smtl_render_draw_primitives(smtl_render_encoder *e, uint32_t primitive_type, uint64_t start,
     uint64_t count, uint64_t instances, uint64_t base_instance);
+/* stage: 0 vertex, 1 fragment */
+int smtl_render_set_buffer_offset(smtl_render_encoder *e, uint32_t stage, uint64_t offset, uint32_t index);
+int smtl_render_set_bytes(smtl_render_encoder *e, uint32_t stage, const void *bytes, uint64_t len,
+    uint32_t index);
+int smtl_render_set_vertex_texture(smtl_render_encoder *e, smtl_texture *t, uint32_t index);
+int smtl_render_set_sampler(smtl_render_encoder *e, uint32_t stage, smtl_sampler_state *s, uint32_t index);
+int smtl_render_set_viewport(smtl_render_encoder *e, double x, double y, double w, double h,
+    double znear, double zfar);
+int smtl_render_set_scissor(smtl_render_encoder *e, uint64_t x, uint64_t y, uint64_t w, uint64_t h);
+/* MTLCullMode, MTLWinding, MTLTriangleFillMode */
+int smtl_render_set_raster(smtl_render_encoder *e, uint32_t cull, uint32_t winding, uint32_t fill);
+int smtl_render_set_blend_color(smtl_render_encoder *e, float r, float g, float b, float a);
+int smtl_render_draw_indexed(smtl_render_encoder *e, uint32_t primitive_type, uint32_t index_count,
+    uint32_t index_type, smtl_buffer *index_buffer, uint64_t index_offset, uint32_t instances,
+    int32_t base_vertex, uint32_t base_instance);
 int smtl_render_set_depth_stencil_state(smtl_render_encoder *e, smtl_depth_stencil_state *s);
 int smtl_render_set_stencil_reference(smtl_render_encoder *e, uint32_t front, uint32_t back);
 int smtl_render_end(smtl_render_encoder *e);

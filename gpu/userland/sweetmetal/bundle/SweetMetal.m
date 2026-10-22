@@ -151,6 +151,9 @@ SMError(NSString *what)
 - (IOSurfaceRef)iosurface { return _iosurface; }
 - (NSUInteger)iosurfacePlane { return _plane; }
 - (BOOL)isFramebufferOnly { return NO; }
+- (MTLStorageMode)storageMode { return _iosurface ? MTLStorageModeShared : MTLStorageModePrivate; }
+- (MTLCPUCacheMode)cpuCacheMode { return MTLCPUCacheModeDefaultCache; }
+- (uint64_t)protectionOptions { return 0; }
 static uint64_t
 regionBytes(MTLRegion r, NSUInteger bpr, NSUInteger bpi)
 {
@@ -193,6 +196,39 @@ regionBytes(MTLRegion r, NSUInteger bpr, NSUInteger bpi)
 	if (_iosurface) {
 		CFRelease(_iosurface);
 	}
+}
+@end
+
+/* textures over a buffer: after SweetMetalTexture, whose ivars they set */
+@implementation SweetMetalBuffer (Textures)
+- (id<MTLTexture>)newTextureOver:(MTLTextureDescriptor *)desc offset:(NSUInteger)off
+    bytesPerRow:(NSUInteger)bpr linear:(BOOL)linear
+{
+	smtl_texture *t = smtl_buffer_new_texture(_b, (uint32_t)desc.pixelFormat, desc.width,
+	    desc.height, (uint32_t)desc.usage, off, bpr, linear);
+	if (t == NULL) {
+		SMError(@"newTextureWithDescriptor:offset:bytesPerRow:");
+		return nil;
+	}
+	SweetMetalTexture *tex = [SweetMetalTexture new];
+	tex->_t = t;
+	tex->_device = _device;
+	tex->_format = desc.pixelFormat;
+	tex->_width = desc.width;
+	tex->_height = desc.height;
+	tex->_usage = desc.usage;
+	tex->_backing = self;
+	return tex;
+}
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)desc offset:(NSUInteger)off
+    bytesPerRow:(NSUInteger)bpr
+{
+	return [self newTextureOver:desc offset:off bytesPerRow:bpr linear:NO];
+}
+- (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)desc
+    offset:(NSUInteger)off bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
+{
+	return [self newTextureOver:desc offset:off bytesPerRow:bpr linear:YES];
 }
 @end
 
@@ -335,6 +371,20 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 - (void)dealloc { smtl_render_pipeline_release(_p); }
 @end
 
+@interface SweetMetalSamplerState : SMBase <MTLSamplerState> {
+@public
+	smtl_sampler_state *_s;
+	id<MTLDevice> _device;
+	NSString *_label;
+}
+@end
+
+@implementation SweetMetalSamplerState
+- (id<MTLDevice>)device { return _device; }
+- (NSString *)label { return _label; }
+- (void)dealloc { smtl_sampler_state_release(_s); }
+@end
+
 @interface SweetMetalDepthStencilState : SMBase <MTLDepthStencilState> {
 @public
 	smtl_depth_stencil_state *_s;
@@ -358,6 +408,7 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 	smtl_cmdbuf *_c;
 	id<MTLCommandQueue> _queue;
 	NSMutableArray<MTLCommandBufferHandler> *_completed;
+	NSMutableArray<MTLCommandBufferHandler> *_scheduled;
 }
 @property (copy, atomic) NSString *label;
 @end
@@ -366,6 +417,9 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 @public
 	smtl_render_encoder *_e;
 	SweetMetalCommandBuffer *_cb;
+	MTLCullMode _cull;
+	MTLWinding _winding;
+	MTLTriangleFillMode _fill;
 }
 @property (copy, atomic) NSString *label;
 @end
@@ -382,6 +436,95 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i
 {
 	smtl_render_set_fragment_buffer(_e, b ? ((SweetMetalBuffer *)b)->_b : NULL, o, (uint32_t)i);
+}
+- (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i
+{
+	smtl_render_set_buffer_offset(_e, 0, o, (uint32_t)i);
+}
+- (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i
+{
+	smtl_render_set_buffer_offset(_e, 1, o, (uint32_t)i);
+}
+- (void)setVertexBytes:(const void *)b length:(NSUInteger)n atIndex:(NSUInteger)i
+{
+	smtl_render_set_bytes(_e, 0, b, n, (uint32_t)i);
+}
+- (void)setFragmentBytes:(const void *)b length:(NSUInteger)n atIndex:(NSUInteger)i
+{
+	smtl_render_set_bytes(_e, 1, b, n, (uint32_t)i);
+}
+- (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i
+{
+	smtl_render_set_vertex_texture(_e, t ? ((SweetMetalTexture *)t)->_t : NULL, (uint32_t)i);
+}
+- (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i
+{
+	smtl_render_set_sampler(_e, 0, s ? ((SweetMetalSamplerState *)s)->_s : NULL, (uint32_t)i);
+}
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i
+{
+	smtl_render_set_sampler(_e, 1, s ? ((SweetMetalSamplerState *)s)->_s : NULL, (uint32_t)i);
+}
+/* SPI QuartzCore uses: a texture and its sampler in one call */
+- (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti
+    samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si
+{
+	[self setFragmentTexture:t atIndex:ti];
+	[self setFragmentSamplerState:s atIndex:si];
+}
+- (void)setViewport:(MTLViewport)v
+{
+	smtl_render_set_viewport(_e, v.originX, v.originY, v.width, v.height, v.znear, v.zfar);
+}
+- (void)setScissorRect:(MTLScissorRect)r
+{
+	smtl_render_set_scissor(_e, r.x, r.y, r.width, r.height);
+}
+- (void)setCullMode:(MTLCullMode)m
+{
+	_cull = m;
+	smtl_render_set_raster(_e, (uint32_t)_cull, (uint32_t)_winding, (uint32_t)_fill);
+}
+- (void)setFrontFacingWinding:(MTLWinding)w
+{
+	_winding = w;
+	smtl_render_set_raster(_e, (uint32_t)_cull, (uint32_t)_winding, (uint32_t)_fill);
+}
+- (void)setTriangleFillMode:(MTLTriangleFillMode)f
+{
+	_fill = f;
+	smtl_render_set_raster(_e, (uint32_t)_cull, (uint32_t)_winding, (uint32_t)_fill);
+}
+- (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a
+{
+	smtl_render_set_blend_color(_e, r, g, b, a);
+}
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)p indexCount:(NSUInteger)n
+    indexType:(MTLIndexType)t indexBuffer:(id<MTLBuffer>)ib indexBufferOffset:(NSUInteger)o
+    instanceCount:(NSUInteger)ic baseVertex:(NSInteger)bv baseInstance:(NSUInteger)bi
+{
+	if (smtl_render_draw_indexed(_e, (uint32_t)p, (uint32_t)n, (uint32_t)t,
+	    ((SweetMetalBuffer *)ib)->_b, o, (uint32_t)ic, (int32_t)bv, (uint32_t)bi) != 0) {
+		SMError(@"drawIndexedPrimitives:");
+	}
+}
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)p indexCount:(NSUInteger)n
+    indexType:(MTLIndexType)t indexBuffer:(id<MTLBuffer>)ib indexBufferOffset:(NSUInteger)o
+    instanceCount:(NSUInteger)ic
+{
+	[self drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:ib indexBufferOffset:o
+	    instanceCount:ic baseVertex:0 baseInstance:0];
+}
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)p indexCount:(NSUInteger)n
+    indexType:(MTLIndexType)t indexBuffer:(id<MTLBuffer>)ib indexBufferOffset:(NSUInteger)o
+{
+	[self drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:ib indexBufferOffset:o
+	    instanceCount:1 baseVertex:0 baseInstance:0];
+}
+- (void)drawPrimitives:(MTLPrimitiveType)p vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n
+    instanceCount:(NSUInteger)ic baseInstance:(NSUInteger)bi
+{
+	smtl_render_draw_primitives(_e, (uint32_t)p, s, n, ic, bi);
 }
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)s
 {
@@ -564,6 +707,10 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 		SMError(@"commit");
 		return;
 	}
+	for (MTLCommandBufferHandler h in _scheduled) {
+		h(self);
+	}
+	_scheduled = nil;
 	if (_completed.count) {
 		/* completion handlers run off the committing thread, as Metal's do */
 		NSArray *handlers = [_completed copy];
@@ -575,6 +722,19 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 		});
 	}
 }
+- (void)enqueue { }
+- (void)commitAndWaitUntilSubmitted { [self commit]; }
+- (void)waitUntilScheduled { }
+- (void)addScheduledHandler:(MTLCommandBufferHandler)h
+{
+	/* scheduled at commit: call it then (and at once when already committed) */
+	if (_scheduled == nil) {
+		_scheduled = [NSMutableArray new];
+	}
+	[_scheduled addObject:[h copy]];
+}
+- (void)setProtectionOptions:(uint64_t)o { }
+- (uint64_t)protectionOptions { return 0; }
 - (void)waitUntilCompleted
 {
 	smtl_cmdbuf_wait(_c, UINT32_MAX);
@@ -768,6 +928,26 @@ stencilDesc(MTLStencilDescriptor *s)
 	};
 }
 
+- (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d
+{
+	struct smtl_sampler_desc sd = {
+		(uint32_t)d.minFilter, (uint32_t)d.magFilter, (uint32_t)d.mipFilter,
+		(uint32_t)d.sAddressMode, (uint32_t)d.tAddressMode, (uint32_t)d.rAddressMode,
+		(uint32_t)d.borderColor, d.normalizedCoordinates, d.lodMinClamp, d.lodMaxClamp,
+		(uint32_t)d.maxAnisotropy, (uint32_t)d.compareFunction,
+	};
+	smtl_sampler_state *st = smtl_device_new_sampler_state(_d, &sd);
+	if (st == NULL) {
+		SMError(@"newSamplerStateWithDescriptor:");
+		return nil;
+	}
+	SweetMetalSamplerState *state = [SweetMetalSamplerState new];
+	state->_s = st;
+	state->_device = self;
+	state->_label = d.label;
+	return state;
+}
+
 - (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d
 {
 	struct smtl_stencil_desc front = stencilDesc(d.frontFaceStencil);
@@ -810,7 +990,13 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)p length:(NSUInteger)len
     options:(MTLResourceOptions)o deallocator:(void (^)(void *, NSUInteger))dealloc
 {
-	SweetMetalBuffer *b = wrapBuffer(self, smtl_device_new_buffer_no_copy(_d, p, len, o), o);
+	smtl_buffer *nb = smtl_device_new_buffer_no_copy(_d, p, len, o);
+	if (nb == NULL) {
+		SMError([NSString stringWithFormat:@"newBufferWithBytesNoCopy: %p length %lu options %#lx",
+		    p, (unsigned long)len, (unsigned long)o]);
+		return nil;
+	}
+	SweetMetalBuffer *b = wrapBuffer(self, nb, o);
 	/* the deallocator runs when our wrapper goes, after the GPU's last use of
 	 * it (command buffers retain their resources) */
 	if (b != nil && dealloc != nil) {

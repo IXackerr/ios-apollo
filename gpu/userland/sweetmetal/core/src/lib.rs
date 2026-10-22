@@ -14,7 +14,11 @@ use std::time::Duration;
 
 use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
-use metal2vulkan::metal::{CompareFunction, PixelFormat, PrimitiveType, StencilOperation, TextureUsage};
+use metal2vulkan::bind::SamplerDescriptor;
+use metal2vulkan::metal::{
+    CompareFunction, CullMode, IndexType, PixelFormat, PrimitiveType, StencilOperation,
+    TextureUsage, TriangleFillMode, Winding,
+};
 use metal2vulkan::pipeline::{
     ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor,
     VertexBufferLayoutDescriptor, VertexDescriptor,
@@ -23,7 +27,7 @@ use metal2vulkan_runtime::{
     BlitCommandEncoder, BlitOption, Buffer, ClearColor, CommandBuffer, CommandBufferStatus,
     CommandQueue, ComputeCommandEncoder, ComputePipelineState, DepthStencilState, Device,
     DeviceOptions, Function,
-    HostMemory, IoSurfacePlane, Library, Region, LoadAction, Origin, PipelineOptions, RenderCommandEncoder,
+    HostMemory, IoSurfacePlane, Library, Region, SamplerState, ScissorRect, Viewport, LoadAction, Origin, PipelineOptions, RenderCommandEncoder,
     RenderPassDescriptor, RenderPipelineState, ResourceOptions, Size, StoreAction, Texture,
     TextureDescriptor,
 };
@@ -280,7 +284,86 @@ pub unsafe extern "C" fn smtl_buffer_new_iosurface_texture(
         }),
     )
 }
+/// `newTextureWithDescriptor:offset:bytesPerRow:` / `newLinearTextureWithDescriptor:...`: a
+/// 2D texture over a buffer's bytes.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_buffer_new_texture(
+    b: *mut Buffer,
+    pixel_format_raw: u32,
+    width: u64,
+    height: u64,
+    usage: u32,
+    offset: u64,
+    bytes_per_row: u64,
+    linear: i32,
+) -> *mut Texture {
+    let b = handle!(b, std::ptr::null_mut());
+    boxed(
+        "newTextureWithDescriptor:offset:bytesPerRow:",
+        texture_descriptor(pixel_format_raw, width, height, false, usage, 0).and_then(|desc| {
+            if linear != 0 {
+                b.new_linear_texture(&desc, offset, bytes_per_row, 0)
+            } else {
+                b.new_texture(&desc, offset, bytes_per_row)
+            }
+            .map_err(|e| format!("{e:?}"))
+        }),
+    )
+}
 release!(smtl_texture_release, Texture);
+
+/// MTLSamplerDescriptor, raw Metal values.
+#[repr(C)]
+pub struct SmtlSamplerDesc {
+    min_filter: u32,
+    mag_filter: u32,
+    mip_filter: u32,
+    s_address: u32,
+    t_address: u32,
+    r_address: u32,
+    border_color: u32,
+    normalized_coordinates: u32,
+    lod_min_clamp: f32,
+    lod_max_clamp: f32,
+    max_anisotropy: u32,
+    compare_function: u32,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_device_new_sampler_state(
+    d: *mut SmtlDevice,
+    s: *const SmtlSamplerDesc,
+) -> *mut SamplerState {
+    let d = handle!(d, std::ptr::null_mut());
+    let Some(s) = s.as_ref() else {
+        set_error("newSamplerStateWithDescriptor: NULL descriptor".into());
+        return std::ptr::null_mut();
+    };
+    let desc = (|| -> Result<SamplerDescriptor, String> {
+        let mut d = SamplerDescriptor::default();
+        d.min_filter = raw("MTLSamplerMinMagFilter", s.min_filter)?;
+        d.mag_filter = raw("MTLSamplerMinMagFilter", s.mag_filter)?;
+        d.mip_filter = raw("MTLSamplerMipFilter", s.mip_filter)?;
+        d.s_address_mode = raw("MTLSamplerAddressMode", s.s_address)?;
+        d.t_address_mode = raw("MTLSamplerAddressMode", s.t_address)?;
+        d.r_address_mode = raw("MTLSamplerAddressMode", s.r_address)?;
+        d.border_color = raw("MTLSamplerBorderColor", s.border_color)?;
+        d.normalized_coordinates = s.normalized_coordinates != 0;
+        d.lod_min_clamp = s.lod_min_clamp;
+        d.lod_max_clamp = s.lod_max_clamp;
+        d.max_anisotropy = s.max_anisotropy.max(1);
+        d.compare_function = raw("MTLCompareFunction", s.compare_function)?;
+        Ok(d)
+    })();
+    match desc {
+        Ok(desc) => boxed("newSamplerStateWithDescriptor:", d.device.new_sampler_state(&desc)),
+        Err(e) => {
+            set_error(e);
+            std::ptr::null_mut()
+        }
+    }
+}
+release!(smtl_sampler_state_release, SamplerState);
 
 /// `replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:`; `len` is how many
 /// bytes at `bytes` may be read.
@@ -958,6 +1041,175 @@ pub unsafe extern "C" fn smtl_render_set_stencil_reference(
     let enc = encoder!(e, "setStencilReferenceValue:");
     enc.set_stencil_reference_values(front, back);
     0
+}
+
+/// `setVertexBufferOffset:atIndex:` (stage 0) / `setFragmentBufferOffset:atIndex:` (stage 1)
+#[no_mangle]
+pub unsafe extern "C" fn smtl_render_set_buffer_offset(
+    e: *mut SmtlRenderEncoder,
+    stage: u32,
+    offset: u64,
+    index: u32,
+) -> i32 {
+    let enc = encoder!(e, "setBufferOffset:atIndex:");
+    status(
+        "setBufferOffset:atIndex:",
+        if stage == 0 {
+            enc.set_vertex_buffer_offset(offset, index)
+        } else {
+            enc.set_fragment_buffer_offset(offset, index)
+        },
+    )
+}
+
+/// `setVertexBytes:length:atIndex:` (stage 0) / `setFragmentBytes:length:atIndex:` (stage 1)
+#[no_mangle]
+pub unsafe extern "C" fn smtl_render_set_bytes(
+    e: *mut SmtlRenderEncoder,
+    stage: u32,
+    bytes: *const c_void,
+    len: u64,
+    index: u32,
+) -> i32 {
+    let enc = encoder!(e, "setBytes:length:atIndex:");
+    if bytes.is_null() {
+        set_error("setBytes: NULL bytes".into());
+        return -1;
+    }
+    let data = std::slice::from_raw_parts(bytes as *const u8, len as usize);
+    status(
+        "setBytes:length:atIndex:",
+        if stage == 0 {
+            enc.set_vertex_bytes(data, index)
+        } else {
+            enc.set_fragment_bytes(data, index)
+        },
+    )
+}
+
+/// `setVertexTexture:atIndex:` (the fragment one is smtl_render_set_fragment_texture)
+#[no_mangle]
+pub unsafe extern "C" fn smtl_render_set_vertex_texture(
+    e: *mut SmtlRenderEncoder,
+    t: *mut Texture,
+    index: u32,
+) -> i32 {
+    let enc = encoder!(e, "setVertexTexture:atIndex:");
+    status("setVertexTexture:atIndex:", enc.set_vertex_texture(t.as_ref(), index))
+}
+
+/// `setVertexSamplerState:atIndex:` (stage 0) / `setFragmentSamplerState:atIndex:` (stage 1)
+#[no_mangle]
+pub unsafe extern "C" fn smtl_render_set_sampler(
+    e: *mut SmtlRenderEncoder,
+    stage: u32,
+    s: *mut SamplerState,
+    index: u32,
+) -> i32 {
+    let enc = encoder!(e, "setSamplerState:atIndex:");
+    status(
+        "setSamplerState:atIndex:",
+        if stage == 0 {
+            enc.set_vertex_sampler_state(s.as_ref(), index)
+        } else {
+            enc.set_fragment_sampler_state(s.as_ref(), index)
+        },
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_render_set_viewport(
+    e: *mut SmtlRenderEncoder,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    znear: f64,
+    zfar: f64,
+) -> i32 {
+    let enc = encoder!(e, "setViewport:");
+    let v = Viewport { origin_x: x, origin_y: y, width: w, height: h, znear, zfar };
+    status("setViewport:", enc.set_viewport(v))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_render_set_scissor(
+    e: *mut SmtlRenderEncoder,
+    x: u64,
+    y: u64,
+    w: u64,
+    h: u64,
+) -> i32 {
+    let enc = encoder!(e, "setScissorRect:");
+    status("setScissorRect:", enc.set_scissor_rect(ScissorRect { x, y, width: w, height: h }))
+}
+
+/// Fixed-function state: cull mode, winding, fill mode (raw Metal values), blend colour.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_render_set_raster(
+    e: *mut SmtlRenderEncoder,
+    cull: u32,
+    winding: u32,
+    fill: u32,
+) -> i32 {
+    let enc = encoder!(e, "setCullMode:");
+    let r = (|| -> Result<(CullMode, Winding, TriangleFillMode), String> {
+        Ok((raw("MTLCullMode", cull)?, raw("MTLWinding", winding)?, raw("MTLTriangleFillMode", fill)?))
+    })();
+    match r {
+        Ok((c, w, f)) => {
+            enc.set_cull_mode(c);
+            enc.set_front_facing_winding(w);
+            status("setTriangleFillMode:", enc.set_triangle_fill_mode(f))
+        }
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_render_set_blend_color(
+    e: *mut SmtlRenderEncoder,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+) -> i32 {
+    let enc = encoder!(e, "setBlendColorRed:");
+    enc.set_blend_color(r, g, b, a);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_render_draw_indexed(
+    e: *mut SmtlRenderEncoder,
+    primitive_type: u32,
+    index_count: u32,
+    index_type: u32,
+    index_buffer: *mut Buffer,
+    index_offset: u64,
+    instances: u32,
+    base_vertex: i32,
+    base_instance: u32,
+) -> i32 {
+    let enc = encoder!(e, "drawIndexedPrimitives:");
+    let ib = handle!(index_buffer, -1);
+    let r = (|| -> Result<(PrimitiveType, IndexType), String> {
+        Ok((raw("MTLPrimitiveType", primitive_type)?, raw("MTLIndexType", index_type)?))
+    })();
+    match r {
+        Ok((p, t)) => status(
+            "drawIndexedPrimitives:",
+            enc.draw_indexed_primitives(p, index_count, t, ib, index_offset, instances.max(1),
+                base_vertex, base_instance),
+        ),
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
 }
 
 #[no_mangle]
