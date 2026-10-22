@@ -2,17 +2,20 @@
  * sweet_gpu_os_dma.cpp - physically contiguous DMA memory for the SWEET
  * Adreno driver, built on IOBufferMemoryDescriptor.
  *
- * Why IOKit and not kmem_alloc_contig: the GPU, the GMU and the SMMU
- * walker need buffers whose CPU view is Normal non-cacheable (Linux:
- * MSM_BO_WC). IOKit is the supported way to get such a kernel mapping of
- * RAM (createMappingInTask(kernel_task, kIOMapWriteCombineCache)); the
- * pmap enforces consistent attributes for managed pages there, which a
- * raw ml_io_map of RAM would bypass.
+ * The GPU, the GMU and the SMMU walker need buffers whose CPU view is
+ * Normal non-cacheable (Linux: MSM_BO_WC). An IOMemoryMap with
+ * kIOMapWriteCombineCache is not reliable for wired kernel memory: the
+ * memory entry of a kernel buffer is not a VM object, so the cache-mode
+ * change it asks for can fail and leave the map cacheable (the GMU then
+ * faulted on page tables the CPU had already written). The pages are
+ * therefore mapped a second time with ml_io_map_wcomb, whose pmap_map
+ * applies the attribute to managed pages too.
  *
- * Aliasing rule: the descriptor's own (cacheable) kernel mapping is
- * zeroed, cleaned+invalidated to PoC once, and then never touched; all
- * CPU access goes through the WC map. No dirty line can therefore be
- * written back over data the device produced.
+ * Aliasing rule (the same one Linux follows for non-coherent DMA): the
+ * descriptor's own cacheable kernel mapping is zeroed, cleaned and
+ * invalidated to PoC once, and then never written again; all CPU access
+ * goes through the WC map. No dirty line can therefore be written back
+ * over data the device produced.
  *
  * Physical address limit: SMMU output size on MMU-500 SM8250 is at least
  * 36 bits (read from ID2 at stage 3); RAM on apollo ends below 0x2_8000_0000,
@@ -27,6 +30,8 @@
 extern "C" {
 #include "../../../bsd/dev/sweet_gpu.h"
 void flush_dcache64(addr64_t addr, unsigned count, int phys);
+vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 }
 
 #define SGPU_DMA_PHYS_MASK      0x0000000ffffff000ULL   /* 36-bit PA */
@@ -70,16 +75,15 @@ sgpu_dma_alloc(size_t size, size_t align, uint32_t flags, struct sgpu_dma *out)
 	out->size = size;
 	out->os_md = md;
 	if (flags & SGPU_DMA_WC) {
-		IOMemoryMap *map = md->createMappingInTask(kernel_task, 0,
-		    kIOMapAnywhere | kIOMapWriteCombineCache);
-		if (map == NULL) {
+		vm_offset_t va = ml_io_map_wcomb((vm_offset_t)pa, size);
+		if (va == 0) {
 			md->complete();
 			md->release();
 			bzero(out, sizeof(*out));
 			return ENOMEM;
 		}
-		out->os_map = map;
-		out->va = (void *)map->getVirtualAddress();
+		out->os_map = (void *)va;
+		out->va = (void *)va;
 	} else {
 		out->va = cva;
 	}
@@ -90,7 +94,7 @@ extern "C" void
 sgpu_dma_free(struct sgpu_dma *dma)
 {
 	if (dma->os_map != NULL) {
-		((IOMemoryMap *)dma->os_map)->release();
+		ml_io_unmap((vm_offset_t)dma->os_map, dma->size);
 	}
 	if (dma->os_md != NULL) {
 		IOBufferMemoryDescriptor *md = (IOBufferMemoryDescriptor *)dma->os_md;

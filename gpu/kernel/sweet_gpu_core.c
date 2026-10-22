@@ -19,9 +19,22 @@ extern int vsnprintf(char *, size_t, const char *, va_list);
 #define sgpu_vsnprintf vsnprintf
 #endif
 
-static const char *const stage_names[] = {
-	"off", "probe", "clocks", "smmu", "gmu", "gx", "cp", "selftest", "user",
-};
+/* NUL-separated, not a pointer table: the driver also runs in the boot
+ * shim, which cannot apply absolute relocations. */
+static const char stage_list[] =
+	"off\0probe\0clocks\0smmu\0gmu\0gx\0cp\0selftest\0user\0";
+
+const char *
+sgpu_nth(const char *list, unsigned i)
+{
+	while (i-- > 0) {
+		while (*list++) {
+		}
+	}
+	return list;
+}
+
+#define stage_names(i) sgpu_nth(stage_list, (unsigned)(i))
 
 int
 sgpu_poll(volatile uint8_t *base, uint32_t off, uint32_t mask, uint32_t want,
@@ -50,7 +63,7 @@ sgpu_fail(struct sgpu *g, int err, const char *fmt, ...)
 	va_end(ap);
 	g->last_error = err;
 	sgpu_log("FAILED at stage %u (%s): %s (err %d)", g->stage_reached + 1,
-	    g->stage_reached + 1 <= SGPU_STAGE_MAX ? stage_names[g->stage_reached + 1] : "?",
+	    g->stage_reached + 1 <= SGPU_STAGE_MAX ? stage_names(g->stage_reached + 1) : "?",
 	    g->message, err);
 	return err;
 }
@@ -164,19 +177,19 @@ sgpu_bringup(struct sgpu *g, uint32_t stage)
 		stage = SGPU_STAGE_MAX;
 	}
 	g->stage_requested = stage;
-	sgpu_log("bring-up to stage %u (%s)", stage, stage_names[stage]);
+	sgpu_log("bring-up to stage %u (%s)", stage, stage_names(stage));
 	while (g->stage_reached < stage) {
 		uint32_t s = g->stage_reached + 1;
 		uint64_t t0 = sgpu_now_us();
 		int err = run_stage(g, s);
 		if (err) {
 			if (!g->last_error) {
-				sgpu_fail(g, err, "stage %s returned an error", stage_names[s]);
+				sgpu_fail(g, err, "stage %s returned an error", stage_names(s));
 			}
 			return err;
 		}
 		g->stage_reached = s;
-		sgpu_log("stage %u (%s) OK in %llu us", s, stage_names[s],
+		sgpu_log("stage %u (%s) OK in %llu us", s, stage_names(s),
 		    (unsigned long long)(sgpu_now_us() - t0));
 	}
 	return 0;

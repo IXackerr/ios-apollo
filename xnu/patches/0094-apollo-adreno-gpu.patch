@@ -409,7 +409,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_core.c
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,219 @@
 +/*
 + * sweet_gpu_core.c - staged bring-up of the Adreno 650 on SM8250 (apollo).
 + *
@@ -431,9 +431,22 @@
 +#define sgpu_vsnprintf vsnprintf
 +#endif
 +
-+static const char *const stage_names[] = {
-+	"off", "probe", "clocks", "smmu", "gmu", "gx", "cp", "selftest", "user",
-+};
++/* NUL-separated, not a pointer table: the driver also runs in the boot
++ * shim, which cannot apply absolute relocations. */
++static const char stage_list[] =
++	"off\0probe\0clocks\0smmu\0gmu\0gx\0cp\0selftest\0user\0";
++
++const char *
++sgpu_nth(const char *list, unsigned i)
++{
++	while (i-- > 0) {
++		while (*list++) {
++		}
++	}
++	return list;
++}
++
++#define stage_names(i) sgpu_nth(stage_list, (unsigned)(i))
 +
 +int
 +sgpu_poll(volatile uint8_t *base, uint32_t off, uint32_t mask, uint32_t want,
@@ -462,7 +475,7 @@
 +	va_end(ap);
 +	g->last_error = err;
 +	sgpu_log("FAILED at stage %u (%s): %s (err %d)", g->stage_reached + 1,
-+	    g->stage_reached + 1 <= SGPU_STAGE_MAX ? stage_names[g->stage_reached + 1] : "?",
++	    g->stage_reached + 1 <= SGPU_STAGE_MAX ? stage_names(g->stage_reached + 1) : "?",
 +	    g->message, err);
 +	return err;
 +}
@@ -576,19 +589,19 @@
 +		stage = SGPU_STAGE_MAX;
 +	}
 +	g->stage_requested = stage;
-+	sgpu_log("bring-up to stage %u (%s)", stage, stage_names[stage]);
++	sgpu_log("bring-up to stage %u (%s)", stage, stage_names(stage));
 +	while (g->stage_reached < stage) {
 +		uint32_t s = g->stage_reached + 1;
 +		uint64_t t0 = sgpu_now_us();
 +		int err = run_stage(g, s);
 +		if (err) {
 +			if (!g->last_error) {
-+				sgpu_fail(g, err, "stage %s returned an error", stage_names[s]);
++				sgpu_fail(g, err, "stage %s returned an error", stage_names(s));
 +			}
 +			return err;
 +		}
 +		g->stage_reached = s;
-+		sgpu_log("stage %u (%s) OK in %llu us", s, stage_names[s],
++		sgpu_log("stage %u (%s) OK in %llu us", s, stage_names(s),
 +		    (unsigned long long)(sgpu_now_us() - t0));
 +	}
 +	return 0;
@@ -1555,7 +1568,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_gmu.c
-@@ -0,0 +1,1050 @@
+@@ -0,0 +1,1052 @@
 +/*
 + * sweet_gpu_gmu.c - Adreno 650 GMU (graphics management unit) on SM8250.
 + *
@@ -2315,6 +2328,8 @@
 +	if (!sgpu_smmu_check_faults(g)) {
 +		sgpu_log("gmu: no SMMU faults recorded");
 +	}
++	sgpu_smmu_debug(g, SGPU_DOM_GMU, GMU_LOG_IOVA);
++	sgpu_smmu_debug(g, SGPU_DOM_GMU, GMU_ICACHE_IOVA);
 +}
 +
 +static int
@@ -2608,7 +2623,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.h
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,364 @@
 +/*
 + * sweet_gpu.h - internal interface of the SWEET Adreno 650 driver
 + * (Xiaomi Mi 10T / 10T Pro "apollo", Qualcomm SM8250).
@@ -2668,7 +2683,7 @@
 +	uint64_t  pa;
 +	size_t    size;
 +	void     *os_md;                /* XNU: IOBufferMemoryDescriptor */
-+	void     *os_map;               /* XNU: IOMemoryMap of the WC view */
++	void     *os_map;               /* XNU: kernel VA of the WC view */
 +};
 +int      sgpu_dma_alloc(size_t size, size_t align, uint32_t flags, struct sgpu_dma *out);
 +void     sgpu_dma_free(struct sgpu_dma *dma);
@@ -2683,6 +2698,8 @@
 +bool     sgpu_bootarg_u32(const char *name, uint32_t *out);
 +/* Property of the ADT node /sweet-gpu (firmware blobs, regions). */
 +bool     sgpu_dt_prop(const char *prop, const void **data, uint32_t *len);
++/* i-th string of a NUL-separated list */
++const char *sgpu_nth(const char *list, unsigned i);
 +
 +/* ------------------------------------------------------------------ */
 +/* MMIO                                                               */
@@ -2905,6 +2922,7 @@
 +    uint64_t pa, uint64_t size, uint32_t prot);
 +int  sgpu_smmu_unmap(struct sgpu *g, enum sgpu_smmu_domain d, uint64_t iova, uint64_t size);
 +void sgpu_smmu_tlb_sync(struct sgpu *g, enum sgpu_smmu_domain d);
++void     sgpu_smmu_debug(struct sgpu *g, enum sgpu_smmu_domain dom, uint64_t iova);
 +uint32_t sgpu_smmu_check_faults(struct sgpu *g);   /* logs + clears, returns count */
 +uint64_t sgpu_smmu_ttbr0(struct sgpu *g, enum sgpu_smmu_domain d);
 +
@@ -3662,7 +3680,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_smmu.c
-@@ -0,0 +1,833 @@
+@@ -0,0 +1,860 @@
 +/*
 + * sweet_gpu_smmu.c - Adreno SMMU (ARM MMU-500, "qcom,sm8250-smmu-500",
 + * 0x03da0000) for the GPU (SID 0, mask 0x401) and the GMU (SID 5, mask 0x400).
@@ -4448,6 +4466,33 @@
 +	return 0;
 +}
 +
++/* Registers of a domain's bank as read back, and the walk for one IOVA. */
++void
++sgpu_smmu_debug(struct sgpu *g, enum sgpu_smmu_domain dom, uint64_t iova)
++{
++	struct sgpu_smmu *s = g->smmu_state;
++	if (s == NULL || dom >= SGPU_DOM_COUNT || !s->dom[dom].root) {
++		return;
++	}
++	struct smmu_dom *d = &s->dom[dom];
++	volatile uint8_t *c = cbase(g, d->cb);
++	sgpu_log("smmu: CB%d CBAR %#x CBA2R %#x TCR %#x TCR2 %#x TTBR0 %#llx MAIR0 %#x",
++	    d->cb, sgpu_rd(gr1(g), SMMU_CBAR(d->cb)), sgpu_rd(gr1(g), SMMU_CBA2R(d->cb)),
++	    sgpu_rd(c, CB_TCR), sgpu_rd(c, CB_TCR2), (unsigned long long)sgpu_rd64(c, CB_TTBR0),
++	    sgpu_rd(c, CB_MAIR0));
++	uint64_t *t = d->root;
++	for (int level = 1; level <= 3 && t != NULL; level++) {
++		uint32_t idx = (uint32_t)(iova >> (level == 1 ? 30 : level == 2 ? 21 : 12)) & 0x1ff;
++		uint64_t e = t[idx];
++		sgpu_log("smmu: walk %#llx L%d[%u] = %#llx", (unsigned long long)iova, level, idx,
++		    (unsigned long long)e);
++		if (level == 3 || (e & 3) != 3) {
++			break;
++		}
++		t = table_va(s, e & PTE_ADDR_MASK);
++	}
++}
++
 +uint32_t
 +sgpu_smmu_check_faults(struct sgpu *g)
 +{
@@ -4470,14 +4515,14 @@
 +		uint64_t far = sgpu_rd64(c, CB_FAR);
 +		uint32_t syn0 = sgpu_rd(c, CB_FSYNR0), syn1 = sgpu_rd(c, CB_FSYNR1);
 +		uint32_t sid = sgpu_rd(gr1(g), SMMU_CBFRSYNRA(d->cb)) & 0xffff;
-+		static const char *const client[] = { "CP", "?", "?", "?", "CCU", "?", "CDP", "GMU" };
 +		uint32_t cl = syn1 & 0xff;
 +		sgpu_log("smmu: %s fault CB%d FSR %#x (%s%s%s%s) FAR %#llx %s SID %#x "
 +		    "FSYNR0 %#x FSYNR1 %#x client %s", i == SGPU_DOM_GPU ? "GPU" : "GMU",
 +		    d->cb, fsr, (fsr & 2) ? "translation " : "", (fsr & 8) ? "permission " : "",
 +		    (fsr & 0x10) ? "external " : "", (fsr & 0x80) ? "address-size " : "",
 +		    (unsigned long long)far, (syn0 & 0x10) ? "write" : "read", sid, syn0, syn1,
-+		    i == SGPU_DOM_GPU ? (cl < 8 ? client[cl] : "UCHE") : "GMU");
++		    i == SGPU_DOM_GPU ? (cl < 8 ? sgpu_nth("CP\0?\0?\0?\0CCU\0?\0CDP\0GMU\0", cl) :
++		    "UCHE") : "GMU");
 +		sgpu_wr(c, CB_FSR, fsr);
 +		if (fsr & FSR_SS) {
 +			sgpu_wr(c, CB_RESUME, 1);       /* terminate the stalled transaction */
@@ -5468,22 +5513,25 @@
 +#endif /* SWEET */
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdrenoDMA.cpp
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,106 @@
 +/*
 + * sweet_gpu_os_dma.cpp - physically contiguous DMA memory for the SWEET
 + * Adreno driver, built on IOBufferMemoryDescriptor.
 + *
-+ * Why IOKit and not kmem_alloc_contig: the GPU, the GMU and the SMMU
-+ * walker need buffers whose CPU view is Normal non-cacheable (Linux:
-+ * MSM_BO_WC). IOKit is the supported way to get such a kernel mapping of
-+ * RAM (createMappingInTask(kernel_task, kIOMapWriteCombineCache)); the
-+ * pmap enforces consistent attributes for managed pages there, which a
-+ * raw ml_io_map of RAM would bypass.
++ * The GPU, the GMU and the SMMU walker need buffers whose CPU view is
++ * Normal non-cacheable (Linux: MSM_BO_WC). An IOMemoryMap with
++ * kIOMapWriteCombineCache is not reliable for wired kernel memory: the
++ * memory entry of a kernel buffer is not a VM object, so the cache-mode
++ * change it asks for can fail and leave the map cacheable (the GMU then
++ * faulted on page tables the CPU had already written). The pages are
++ * therefore mapped a second time with ml_io_map_wcomb, whose pmap_map
++ * applies the attribute to managed pages too.
 + *
-+ * Aliasing rule: the descriptor's own (cacheable) kernel mapping is
-+ * zeroed, cleaned+invalidated to PoC once, and then never touched; all
-+ * CPU access goes through the WC map. No dirty line can therefore be
-+ * written back over data the device produced.
++ * Aliasing rule (the same one Linux follows for non-coherent DMA): the
++ * descriptor's own cacheable kernel mapping is zeroed, cleaned and
++ * invalidated to PoC once, and then never written again; all CPU access
++ * goes through the WC map. No dirty line can therefore be written back
++ * over data the device produced.
 + *
 + * Physical address limit: SMMU output size on MMU-500 SM8250 is at least
 + * 36 bits (read from ID2 at stage 3); RAM on apollo ends below 0x2_8000_0000,
@@ -5498,6 +5546,8 @@
 +extern "C" {
 +#include "../../../bsd/dev/sweet_gpu.h"
 +void flush_dcache64(addr64_t addr, unsigned count, int phys);
++vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 +}
 +
 +#define SGPU_DMA_PHYS_MASK      0x0000000ffffff000ULL   /* 36-bit PA */
@@ -5541,16 +5591,15 @@
 +	out->size = size;
 +	out->os_md = md;
 +	if (flags & SGPU_DMA_WC) {
-+		IOMemoryMap *map = md->createMappingInTask(kernel_task, 0,
-+		    kIOMapAnywhere | kIOMapWriteCombineCache);
-+		if (map == NULL) {
++		vm_offset_t va = ml_io_map_wcomb((vm_offset_t)pa, size);
++		if (va == 0) {
 +			md->complete();
 +			md->release();
 +			bzero(out, sizeof(*out));
 +			return ENOMEM;
 +		}
-+		out->os_map = map;
-+		out->va = (void *)map->getVirtualAddress();
++		out->os_map = (void *)va;
++		out->va = (void *)va;
 +	} else {
 +		out->va = cva;
 +	}
@@ -5561,7 +5610,7 @@
 +sgpu_dma_free(struct sgpu_dma *dma)
 +{
 +	if (dma->os_map != NULL) {
-+		((IOMemoryMap *)dma->os_map)->release();
++		ml_io_unmap((vm_offset_t)dma->os_map, dma->size);
 +	}
 +	if (dma->os_md != NULL) {
 +		IOBufferMemoryDescriptor *md = (IOBufferMemoryDescriptor *)dma->os_md;

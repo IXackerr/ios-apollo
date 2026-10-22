@@ -783,6 +783,33 @@ sgpu_smmu_restore(struct sgpu *g)
 	return 0;
 }
 
+/* Registers of a domain's bank as read back, and the walk for one IOVA. */
+void
+sgpu_smmu_debug(struct sgpu *g, enum sgpu_smmu_domain dom, uint64_t iova)
+{
+	struct sgpu_smmu *s = g->smmu_state;
+	if (s == NULL || dom >= SGPU_DOM_COUNT || !s->dom[dom].root) {
+		return;
+	}
+	struct smmu_dom *d = &s->dom[dom];
+	volatile uint8_t *c = cbase(g, d->cb);
+	sgpu_log("smmu: CB%d CBAR %#x CBA2R %#x TCR %#x TCR2 %#x TTBR0 %#llx MAIR0 %#x",
+	    d->cb, sgpu_rd(gr1(g), SMMU_CBAR(d->cb)), sgpu_rd(gr1(g), SMMU_CBA2R(d->cb)),
+	    sgpu_rd(c, CB_TCR), sgpu_rd(c, CB_TCR2), (unsigned long long)sgpu_rd64(c, CB_TTBR0),
+	    sgpu_rd(c, CB_MAIR0));
+	uint64_t *t = d->root;
+	for (int level = 1; level <= 3 && t != NULL; level++) {
+		uint32_t idx = (uint32_t)(iova >> (level == 1 ? 30 : level == 2 ? 21 : 12)) & 0x1ff;
+		uint64_t e = t[idx];
+		sgpu_log("smmu: walk %#llx L%d[%u] = %#llx", (unsigned long long)iova, level, idx,
+		    (unsigned long long)e);
+		if (level == 3 || (e & 3) != 3) {
+			break;
+		}
+		t = table_va(s, e & PTE_ADDR_MASK);
+	}
+}
+
 uint32_t
 sgpu_smmu_check_faults(struct sgpu *g)
 {
@@ -805,14 +832,14 @@ sgpu_smmu_check_faults(struct sgpu *g)
 		uint64_t far = sgpu_rd64(c, CB_FAR);
 		uint32_t syn0 = sgpu_rd(c, CB_FSYNR0), syn1 = sgpu_rd(c, CB_FSYNR1);
 		uint32_t sid = sgpu_rd(gr1(g), SMMU_CBFRSYNRA(d->cb)) & 0xffff;
-		static const char *const client[] = { "CP", "?", "?", "?", "CCU", "?", "CDP", "GMU" };
 		uint32_t cl = syn1 & 0xff;
 		sgpu_log("smmu: %s fault CB%d FSR %#x (%s%s%s%s) FAR %#llx %s SID %#x "
 		    "FSYNR0 %#x FSYNR1 %#x client %s", i == SGPU_DOM_GPU ? "GPU" : "GMU",
 		    d->cb, fsr, (fsr & 2) ? "translation " : "", (fsr & 8) ? "permission " : "",
 		    (fsr & 0x10) ? "external " : "", (fsr & 0x80) ? "address-size " : "",
 		    (unsigned long long)far, (syn0 & 0x10) ? "write" : "read", sid, syn0, syn1,
-		    i == SGPU_DOM_GPU ? (cl < 8 ? client[cl] : "UCHE") : "GMU");
+		    i == SGPU_DOM_GPU ? (cl < 8 ? sgpu_nth("CP\0?\0?\0?\0CCU\0?\0CDP\0GMU\0", cl) :
+		    "UCHE") : "GMU");
 		sgpu_wr(c, CB_FSR, fsr);
 		if (fsr & FSR_SS) {
 			sgpu_wr(c, CB_RESUME, 1);       /* terminate the stalled transaction */

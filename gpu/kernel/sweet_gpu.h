@@ -57,7 +57,7 @@ struct sgpu_dma {
 	uint64_t  pa;
 	size_t    size;
 	void     *os_md;                /* XNU: IOBufferMemoryDescriptor */
-	void     *os_map;               /* XNU: IOMemoryMap of the WC view */
+	void     *os_map;               /* XNU: kernel VA of the WC view */
 };
 int      sgpu_dma_alloc(size_t size, size_t align, uint32_t flags, struct sgpu_dma *out);
 void     sgpu_dma_free(struct sgpu_dma *dma);
@@ -72,6 +72,8 @@ void     sgpu_smc_call(struct sgpu_smc *args);
 bool     sgpu_bootarg_u32(const char *name, uint32_t *out);
 /* Property of the ADT node /sweet-gpu (firmware blobs, regions). */
 bool     sgpu_dt_prop(const char *prop, const void **data, uint32_t *len);
+/* i-th string of a NUL-separated list */
+const char *sgpu_nth(const char *list, unsigned i);
 
 /* ------------------------------------------------------------------ */
 /* MMIO                                                               */
@@ -294,6 +296,7 @@ int  sgpu_smmu_map(struct sgpu *g, enum sgpu_smmu_domain d, uint64_t iova,
     uint64_t pa, uint64_t size, uint32_t prot);
 int  sgpu_smmu_unmap(struct sgpu *g, enum sgpu_smmu_domain d, uint64_t iova, uint64_t size);
 void sgpu_smmu_tlb_sync(struct sgpu *g, enum sgpu_smmu_domain d);
+void     sgpu_smmu_debug(struct sgpu *g, enum sgpu_smmu_domain dom, uint64_t iova);
 uint32_t sgpu_smmu_check_faults(struct sgpu *g);   /* logs + clears, returns count */
 uint64_t sgpu_smmu_ttbr0(struct sgpu *g, enum sgpu_smmu_domain d);
 

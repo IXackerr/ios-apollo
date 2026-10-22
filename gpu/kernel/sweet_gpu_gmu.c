@@ -757,6 +757,8 @@ gmu_dump(struct sgpu *g)
 	if (!sgpu_smmu_check_faults(g)) {
 		sgpu_log("gmu: no SMMU faults recorded");
 	}
+	sgpu_smmu_debug(g, SGPU_DOM_GMU, GMU_LOG_IOVA);
+	sgpu_smmu_debug(g, SGPU_DOM_GMU, GMU_ICACHE_IOVA);
 }
 
 static int
