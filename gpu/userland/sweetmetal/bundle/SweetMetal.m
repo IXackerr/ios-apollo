@@ -121,6 +121,7 @@ static sgpu_dev *smGpu;         /* the device's kernel client, for SURFACE_BUSY 
 static smtl_device *smDev;      /* for smstats' work counts */
 static uint64_t smLatencySum, smLatencyMax;    /* commit to completion, mach ticks */
 static uint64_t smGpuSum, smGpuMax, smGpuCount; /* GPUEndTime - GPUStartTime, ns */
+static uint64_t smEncodeSum, smEncodeMax;      /* commandBuffer to commit, mach ticks */
 
 /*
  * Which command buffers may still run, for what outlives the textures they
@@ -214,9 +215,12 @@ smstats(void)
 	uint64_t gsum = __atomic_exchange_n(&smGpuSum, 0, __ATOMIC_RELAXED);
 	uint64_t gmax = __atomic_exchange_n(&smGpuMax, 0, __ATOMIC_RELAXED);
 	uint64_t gn = __atomic_exchange_n(&smGpuCount, 0, __ATOMIC_RELAXED);
+	uint64_t esum = __atomic_exchange_n(&smEncodeSum, 0, __ATOMIC_RELAXED);
+	uint64_t emax = __atomic_exchange_n(&smEncodeMax, 0, __ATOMIC_RELAXED);
 	NSMutableString *line = [NSMutableString stringWithFormat:
-	    @"%u commits (%.1f/s), %u completed, latency %.1f ms (max %.1f), GPU %.1f ms "
-	    "(max %.1f), live:", commits, per_s, done,
+	    @"%u commits (%.1f/s), encode %.1f ms (max %.1f), %u completed, latency %.1f ms "
+	    "(max %.1f), GPU %.1f ms (max %.1f), live:", commits, per_s, esum * ms / 50, emax * ms,
+	    done,
 	    done > done_before ? sum * ms / (done - done_before) : 0, max * ms,
 	    gn ? gsum / 1e6 / gn : 0, gmax / 1e6];
 	done_before = done;
@@ -697,6 +701,7 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 	NSMutableArray<MTLCommandBufferHandler> *_scheduled;
 	dispatch_semaphore_t _slot;     /* the queue's in-flight slot this buffer holds */
 	uint64_t _seq;                  /* smSeqTake, until its completion takes it */
+	uint64_t _made;                 /* mach_absolute_time of -commandBuffer */
 	uint32_t _surfaces[8];          /* IOSurfaces it renders into */
 	unsigned _surfaceCount;
 	uint32_t _reads[32];            /* IOSurfaces its commands read */
@@ -1241,6 +1246,12 @@ countCompleted(void *ctx)
 	 * what waits for it to be done (smSeqDone) */
 	NSArray<SweetSurfaceImage *> *written = _written;
 	_written = nil;
+	uint64_t encode = mach_absolute_time() - _made;
+	__atomic_fetch_add(&smEncodeSum, encode, __ATOMIC_RELAXED);
+	uint64_t emax = __atomic_load_n(&smEncodeMax, __ATOMIC_RELAXED);
+	while (encode > emax && !__atomic_compare_exchange_n(&smEncodeMax, &emax, encode, false,
+	    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+	}
 	struct smDone *d = calloc(1, sizeof(*d));
 	d->slot = _slot ? (__bridge_retained void *)_slot : NULL;
 	d->seq = _seq;
@@ -1389,6 +1400,7 @@ countCompleted(void *ctx)
 	cb->_slot = slot ? _slots : nil;
 	cb->_seq = smSeqTake();
 	cb->_rawQueue = _q;
+	cb->_made = mach_absolute_time();
 	return cb;
 }
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
