@@ -1,0 +1,83 @@
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -14,6 +14,7 @@
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetAccelerator.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -0,0 +1,56 @@
++/*
++ * Placeholder IOAcceleratorES for SWEET.
++ *
++ * QuartzCore's CAMetalContextCreate first waits for an IOAcceleratorES
++ * service: up to 300 lookups 100 ms apart, then it goes on regardless.
++ * Without a GPU that costs backboardd 30 s before the first frame. This
++ * service ends the wait at once. It names no Metal or GL plug-in, so
++ * Metal still finds no device and CoreAnimation renders on the CPU as
++ * before. Boot-arg sweetaccel=0 leaves it out.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++bool
++IOAcceleratorES::start(IOService *provider)
++{
++	int enabled = 1;
++
++	(void)PE_parse_boot_argn("sweetaccel", &enabled, sizeof(enabled));
++	if (!enabled || !IOService::start(provider)) {
++		return false;
++	}
++	registerService();
++	IOLog("SWEET ACCEL: placeholder IOAcceleratorES registered (no GPU)\n");
++	return true;
++}
++
++IOReturn
++IOAcceleratorES::newUserClient(task_t owningTask __unused, void *securityID __unused,
++    UInt32 type, IOUserClient **handler)
++{
++	static bool logged;
++
++	if (!logged) {
++		logged = true;
++		IOLog("SWEET ACCEL: user client type %u refused\n", (unsigned)type);
++	}
++	*handler = NULL;
++	return kIOReturnUnsupported;
++}
++#endif /* SWEET */
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -63,6 +63,11 @@
+     "     'IOMatchCategory' = IOCoreSurfaceRoot;"
+     "   },"
+     "   {"
++    "     'IOClass'         = IOAcceleratorES;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOAcceleratorES;"
++    "   },"
++    "   {"
+     "     'IOClass'         = AppleCLCD;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+     "     'IONameMatch'     = 'sweet,display';"
