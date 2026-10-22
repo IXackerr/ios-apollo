@@ -7,12 +7,18 @@ address comes from the sweet live FDT. Usage:
   mkadt.py OUT.adt [--dump] [--qemu] [--highmem]                  # sweet
   mkadt.py OUT.adt --board apollo --phys-base HEX --mem-size HEX  # Mi 10T (Pro)
            [--touch-fw novatek_nt36675_j3s_fw01.bin] [--gpu-fw DIR]
+           [--run PROGRAM [--run-args "ARGS"] [--run-delay SECONDS]]
 
 --gpu-fw DIR adds /sweet-gpu with the phone's own a650_sqe.fw, a650_gmu.bin
 and a650_zap (.mbn, or .mdt + .bNN which are joined like tools/mkzap.py)
 for SweetAdreno (patch 0094). The blobs are Qualcomm/Xiaomi proprietary:
 copy them from the phone's /vendor/firmware and keep them outside git; the
 ADT is a local build product.
+
+--run PROGRAM adds /sweet-run: ios/sweetrun, started by launchd at boot,
+runs PROGRAM (an iOS Mach-O) with ARGS after SECONDS and its output goes
+to the console. Tests reach the phone in the boot image, the root stays
+as it is.
 
 For apollo the RAM window has no default on purpose: take it from the
 phone's live FDT with tools/fdtmem.py (see PORTING-APOLLO.md). The touch
@@ -157,7 +163,7 @@ def gpu_node(fwdir, ph):
 
 
 def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, mem_size=None,
-          touch_fw=None, gpu_fw=None):
+          touch_fw=None, gpu_fw=None, run=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     b = BOARDS[board]
     if phys_base is None or mem_size is None:
@@ -330,6 +336,15 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
         if board != 'apollo':
             raise SystemExit('--gpu-fw: only the apollo (SM8250 / Adreno 650) board')
         extra.append(gpu_node(gpu_fw, ph))
+    if run:
+        # read by ios/sweetrun at boot: a program to run without changing the root
+        program, args, delay = run
+        extra.append(node('sweet-run', [
+            ph(),
+            ('program', program),
+            ('args', b''.join(cstr(a) for a in args)),
+            ('delay', u32(delay)),
+        ]))
     if b['touch']:
         extra.append(node('sweet-touch', [
             ph(),
@@ -371,7 +386,10 @@ if __name__ == '__main__':
                  phys_base=_opt('--phys-base', lambda x: int(x, 0)),
                  mem_size=_opt('--mem-size', lambda x: int(x, 0)),
                  touch_fw=_opt('--touch-fw', lambda f: open(f, 'rb').read()),
-                 gpu_fw=_opt('--gpu-fw'))
+                 gpu_fw=_opt('--gpu-fw'),
+                 run=_opt('--run', lambda f: (open(f, 'rb').read(),
+                                              _opt('--run-args', default='').split(),
+                                              _opt('--run-delay', int, 0))))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
