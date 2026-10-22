@@ -107,15 +107,24 @@ smcount(Class c, int delta)
 	}
 }
 
-/* every 500 command buffers: how many of each object are alive */
+static unsigned smCompleted;
+
+/* every 50 command buffers: how many completed, the rate, and how many of
+ * each object are alive */
 static void
 smstats(void)
 {
 	static unsigned commits;
-	if (++commits % 500 != 0) {
+	static uint64_t last_ns;
+	if (++commits % 50 != 0) {
 		return;
 	}
-	NSMutableString *line = [NSMutableString stringWithFormat:@"%u commits, live:", commits];
+	uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	double per_s = last_ns ? 50e9 / (double)(now - last_ns) : 0;
+	last_ns = now;
+	NSMutableString *line = [NSMutableString stringWithFormat:
+	    @"%u commits (%.1f/s), %u completed, live:", commits, per_s,
+	    __atomic_load_n(&smCompleted, __ATOMIC_RELAXED)];
 	@synchronized ([SMBase class]) {
 		for (NSString *k in [smLive.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
 			[line appendFormat:@" %@ %@", [k stringByReplacingOccurrencesOfString:@"SweetMetal"
@@ -780,8 +789,19 @@ runHandler(void *ctx)
 	if (smtl_cmdbuf_add_handler(_c, 0, runHandler, (__bridge_retained void *)[call copy]) != 0) {
 		SMError(@"addCompletedHandler:");
 	}
-}- (void)commit
+}
+
+static void
+countCompleted(void *ctx)
 {
+	(void)ctx;
+	__atomic_fetch_add(&smCompleted, 1, __ATOMIC_RELAXED);
+}
+
+- (void)commit
+{
+	/* every buffer reports its completion, for smstats */
+	smtl_cmdbuf_add_handler(_c, 0, countCompleted, NULL);
 	if (smtl_cmdbuf_commit(_c) != 0) {
 		SMError(@"commit");
 		return;
