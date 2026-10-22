@@ -1,0 +1,20 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -336,6 +336,17 @@
+ 		s->planeCount = planes->getCount();
+ 	}
+ 
++	/*
++	 * Room for the rows up to a multiple of 4: the GPU renders the surface
++	 * in place in tiles of 16x4 texels (an Adreno's GMEM stores), and its
++	 * linear image over the pages takes that height.
++	 */
++	uint64_t rows = sweet_div_up(s->height, s->elementHeight);
++	uint64_t tiled = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * ((rows + 3) & ~3ull);
++	if (s->planeCount == 0 && end < tiled) {
++		end = tiled;
++	}
++
+ 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
+ 	if (alloc < end) {
+ 		alloc = end;
