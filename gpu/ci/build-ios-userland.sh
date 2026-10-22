@@ -51,7 +51,7 @@ $CC -dynamiclib -I"$WORK/mesa/include" -o "$OUT/libsweetvk.dylib" \
   -install_name @rpath/libsweetvk.dylib -Wl,-rpath,@loader_path
 $CC -c -I"$ROOT/kernel" -o "$WORK/sweetgpu.o" "$ROOT/userland/libsweetgpu/sweetgpu.c"
 $CC -I"$WORK/mesa/include" -I"$REPO/ios/sweetrun" -o "$OUT/vktest" \
-  "$ROOT/hosttest/vktest.c" "$REPO/ios/sweetrun/sweetlog.c" -framework IOKit -framework CoreFoundation
+  "$ROOT/hosttest/vktest.c" "$REPO/ios/sweetrun/sweetlog.c" -framework IOKit -framework CoreFoundation -lz
 fi
 
 # ---- sweetmetal-core (Rust, LGPL: separate dylib; metal2vulkan pinned in Cargo.toml) ----

@@ -7,7 +7,7 @@ address comes from the sweet live FDT. Usage:
   mkadt.py OUT.adt [--dump] [--qemu] [--highmem]                  # sweet
   mkadt.py OUT.adt --board apollo --phys-base HEX --mem-size HEX  # Mi 10T (Pro)
            [--touch-fw novatek_nt36675_j3s_fw01.bin] [--gpu-fw DIR]
-           [--run PROGRAM [--run-args "ARGS"] [--run-delay SECONDS] [--run-lib FILE]]
+           [--run PROGRAM [--run-args "ARGS"] [--run-delay SECONDS] [--run-file NAME=FILE]...]
 
 --gpu-fw DIR adds /sweet-gpu with the phone's own a650_sqe.fw, a650_gmu.bin
 and a650_zap (.mbn, or .mdt + .bNN which are joined like tools/mkzap.py)
@@ -18,8 +18,9 @@ ADT is a local build product.
 --run PROGRAM adds /sweet-run: ios/sweetrun, started by launchd at boot,
 runs PROGRAM (an iOS Mach-O) with ARGS after SECONDS and its output goes
 to the console. Tests reach the phone in the boot image, the root stays
-as it is. --run-lib FILE adds one more file for the program (properties
-lib-0, lib-1, ...; ios/sweetrun/sweetrun.h sweetrun_file), e.g. the
+as it is. --run-file NAME=FILE (repeatable; --run-lib FILE is lib=FILE)
+adds more files for the program, zlib-compressed (properties NAME-z,
+NAME-0, NAME-1, ...; ios/sweetrun/sweetrun.h sweetrun_file), e.g. the
 Vulkan driver.
 
 For apollo the RAM window has no default on purpose: take it from the
@@ -27,7 +28,7 @@ phone's live FDT with tools/fdtmem.py (see PORTING-APOLLO.md). The touch
 firmware is built into the phone's stock kernel; without --touch-fw the
 /sweet-touch node still names the controller, and the driver stays idle.
 """
-import hashlib, os, struct, sys
+import hashlib, os, struct, sys, zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
@@ -345,14 +346,19 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
         extra.append(gpu_node(gpu_fw, ph))
     if run:
         # read by ios/sweetrun at boot: a program to run without changing the root
-        program, args, delay, lib = run
-        extra.append(node('sweet-run', [
+        program, args, delay, files = run
+        props = [
             ph(),
             ('program', program),
             ('args', b''.join(cstr(a) for a in args)),
             ('delay', u32(delay)),
-        ] + [(f'lib-{i}', lib[o:o + RUN_CHUNK])
-             for i, o in enumerate(range(0, len(lib or b''), RUN_CHUNK))]))
+        ]
+        for name, data in files:
+            z = zlib.compress(data, 9)
+            props.append((f'{name}-z', u32(len(data))))
+            props += [(f'{name}-{i}', z[o:o + RUN_CHUNK])
+                      for i, o in enumerate(range(0, len(z), RUN_CHUNK))]
+        extra.append(node('sweet-run', props))
     if b['touch']:
         extra.append(node('sweet-touch', [
             ph(),
@@ -377,6 +383,17 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
     ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + extra + product + ([] if qemu else [ufs, spmi]))
 
 
+def run_files():
+    """--run-file NAME=FILE (repeatable) and --run-lib FILE (NAME lib)."""
+    files = []
+    for i, a in enumerate(sys.argv):
+        if a in ('--run-file', '--run-lib') and i + 1 < len(sys.argv):
+            spec = sys.argv[i + 1] if a == '--run-file' else 'lib=' + sys.argv[i + 1]
+            name, _, path = spec.partition('=')
+            files.append((name, open(path, 'rb').read()))
+    return files
+
+
 def _opt(name, conv=str, default=None):
     if name in sys.argv:
         i = sys.argv.index(name)
@@ -398,7 +415,7 @@ if __name__ == '__main__':
                  run=_opt('--run', lambda f: (open(f, 'rb').read(),
                                               _opt('--run-args', default='').split(),
                                               _opt('--run-delay', int, 0),
-                                              _opt('--run-lib', lambda f: open(f, 'rb').read()))))
+                                              run_files())))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

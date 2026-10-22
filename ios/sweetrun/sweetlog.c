@@ -7,15 +7,18 @@
  * sweetnull (sweetrun-program), and stdout is line-buffered so a crash
  * loses nothing that was printed.
  *
- * Files: sweetrun_file() (sweetrun.h) unpacks extra files that came with
- * the boot image.
+ * Files: sweetrun_file() (sweetrun.h) unpacks the extra, zlib-compressed
+ * files that came with the boot image.
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <mach/mach.h>
+#include <zlib.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include "sweetrun.h"
 
@@ -64,17 +67,15 @@ run_prop(io_registry_entry_t node, const char *name)
 }
 
 static int
-write_all(int fd, CFDataRef data)
+write_all(int fd, const UInt8 *p, size_t left)
 {
-	const UInt8 *p = CFDataGetBytePtr(data);
-	CFIndex left = CFDataGetLength(data);
 	while (left > 0) {
-		ssize_t n = write(fd, p, (size_t)left);
+		ssize_t n = write(fd, p, left);
 		if (n <= 0) {
 			return -1;
 		}
 		p += n;
-		left -= n;
+		left -= (size_t)n;
 	}
 	return 0;
 }
@@ -86,26 +87,48 @@ sweetrun_file(const char *prop, const char *path)
 	if (node == MACH_PORT_NULL) {
 		return NULL;
 	}
+	char name[32];
+	snprintf(name, sizeof(name), "%s-z", prop);
+	CFDataRef zsize = run_prop(node, name);
+	z_stream z = { 0 };
+	static UInt8 out[256 * 1024];
+	int err = zsize == NULL || inflateInit(&z) != Z_OK;
 	unlink(path);
-	int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0755);
-	int chunks = 0, err = fd < 0;
-	/* the file is split into properties PROP-0, PROP-1, ... (mkadt.py) */
-	for (; fd >= 0 && !err; chunks++) {
-		char name[32];
+	int fd = err ? -1 : open(path, O_WRONLY | O_CREAT | O_EXCL, 0755);
+	int chunks = 0, zr = Z_OK;
+	err |= fd < 0;
+	/* zlib stream split into properties PROP-0, PROP-1, ... (mkadt.py) */
+	for (; !err && zr != Z_STREAM_END; chunks++) {
 		snprintf(name, sizeof(name), "%s-%d", prop, chunks);
 		CFDataRef d = run_prop(node, name);
 		if (d == NULL) {
 			break;
 		}
-		err = write_all(fd, d);
+		z.next_in = (Bytef *)CFDataGetBytePtr(d);
+		z.avail_in = (uInt)CFDataGetLength(d);
+		while (!err && z.avail_in > 0 && zr != Z_STREAM_END) {
+			z.next_out = out;
+			z.avail_out = sizeof(out);
+			zr = inflate(&z, Z_NO_FLUSH);
+			err = (zr != Z_OK && zr != Z_STREAM_END) ||
+			    write_all(fd, out, sizeof(out) - z.avail_out);
+		}
 		CFRelease(d);
+	}
+	if (zsize != NULL) {
+		uint32_t want = 0;
+		memcpy(&want, CFDataGetBytePtr(zsize), sizeof(want));
+		err |= zr != Z_STREAM_END || z.total_out != want;
+		CFRelease(zsize);
+		inflateEnd(&z);
 	}
 	IOObjectRelease(node);
 	if (fd >= 0) {
 		close(fd);
 	}
-	if (err || chunks == 0) {
-		printf("sweetrun_file: %s: %s\n", prop, err ? "cannot write" : "not in the boot image");
+	if (err) {
+		printf("sweetrun_file: %s: %s\n", prop, zsize == NULL && chunks == 0 ?
+		    "not in the boot image" : "cannot unpack");
 		unlink(path);
 		return NULL;
 	}

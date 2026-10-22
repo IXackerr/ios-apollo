@@ -1,7 +1,7 @@
 # Small iOS programs for the phone: ios/sweetrun (runs a program handed
 # over in the boot image) and the GPU user-space tests (gpu/userland/gputest,
-# gpu/hosttest/vktest.c, gpu/userland/vkcompute, vkdraw; turnip itself comes
-# from gpu-userland).
+# gpu/hosttest/vktest.c, gpu/userland/vkcompute, vkdraw, smtltest; turnip
+# and libsweetmetal_core come from gpu-userland).
 name: ios-tools
 on:
   workflow_dispatch:
@@ -15,6 +15,7 @@ on:
       - "gpu/hosttest/vktest.c"
       - "gpu/userland/vkcompute/**"
       - "gpu/userland/vkdraw/**"
+      - "gpu/userland/smtltest/**"
       - ".github/workflows/ios-tools.yml"
 jobs:
   build:
@@ -26,25 +27,29 @@ jobs:
           set -eux
           CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall"
           mkdir -p out
-          $CC -o out/sweetrun ios/sweetrun/sweetrun.c -framework IOKit -framework CoreFoundation
+          $CC -o out/sweetrun ios/sweetrun/sweetrun.c -framework IOKit -framework CoreFoundation -lz
           $CC -Igpu/kernel -Igpu/userland/libsweetgpu -o out/gputest \
             gpu/userland/gputest/gputest.c gpu/userland/libsweetgpu/sweetgpu.c ios/sweetrun/sweetlog.c \
-            -framework IOKit -framework CoreFoundation
+            -framework IOKit -framework CoreFoundation -lz
           # vktest dlopens turnip; the Khronos headers are enough to build it
           brew list vulkan-headers >/dev/null 2>&1 || brew install vulkan-headers
           $CC -I"$(brew --prefix vulkan-headers)/include" -Iios/sweetrun -o out/vktest \
-            gpu/hosttest/vktest.c ios/sweetrun/sweetlog.c -framework IOKit -framework CoreFoundation
+            gpu/hosttest/vktest.c ios/sweetrun/sweetlog.c -framework IOKit -framework CoreFoundation -lz
           brew list glslang >/dev/null 2>&1 || brew install glslang
           mkdir -p gen
           glslangValidator -V --vn square_spv gpu/userland/vkcompute/square.comp -o gen/square_spv.h
           $CC -I"$(brew --prefix vulkan-headers)/include" -Iios/sweetrun -Igen -o out/vkcompute \
-            gpu/userland/vkcompute/vkcompute.c ios/sweetrun/sweetlog.c -framework IOKit -framework CoreFoundation
+            gpu/userland/vkcompute/vkcompute.c ios/sweetrun/sweetlog.c -framework IOKit -framework CoreFoundation -lz
           for s in vert frag; do
             glslangValidator -V --vn tri_${s}_spv gpu/userland/vkdraw/tri.$s -o gen/tri_${s}_spv.h
           done
           $CC -I"$(brew --prefix vulkan-headers)/include" -Iios/sweetrun -Igen -o out/vkdraw \
-            gpu/userland/vkdraw/vkdraw.c ios/sweetrun/sweetlog.c -framework IOKit -framework CoreFoundation
-          for f in out/*; do codesign -f -s - "$f"; done
+            gpu/userland/vkdraw/vkdraw.c ios/sweetrun/sweetlog.c -framework IOKit -framework CoreFoundation -lz
+          xcrun -sdk iphoneos metal -c gpu/userland/smtltest/test.metal -o gen/test.air
+          xcrun -sdk iphoneos metallib gen/test.air -o out/test.metallib
+          $CC -Igpu/userland/sweetmetal/core/include -Iios/sweetrun -o out/smtltest \
+            gpu/userland/smtltest/smtltest.c ios/sweetrun/sweetlog.c -framework IOKit -framework CoreFoundation -lz
+          for f in out/*; do [ "${f%.metallib}" = "$f" ] && codesign -f -s - "$f"; done
           file out/*
       - uses: actions/upload-artifact@v4
         with:
