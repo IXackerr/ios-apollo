@@ -1,0 +1,31 @@
+--- a/iokit/Kernel/arm/SweetBacklight.cpp
++++ b/iokit/Kernel/arm/SweetBacklight.cpp
+@@ -10,6 +10,9 @@
+  * other key is accepted and ignored. Display power is not sent here: the
+  * framebuffer switches the WLED and this service only relays the
+  * will-power-off / has-powered-on messages CoreBrightness listens for.
++ * A brightness of 0 is never applied: the panel's minimum is 2 nits, and
++ * at boot CoreBrightness sends 0 while it still thinks the display is off,
++ * which would leave iOS running on a dark panel.
+  * Boot-arg sweetbacklight=0 leaves it out.
+  */
+ #include <pexpert/arm64/board_config.h>
+@@ -127,12 +130,16 @@
+ 	}
+ 	OSNumber *nits = OSDynamicCast(OSNumber, dict->getObject("brightness-nits"));
+ 	OSNumber *raw = OSDynamicCast(OSNumber, dict->getObject("brightness"));
++	unsigned level = fLevel;
+ 	if (nits) {
+ 		/* 16.16 nits -> level; the scale is linear in nits up to the panel max. */
+ 		uint64_t milli = (nits->unsigned64BitValue() * 1000u) >> 16;
+-		apply((unsigned)(milli * LEVEL_MAX / MILLINITS_MAX));
++		level = (unsigned)(milli * LEVEL_MAX / MILLINITS_MAX);
+ 	} else if (raw) {
+-		apply(raw->unsigned32BitValue());
++		level = raw->unsigned32BitValue();
++	}
++	if (level) {
++		apply(level);
+ 	}
+ 	return kIOReturnSuccess;
+ }
