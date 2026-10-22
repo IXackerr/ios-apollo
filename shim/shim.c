@@ -12,6 +12,7 @@
 #include "loader.h"
 #include "ufs.h"
 #include "touch.h"
+#include "gpu.h"
 #include "cpufreq.h"
 #include "pmic.h"
 #include "menu.h"
@@ -173,6 +174,11 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	con_hex("X0", regs[0]);
 	con_hex("X1", regs[1]);
 	con_hex("X30", regs[29]);	/* stashed lr is just above the frame */
+#if defined(GPU_PROBE)
+	gpu_exception(rsr("esr_el1"), rsr("elr_el1"), rsr("far_el1"));
+	delay_ms(10000);
+	reboot_now(RESTART_RECOVERY);
+#endif
 	reset(40);
 }
 
@@ -604,6 +610,13 @@ void shim_main(uint64_t dtb)
 	con_str("CPUFREQ", "done, reset in ~2 min");
 	delay_ms(120000);
 	reset(20);
+#endif
+#if defined(GPU_PROBE)
+	/* The log is in pstore: recovery shows it, no photo needed. */
+	stage = "gpu";
+	test_gpu(dtb, GPU_PROBE);
+	delay_ms(30000);
+	reboot_now(RESTART_RECOVERY);
 #endif
 #if defined(TOUCH_PROBE)
 	stage = "touch";

@@ -7,6 +7,10 @@
 #             fuel gauge, charger) probe instead (apollo)
 #   TOUCHFW=path  touch probe instead of the hardware probe, with this
 #             NT36675 firmware as the ramdisk (apollo)
+#   GPUFW=dir  Adreno 650 probe instead: the GPU driver (gpu/kernel) runs
+#             bare metal up to stage GPUSTAGE (default 7, selftest) with the
+#             firmware in dir as the ramdisk, then reboots to recovery,
+#             where the log is /sys/fs/pstore/console-ramoops-0 (apollo)
 #   DTB=path  DTB appended to boot.img (default ../dtb/boot_unpacked/dtb,
 #             the stock DTB unpacked from the phone's own boot.img)
 set -euo pipefail
@@ -28,21 +32,34 @@ esac
 # DIAG=1|2|3: black-screen diagnostics (see diag_main in shim.c)
 [ -n "${DIAG:-}" ] && BOARD_CFLAGS="$BOARD_CFLAGS -DDIAG=$DIAG"
 [ -n "${TOUCHFW:-}" ] && BOARD_CFLAGS="$BOARD_CFLAGS -DTOUCH_PROBE"
+[ -n "${GPUFW:-}" ] && BOARD_CFLAGS="$BOARD_CFLAGS -DGPU_PROBE=${GPUSTAGE:-7}"
 [ "${PROBE:-}" = cpufreq ] && BOARD_CFLAGS="$BOARD_CFLAGS -DCPUFREQ_PROBE"
 [ "${PROBE:-}" = pmic ] && BOARD_CFLAGS="$BOARD_CFLAGS -DPMIC_PROBE"
 CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra $BOARD_CFLAGS"
 mkdir -p out
-for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c touch.c cpufreq.c pmic.c spmi.c menu.c; do
-	$CC $CFLAGS -c $f -o out/${f%.*}.o
+SRCS="shim.c console.c mmu.c fdt.c loader.c ufs.c touch.c cpufreq.c pmic.c spmi.c menu.c"
+if [ -n "${GPUFW:-}" ]; then
+	SRCS="$SRCS gpu.c"
+	for f in clk cmddb core cp gmu mem scm smmu; do
+		SRCS="$SRCS ../gpu/kernel/sweet_gpu_$f.c"
+	done
+	CFLAGS="$CFLAGS -DARM64_BOARD_CONFIG_SWEET -I../gpu/kernel"
+fi
+OBJS=""
+for f in $SRCS; do
+	o=out/$(basename "${f%.*}").o
+	$CC $CFLAGS -c "$f" -o "$o"
+	OBJS="$OBJS $o"
 done
+$CC $CFLAGS -c start.S -o out/start.o
 # The image runs wherever ABL puts it with no relocation pass: only the
 # header's image_size (start.o, linked at 0) may be an absolute address.
-abs=$(aarch64-linux-gnu-readelf -r out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o out/touch.o out/cpufreq.o out/pmic.o out/spmi.o out/menu.o | grep -c ABS64 || true)
+abs=$(aarch64-linux-gnu-readelf -r $OBJS | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
-	out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o out/touch.o out/cpufreq.o out/pmic.o out/spmi.o out/menu.o -o out/shim.elf
+	out/start.o $OBJS -o out/shim.elf
 $OBJCOPY -O binary out/shim.elf out/Image
 # ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
 size=$((0x$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print $1}')))	# no gawk needed
@@ -54,7 +71,9 @@ if [ "$GZIP_KERNEL" = 1 ]; then
 fi
 # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
 # newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
-if [ -n "${TOUCHFW:-}" ]; then
+if [ -n "${GPUFW:-}" ]; then
+	python3 ../tools/mkgpufw.py "$GPUFW" out/ramdisk.bin
+elif [ -n "${TOUCHFW:-}" ]; then
 	cp "$TOUCHFW" out/ramdisk.bin
 elif [ -n "${1:-}" ]; then
 	cp "$1" out/ramdisk.bin
