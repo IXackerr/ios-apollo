@@ -212,6 +212,15 @@ Results on the phone (kernel and bare-metal shim agree):
   GMU then faults on its page tables. The driver maps the pages again with
   `ml_io_map_unmappable(..., VM_WIMG_WCOMB)` (not `ml_io_map_wcomb`: its
   8 MiB submap cannot hold the GMU's 16 MiB code space).
+- From iOS user space (gputest through the SweetAdreno user client, run
+  by ios/sweetrun from the boot image): buffer allocation, an IB with
+  CP_MEM_WRITE, timestamp 1, and 1000 submits at about 20 us each. The GPU
+  still runs at its lowest level (305 MHz).
+- XNU's `pmap_sync_page_attributes_phys` shifted the page number in 32
+  bits; on apollo, whose kernel RAM is all above 4 GiB, faulting in a
+  write-combined user mapping panicked (patch 0095).
+- TrustZone interrupts the zap shader's `init_image` when the system is
+  busy; the call has to be resumed with the token it returns in x6.
 - `shim/build.sh GPUFW=dir` runs the same driver bare metal and leaves its
   log in the recovery's pstore console, about a minute per try.
 
