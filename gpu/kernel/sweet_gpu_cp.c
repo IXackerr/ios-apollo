@@ -667,6 +667,7 @@ sgpu_cp_submit(struct sgpu *g, uint32_t ctx_id, const struct sgpu_ib *ibs,
 	if ((err = ring_reserve(g, 27 + 4 * n + 7)) != 0) {
 		return err;
 	}
+	sgpu_dcvs_busy(g);
 	uint32_t seqno = ++g->fence_seqno;
 	uint32_t ts = ++g->ctx[ctx_id].queued;
 	uint32_t idx = seqno % 64;

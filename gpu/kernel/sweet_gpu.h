@@ -323,6 +323,8 @@ void sgpu_gmu_gx_off(struct sgpu *g);
 int  sgpu_gmu_set_freq(struct sgpu *g, uint32_t index);
 uint32_t sgpu_gmu_state(struct sgpu *g);
 uint32_t sgpu_gmu_max_freq_hz(struct sgpu *g);
+void sgpu_dcvs_busy(struct sgpu *g);    /* work submitted: highest level */
+void sgpu_dcvs_tick(struct sgpu *g);    /* periodic: lowest level when idle */
 enum sgpu_oob { SGPU_OOB_GPU_SET, SGPU_OOB_PERFCOUNTER };
 int  sgpu_gmu_oob_set(struct sgpu *g, enum sgpu_oob oob);
 void sgpu_gmu_oob_clear(struct sgpu *g, enum sgpu_oob oob);

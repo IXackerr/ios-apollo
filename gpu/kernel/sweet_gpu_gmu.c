@@ -161,6 +161,8 @@ struct sgpu_gmu {
 	uint32_t        gmu_freq_khz[HFI_MAX_LEVELS_CX];
 	uint32_t        cx_votes[HFI_MAX_LEVELS_CX];
 	uint32_t        perf_index;
+	bool            dcvs_pinned;    /* sweetgpu_freq=N: no DCVS */
+	uint64_t        dcvs_busy_us;   /* last time the GPU had work */
 };
 
 static struct sgpu_gmu gmu_storage;
@@ -865,23 +867,24 @@ sgpu_gmu_init(struct sgpu *g)
 	gmu_wr(g, GMU_GMU2HOST_INTR_MASK, ~GMU2HOST_CM3_FAULT);
 
 	/*
-	 * Initial GX level. Linux votes the highest OPP; a first bring-up is
-	 * safer at the lowest (305 MHz, RPMh LOW_SVS). sweetgpu_freq=N picks
-	 * level N (1 = lowest).
+	 * Initial GX level: the lowest (305 MHz, RPMh LOW_SVS), and DCVS
+	 * (sgpu_dcvs_busy) raises it with the first submission.
+	 * sweetgpu_freq=N pins level N instead (1 = lowest, 0 = highest).
 	 */
 	want = 1;
-	(void)sgpu_bootarg_u32("sweetgpu_freq", &want);
+	m->dcvs_pinned = sgpu_bootarg_u32("sweetgpu_freq", &want);
 	if (want == 0 || want >= m->nr_gpu_freqs) {
 		want = m->nr_gpu_freqs - 1;
 	}
 	m->perf_index = want;
+	m->dcvs_busy_us = sgpu_now_us();
 	if ((err = hfi_perf_vote(g, m, m->perf_index)) != 0) {
 		return err;
 	}
 	m->running = true;
-	sgpu_log("gmu: HFI started, GX level %u (%u MHz), RPMh power state %#x",
+	sgpu_log("gmu: HFI started, GX level %u (%u MHz, %s), RPMh power state %#x",
 	    m->perf_index, m->gpu_freq_khz[m->perf_index] / 1000,
-	    gmu_rd(g, GMU_RPMH_POWER_STATE));
+	    m->dcvs_pinned ? "pinned by sweetgpu_freq" : "DCVS", gmu_rd(g, GMU_RPMH_POWER_STATE));
 	return 0;
 }
 
@@ -976,7 +979,46 @@ sgpu_gmu_max_freq_hz(struct sgpu *g)
 	if (m == NULL || m->nr_gpu_freqs == 0) {
 		return 0;
 	}
-	return m->gpu_freq_khz[m->perf_index] * 1000u;
+	return m->gpu_freq_khz[m->dcvs_pinned ? m->perf_index : m->nr_gpu_freqs - 1] * 1000u;
+}
+
+/*
+ * DCVS, race to idle: the highest level as soon as work is submitted, the
+ * lowest once the ring has been idle for SGPU_DCVS_IDLE_US. Called with
+ * the driver lock held, from the submit path and from a periodic tick.
+ */
+#define SGPU_DCVS_IDLE_US       100000
+
+void
+sgpu_dcvs_busy(struct sgpu *g)
+{
+	struct sgpu_gmu *m = g->gmu_state;
+
+	if (m == NULL || !m->running || m->dcvs_pinned) {
+		return;
+	}
+	m->dcvs_busy_us = sgpu_now_us();
+	if (m->perf_index != m->nr_gpu_freqs - 1) {
+		(void)sgpu_gmu_set_freq(g, m->nr_gpu_freqs - 1);
+	}
+}
+
+void
+sgpu_dcvs_tick(struct sgpu *g)
+{
+	struct sgpu_gmu *m = g->gmu_state;
+
+	if (m == NULL || !m->running || m->dcvs_pinned || g->stage_reached < SGPU_STAGE_CP) {
+		return;
+	}
+	uint64_t now = sgpu_now_us();
+	if (sgpu_cp_ring_fence_retired(g) != g->fence_seqno) {
+		m->dcvs_busy_us = now;
+		return;
+	}
+	if (m->perf_index != 1 && now - m->dcvs_busy_us >= SGPU_DCVS_IDLE_US) {
+		(void)sgpu_gmu_set_freq(g, 1);
+	}
 }
 
 uint32_t

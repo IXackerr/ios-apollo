@@ -237,6 +237,15 @@ SweetAdreno::bringupThread(void *arg, __unused wait_result_t wr)
 		IOLog("SWEET GPU: not published (stage %u of %u, error %d)\n",
 		    sgpu_dev.stage_reached, self->fStage, err);
 	}
+	if (!err && sgpu_dev.stage_reached >= SGPU_STAGE_CP) {
+		/* This thread stays as the DCVS tick: lowest level once idle. */
+		for (;;) {
+			IOSleep(50);
+			IOLockLock(sgpu_lock);
+			sgpu_dcvs_tick(&sgpu_dev);
+			IOLockUnlock(sgpu_lock);
+		}
+	}
 	self->release();
 	thread_terminate(current_thread());
 }

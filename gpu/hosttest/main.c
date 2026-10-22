@@ -96,10 +96,11 @@ test_bringup(void)
 	EXPECT(err == 0, "bring-up failed: %d (%s)", err, host_g.message);
 	EXPECT(host_g.stage_reached == SGPU_STAGE_USER, "stage %u", host_g.stage_reached);
 
-	/* HFI order */
-	static const uint32_t want_hfi[] = { 4, 3, 14, 10, 30 };
-	EXPECT(model_hfi_count == 5, "%d HFI messages", model_hfi_count);
-	for (int i = 0; i < 5 && i < model_hfi_count; i++) {
+	/* HFI order; the second GX_BW_PERF_VOTE is DCVS raising the level
+	 * for the selftest's submission */
+	static const uint32_t want_hfi[] = { 4, 3, 14, 10, 30, 30 };
+	EXPECT(model_hfi_count == 6, "%d HFI messages", model_hfi_count);
+	for (int i = 0; i < 6 && i < model_hfi_count; i++) {
 		EXPECT(model_hfi_log[i] == want_hfi[i], "HFI msg %d id %u want %u", i,
 		    model_hfi_log[i], want_hfi[i]);
 	}
@@ -158,8 +159,21 @@ test_bringup(void)
 	EXPECT(info.gpu_id == 650 && info.chip_id == 0x06050002 && info.gmem_size == 0x120000 &&
 	    info.gmem_base == 0 && info.highest_bank_bit == 16 && info.max_contexts == 64,
 	    "info fields");
-	EXPECT(info.max_freq_hz == 305000000, "initial level %u Hz", info.max_freq_hz);
+	EXPECT(info.max_freq_hz == 670000000, "highest level %u Hz", info.max_freq_hz);
 	EXPECT(host_g.speed_bin == 1, "speed bin %u", host_g.speed_bin);
+	end_scenario(f);
+
+	f = failures;
+	scenario("DCVS: highest level after a submission, lowest when idle");
+	uint32_t top = (sgpu_gmu_state(&host_g) >> 16) & 0xff;
+	EXPECT(top > 1, "level after the selftest %u", top);
+	sgpu_dcvs_tick(&host_g);
+	EXPECT(((sgpu_gmu_state(&host_g) >> 16) & 0xff) == top, "dropped before the idle time");
+	sgpu_msleep(120);
+	sgpu_dcvs_tick(&host_g);
+	EXPECT(((sgpu_gmu_state(&host_g) >> 16) & 0xff) == 1, "level %u after 120 ms idle",
+	    (sgpu_gmu_state(&host_g) >> 16) & 0xff);
+	EXPECT(model_hfi_count == 7 && model_hfi_log[6] == 30, "%d HFI messages", model_hfi_count);
 	end_scenario(f);
 
 	/* ---- user space on top ---- */

@@ -631,7 +631,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_cp.c
-@@ -0,0 +1,934 @@
+@@ -0,0 +1,935 @@
 +/*
 + * sweet_gpu_cp.c - Adreno 650 command processor: hw_init, SQE microcode,
 + * ringbuffer, submission, timestamps, self-test, hang recovery.
@@ -1301,6 +1301,7 @@
 +	if ((err = ring_reserve(g, 27 + 4 * n + 7)) != 0) {
 +		return err;
 +	}
++	sgpu_dcvs_busy(g);
 +	uint32_t seqno = ++g->fence_seqno;
 +	uint32_t ts = ++g->ctx[ctx_id].queued;
 +	uint32_t idx = seqno % 64;
@@ -1568,7 +1569,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_gmu.c
-@@ -0,0 +1,1052 @@
+@@ -0,0 +1,1094 @@
 +/*
 + * sweet_gpu_gmu.c - Adreno 650 GMU (graphics management unit) on SM8250.
 + *
@@ -1732,6 +1733,8 @@
 +	uint32_t        gmu_freq_khz[HFI_MAX_LEVELS_CX];
 +	uint32_t        cx_votes[HFI_MAX_LEVELS_CX];
 +	uint32_t        perf_index;
++	bool            dcvs_pinned;    /* sweetgpu_freq=N: no DCVS */
++	uint64_t        dcvs_busy_us;   /* last time the GPU had work */
 +};
 +
 +static struct sgpu_gmu gmu_storage;
@@ -2436,23 +2439,24 @@
 +	gmu_wr(g, GMU_GMU2HOST_INTR_MASK, ~GMU2HOST_CM3_FAULT);
 +
 +	/*
-+	 * Initial GX level. Linux votes the highest OPP; a first bring-up is
-+	 * safer at the lowest (305 MHz, RPMh LOW_SVS). sweetgpu_freq=N picks
-+	 * level N (1 = lowest).
++	 * Initial GX level: the lowest (305 MHz, RPMh LOW_SVS), and DCVS
++	 * (sgpu_dcvs_busy) raises it with the first submission.
++	 * sweetgpu_freq=N pins level N instead (1 = lowest, 0 = highest).
 +	 */
 +	want = 1;
-+	(void)sgpu_bootarg_u32("sweetgpu_freq", &want);
++	m->dcvs_pinned = sgpu_bootarg_u32("sweetgpu_freq", &want);
 +	if (want == 0 || want >= m->nr_gpu_freqs) {
 +		want = m->nr_gpu_freqs - 1;
 +	}
 +	m->perf_index = want;
++	m->dcvs_busy_us = sgpu_now_us();
 +	if ((err = hfi_perf_vote(g, m, m->perf_index)) != 0) {
 +		return err;
 +	}
 +	m->running = true;
-+	sgpu_log("gmu: HFI started, GX level %u (%u MHz), RPMh power state %#x",
++	sgpu_log("gmu: HFI started, GX level %u (%u MHz, %s), RPMh power state %#x",
 +	    m->perf_index, m->gpu_freq_khz[m->perf_index] / 1000,
-+	    gmu_rd(g, GMU_RPMH_POWER_STATE));
++	    m->dcvs_pinned ? "pinned by sweetgpu_freq" : "DCVS", gmu_rd(g, GMU_RPMH_POWER_STATE));
 +	return 0;
 +}
 +
@@ -2547,7 +2551,46 @@
 +	if (m == NULL || m->nr_gpu_freqs == 0) {
 +		return 0;
 +	}
-+	return m->gpu_freq_khz[m->perf_index] * 1000u;
++	return m->gpu_freq_khz[m->dcvs_pinned ? m->perf_index : m->nr_gpu_freqs - 1] * 1000u;
++}
++
++/*
++ * DCVS, race to idle: the highest level as soon as work is submitted, the
++ * lowest once the ring has been idle for SGPU_DCVS_IDLE_US. Called with
++ * the driver lock held, from the submit path and from a periodic tick.
++ */
++#define SGPU_DCVS_IDLE_US       100000
++
++void
++sgpu_dcvs_busy(struct sgpu *g)
++{
++	struct sgpu_gmu *m = g->gmu_state;
++
++	if (m == NULL || !m->running || m->dcvs_pinned) {
++		return;
++	}
++	m->dcvs_busy_us = sgpu_now_us();
++	if (m->perf_index != m->nr_gpu_freqs - 1) {
++		(void)sgpu_gmu_set_freq(g, m->nr_gpu_freqs - 1);
++	}
++}
++
++void
++sgpu_dcvs_tick(struct sgpu *g)
++{
++	struct sgpu_gmu *m = g->gmu_state;
++
++	if (m == NULL || !m->running || m->dcvs_pinned || g->stage_reached < SGPU_STAGE_CP) {
++		return;
++	}
++	uint64_t now = sgpu_now_us();
++	if (sgpu_cp_ring_fence_retired(g) != g->fence_seqno) {
++		m->dcvs_busy_us = now;
++		return;
++	}
++	if (m->perf_index != 1 && now - m->dcvs_busy_us >= SGPU_DCVS_IDLE_US) {
++		(void)sgpu_gmu_set_freq(g, 1);
++	}
 +}
 +
 +uint32_t
@@ -2623,7 +2666,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.h
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,367 @@
 +/*
 + * sweet_gpu.h - internal interface of the SWEET Adreno 650 driver
 + * (Xiaomi Mi 10T / 10T Pro "apollo", Qualcomm SM8250).
@@ -2949,6 +2992,8 @@
 +int  sgpu_gmu_set_freq(struct sgpu *g, uint32_t index);
 +uint32_t sgpu_gmu_state(struct sgpu *g);
 +uint32_t sgpu_gmu_max_freq_hz(struct sgpu *g);
++void sgpu_dcvs_busy(struct sgpu *g);    /* work submitted: highest level */
++void sgpu_dcvs_tick(struct sgpu *g);    /* periodic: lowest level when idle */
 +enum sgpu_oob { SGPU_OOB_GPU_SET, SGPU_OOB_PERFCOUNTER };
 +int  sgpu_gmu_oob_set(struct sgpu *g, enum sgpu_oob oob);
 +void sgpu_gmu_oob_clear(struct sgpu *g, enum sgpu_oob oob);
@@ -4757,7 +4802,7 @@
  IOHibernateRestoreKernel.o_CWARNFLAGS_ADD += -Wno-cast-align
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,758 @@
+@@ -0,0 +1,767 @@
 +/*
 + * SweetAdreno - IOKit front end of the SWEET Adreno 650 driver.
 + *
@@ -4996,6 +5041,15 @@
 +	} else {
 +		IOLog("SWEET GPU: not published (stage %u of %u, error %d)\n",
 +		    sgpu_dev.stage_reached, self->fStage, err);
++	}
++	if (!err && sgpu_dev.stage_reached >= SGPU_STAGE_CP) {
++		/* This thread stays as the DCVS tick: lowest level once idle. */
++		for (;;) {
++			IOSleep(50);
++			IOLockLock(sgpu_lock);
++			sgpu_dcvs_tick(&sgpu_dev);
++			IOLockUnlock(sgpu_lock);
++		}
 +	}
 +	self->release();
 +	thread_terminate(current_thread());
