@@ -1,7 +1,8 @@
 # Small iOS programs for the phone: ios/sweetrun (runs a program handed
-# over in the boot image) and the GPU user-space tests (gpu/userland/gputest,
-# gpu/hosttest/vktest.c, gpu/userland/vkcompute, vkdraw, smtltest, mtltest;
-# turnip, libsweetmetal_core and SweetMetal.bundle come from gpu-userland).
+# over in the boot image), ios/sysapps (installs the staged system apps)
+# and the GPU user-space tests (gpu/userland/gputest, gpu/hosttest/vktest.c,
+# gpu/userland/vkcompute, vkdraw, smtltest, mtltest; turnip,
+# libsweetmetal_core and SweetMetal.bundle come from gpu-userland).
 name: ios-tools
 on:
   workflow_dispatch:
@@ -53,6 +54,7 @@ jobs:
           $CC -fobjc-arc -fmodules -Iios/sweetrun -o out/mtltest gpu/userland/mtltest/mtltest.m \
             ios/sweetrun/sweetlog.c ios/sweetrun/sweetfile.c -framework Foundation -framework Metal -framework IOKit -framework IOSurface \
             -framework CoreFoundation -lz
+          $CC -o out/sysapps ios/sysapps/sysapps.c ios/sweetrun/sweetlog.c
           for f in out/*; do [ "${f%.metallib}" = "$f" ] && codesign -f -s - "$f"; done
           file out/*
       - uses: actions/upload-artifact@v4
