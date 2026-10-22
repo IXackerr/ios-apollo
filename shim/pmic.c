@@ -11,6 +11,7 @@
 #define ARB_CORE	0x0c440000UL
 #define ARB_CNFG	0x0c40a000UL
 #define ARB_OBS		0x0e600000UL
+#define ARB_CHNLS	0x0c600000UL
 #define NO_APID		0xffff
 
 static inline uint32_t rd(uintptr_t a) { return *(volatile uint32_t *)a; }
@@ -42,6 +43,33 @@ static int spmi_rd(unsigned sid, unsigned addr)
 			return st & 0x0e ? -1 : (int)(rd(ch + 0x18) & 0xff);
 	}
 	return -1;
+}
+
+/*
+ * One-byte EXT_WRITEL on the APID's channel page. Only used to write a
+ * register back with the value just read from it.
+ */
+static void write_back(unsigned sid, unsigned addr)
+{
+	unsigned apid = find_apid(sid << 8 | addr >> 8);
+	int v = spmi_rd(sid, addr);
+	if (apid == NO_APID || v < 0) {
+		con_str("WRITE", "no apid / read failed");
+		return;
+	}
+	uintptr_t ch = ARB_CHNLS + 0x10000 * apid;
+	uint32_t before = rd(ch + 0x08), st = 0;
+	wr(ch + 0x10, (uint32_t)v);
+	wr(ch, (addr & 0xff) << 4);
+	int i;
+	for (i = 0; i < 100000; i++) {
+		st = rd(ch + 0x08);
+		if (st & 1)
+			break;
+	}
+	con_hex2("WRITE", "addr=", addr << 16 | (unsigned)v, "apid=", apid);
+	con_hex2("  status", "before=", before, "after=", st);
+	con_hex2("  status", "polls=", (uint32_t)i, "readback=", (uint32_t)spmi_rd(sid, addr));
 }
 
 static void pair(const char *label, unsigned sid, unsigned a, unsigned b)
@@ -88,4 +116,6 @@ void test_pmic(void)
 	con_skip();
 	for (unsigned i = 0; i < sizeof(batt) / sizeof(batt[0]); i += 2)
 		pair("SID2", 2, batt[i], batt[i + 1]);
+	con_skip();
+	write_back(5, 0xd953);
 }

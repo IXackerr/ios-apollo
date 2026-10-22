@@ -1,0 +1,137 @@
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -187,20 +187,31 @@
+ 		}
+ 	}
+ 	vm_offset_t ch = sp_chnl[apid];
+-	*(volatile uint32_t *)(ch + 0x10u) = value;		/* WDATA0 */
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)ch = (addr & 0xffu) << 4;	/* EXT_WRITEL, BC=0 */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		uint32_t status = sp_rd(ch, 0x08u);
+-		if (status & 1u) {
++	uint32_t status = 0;
++	for (unsigned attempt = 0; attempt < 3; ++attempt) {
++		*(volatile uint32_t *)(ch + 0x10u) = value;		/* WDATA0 */
++		__asm__ volatile("dmb oshst" ::: "memory");
++		*(volatile uint32_t *)ch = (addr & 0xffu) << 4;	/* EXT_WRITEL, BC=0 */
++		__asm__ volatile("dsb osh" ::: "memory");
++		/* STATUS keeps the previous command's DONE until this one is taken. */
++		delay(2);
++		for (unsigned i = 0; i < 1000; ++i) {
++			status = sp_rd(ch, 0x08u);
++			if (status & 1u) {
++				break;
++			}
++			delay(1);
++		}
++		if ((status & 0x0fu) == 1u) {
+ 			IOLockUnlock(sp_lock);
+-			return (status & 0x0eu) ? -1 : 0;
++			return 0;
+ 		}
+-		delay(1);
+ 	}
+-	sp_poisoned[apid] = true;
+-	printf("SWEET SPMI: write timeout sid=%u addr=%#x APID=%u disabled\n", sid, addr, apid);
++	printf("SWEET SPMI: write sid=%u addr=%#x value=%#x failed, status %#x\n",
++	    sid, addr, value, status);
++	if (!(status & 1u)) {
++		sp_poisoned[apid] = true;
++	}
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
+--- a/bsd/dev/sweet_wled.c
++++ b/bsd/dev/sweet_wled.c
+@@ -72,12 +72,16 @@
+ 	} else if (level && level < 4) {
+ 		level = 4;
+ 	}
+-	if (sweet_spmi_write(WLED_SID, WLED_MOD_A_BRT_LSB, level & 0xff) ||
+-	    sweet_spmi_write(WLED_SID, WLED_MOD_A_BRT_MSB, (level >> 8) & 0x0f) ||
+-	    sweet_spmi_write(WLED_SID, WLED_MOD_SYNC, 0) ||
+-	    sweet_spmi_write(WLED_SID, WLED_MOD_SYNC, WLED_MOD_SYNC_A)) {
+-		printf("SWEET WLED: brightness %u not applied\n", level);
++	/* The new level takes effect on the MOD_A sync edge; redo it all on error. */
++	for (int attempt = 0; attempt < 2; attempt++) {
++		if (!sweet_spmi_write(WLED_SID, WLED_MOD_A_BRT_LSB, level & 0xff) &&
++		    !sweet_spmi_write(WLED_SID, WLED_MOD_A_BRT_MSB, (level >> 8) & 0x0f) &&
++		    !sweet_spmi_write(WLED_SID, WLED_MOD_SYNC, 0) &&
++		    !sweet_spmi_write(WLED_SID, WLED_MOD_SYNC, WLED_MOD_SYNC_A)) {
++			return;
++		}
+ 	}
++	printf("SWEET WLED: brightness %u not applied\n", level);
+ }
+ 
+ unsigned
+--- a/iokit/Kernel/arm/SweetBacklight.cpp
++++ b/iokit/Kernel/arm/SweetBacklight.cpp
+@@ -89,6 +89,11 @@
+ 		level = LEVEL_MAX;
+ 	}
+ 	if (level != fLevel) {
++		static unsigned logged;
++		if (logged < 16) {
++			logged++;
++			IOLog("SWEET BACKLIGHT: level %u -> %u\n", fLevel, level);
++		}
+ 		fLevel = level;
+ 		sweet_wled_brightness(level);
+ 		publishParameters();
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -32,6 +32,8 @@
+ 	bool fTimerAdded, fRunning, fReal, fFuelGauge;
+ 	unsigned fDesign;       /* design capacity, mAh */
+ 	int fLastMode;
++	unsigned fTicks;        /* fuel gauge mode: 2 s ticks since the last poll */
++	uint8_t fLastUsb;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -79,6 +81,8 @@
+ 		}
+ 	}
+ 	fLastMode = -1;
++	fTicks = 0;
++	fLastUsb = 0xff;
+ 	return true;
+ }
+ 
+@@ -322,10 +326,23 @@
+ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+-	if (self && self->fRunning) {
++	if (!self || !self->fRunning) {
++		return;
++	}
++	if (!self->fFuelGauge) {
+ 		self->poll();
+ 		sender->setTimeoutMS(30000);
++		return;
++	}
++	/* Plug and unplug show up within 2 s; the full poll runs every 30 s. */
++	uint8_t usb;
++	bool changed = !sweet_spmi_read(2, 0x1310, &usb) && (usb & 0x10u) != (self->fLastUsb & 0x10u);
++	if (changed || ++self->fTicks >= 15) {
++		self->fLastUsb = usb;
++		self->fTicks = 0;
++		self->poll();
+ 	}
++	sender->setTimeoutMS(2000);
+ }
+ 
+ bool
+@@ -352,7 +369,7 @@
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(fFuelGauge ? 2000 : 30000);
+ 		} else {
+ 			fReal = false;
+ 			poll();
