@@ -7,8 +7,8 @@
  * recovery kernel reserves (ramoops at 0xb0000000, 2 MiB console zone,
  * no ECC). DDR survives the warm reset into recovery, which then shows
  * the log as /sys/fs/pstore/console-ramoops-0, so a run needs no photo.
- * A few bits flip across the reset, so the log is stored three times,
- * PSTORE_COPY bytes apart, and tools/gpu-log.py takes a bytewise vote.
+ * A few characters come back changed (the same ones on every run, so
+ * not decay in DRAM); the screen shows the same log intact.
  */
 #include <stdarg.h>
 #include <stdint.h>
@@ -20,7 +20,6 @@
 #define PSTORE_BASE	0xb0000000UL
 #define PSTORE_SIZE	0x200000UL
 #define PSTORE_SIG	0x43474244U	/* "DBGC", persistent_ram_buffer */
-#define PSTORE_COPY	0x60000U
 
 /* Free RAM well above anything ABL loads and below the XNU payload's top. */
 #define DMA_BASE	0x1c0000000UL
@@ -196,11 +195,10 @@ static void pstore_put(const char *s)
 	volatile uint32_t *hdr = (volatile uint32_t *)PSTORE_BASE;
 	volatile uint8_t *data = (volatile uint8_t *)(PSTORE_BASE + 12);
 
-	for (; *s && pstore_len < PSTORE_COPY; s++, pstore_len++)
-		for (unsigned i = 0; i < 3; i++)
-			data[i * PSTORE_COPY + pstore_len] = (uint8_t)*s;
-	hdr[1] = 2 * PSTORE_COPY + pstore_len;	/* start: nothing wrapped */
-	hdr[2] = 2 * PSTORE_COPY + pstore_len;	/* size */
+	for (; *s && pstore_len < PSTORE_SIZE - 12; s++)
+		data[pstore_len++] = (uint8_t)*s;
+	hdr[1] = pstore_len;	/* start: nothing wrapped */
+	hdr[2] = pstore_len;	/* size */
 	hdr[0] = PSTORE_SIG;
 	__asm__ volatile("dsb sy" ::: "memory");
 }
@@ -378,9 +376,6 @@ int test_gpu(uint64_t dtb, unsigned stage)
 	char buf[128];
 
 	pstore_len = 0;
-	for (volatile uint64_t *p = (volatile uint64_t *)(PSTORE_BASE + 12 - 4);
-	     p < (volatile uint64_t *)(PSTORE_BASE + 12 + 3 * PSTORE_COPY); p++)
-		*p = 0;
 	log_y = 0;
 	dma_next = DMA_BASE;
 	con_rect(0, 0, con_w, con_h, BG);
