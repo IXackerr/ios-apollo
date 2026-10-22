@@ -21,7 +21,7 @@ want() { case " $PARTS " in *" $1 "*) return 0;; esac; return 1; }
 if want mesa; then
 if [ ! -d "$WORK/mesa" ]; then
   git clone --depth 1 --branch "$MESA_REV" https://github.com/chaotic-cx/mesa-mirror.git "$WORK/mesa"
-  git -C "$WORK/mesa" apply "$ROOT/mesa/0001-turnip-sweet-kernel-backend.patch"
+  for p in "$ROOT"/mesa/*.patch; do git -C "$WORK/mesa" apply "$p"; done
 fi
 python3 -m venv "$WORK/venv"
 . "$WORK/venv/bin/activate"
