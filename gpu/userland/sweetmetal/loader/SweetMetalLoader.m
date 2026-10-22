@@ -134,6 +134,13 @@ impl_bundle(void)
 
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port
 {
+	/*
+	 * This instance is never initialized by _MTLDevice, whose -dealloc then
+	 * releases state that was never made: keep it alive. It is one small
+	 * object per device creation, and the device returned is another.
+	 */
+	(void)CFBridgingRetain(self);
+
 	NSString *path = impl_bundle();
 	NSBundle *bundle = path ? [NSBundle bundleWithPath:path] : nil;
 	NSError *err = nil;
