@@ -216,6 +216,11 @@ Results on the phone (kernel and bare-metal shim agree):
   by ios/sweetrun from the boot image): buffer allocation, an IB with
   CP_MEM_WRITE, timestamp 1, and 1000 submits at about 20 us each. The GPU
   still runs at its lowest level (305 MHz).
+- Vulkan: Mesa turnip with the sweet kernel backend, built for iOS
+  (gpu-userland workflow), runs gpu/hosttest/vktest.c on the phone:
+  "Turnip Adreno (TM) 650, Vulkan 1.3", 157 device extensions, memory,
+  events set by the GPU, 300 submissions with fences. It needs user-space
+  reads of CTR_EL0 (patch 0096, SCTLR_EL1.UCT) for Mesa's cache flushes.
 - XNU's `pmap_sync_page_attributes_phys` shifted the page number in 32
   bits; on apollo, whose kernel RAM is all above 4 GiB, faulting in a
   write-combined user mapping panicked (patch 0095).
