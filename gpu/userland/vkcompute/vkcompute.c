@@ -132,7 +132,6 @@ main(int argc, char **argv)
 	DFN(vkQueueSubmit);
 	DFN(vkWaitForFences);
 	DFN(vkDeviceWaitIdle);
-	DFN(vkDestroyDevice);
 
 	/* host-visible, coherent buffer */
 	VkPhysicalDeviceMemoryProperties mp;
