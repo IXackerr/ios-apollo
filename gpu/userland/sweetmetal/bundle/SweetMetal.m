@@ -52,9 +52,26 @@ extern kern_return_t IOObjectRelease(io_object_t object);
 
 #define SMLOG(...) smlog([NSString stringWithFormat:__VA_ARGS__])
 
+/* A message repeated back to back is printed once, then counted: a failing
+ * call per frame would otherwise flood the console. */
 static void
 smlog(NSString *msg)
 {
+	static NSString *last;
+	static unsigned repeats;
+	@synchronized ([NSObject class]) {
+		if ([msg isEqualToString:last]) {
+			if (++repeats % 1000 == 0) {
+				fprintf(stderr, "SweetMetal: (%u times) %s\n", repeats, msg.UTF8String);
+			}
+			return;
+		}
+		if (repeats > 0) {
+			fprintf(stderr, "SweetMetal: (last message %u times more)\n", repeats);
+		}
+		last = [msg copy];
+		repeats = 0;
+	}
 	os_log(OS_LOG_DEFAULT, "SweetMetal: %{public}@", msg);
 	fprintf(stderr, "SweetMetal: %s\n", msg.UTF8String);
 }

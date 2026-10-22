@@ -52,6 +52,18 @@ extern "C" {
 static struct sgpu sgpu_dev;
 static IOLock    *sgpu_lock;            /* serialises every sgpu_* call */
 static uint64_t   sgpu_wired;
+static uint32_t   sgpu_buffers;         /* live buffers of every client */
+
+/* A refused allocation, logged a limited number of times. */
+static void
+sgpu_alloc_failed(const char *what, uint64_t size, IOReturn why)
+{
+	static uint32_t logged;
+	if (logged++ < 32) {
+		IOLog("SWEET GPU: %s of %llu KiB refused (%#x): %llu MiB in %u buffers wired\n",
+		    what, size >> 10, why, sgpu_wired >> 20, sgpu_buffers);
+	}
+}
 
 struct sgpu_umem {
 	struct sgpu_umem         *next;
@@ -92,6 +104,7 @@ sgpu_umem_destroy(struct sgpu_umem *m)
 	} else {
 		sgpu_wired -= m->size;
 	}
+	sgpu_buffers--;
 	IOFreeType(m, struct sgpu_umem);
 }
 
@@ -252,10 +265,17 @@ SweetAdreno::bringupThread(void *arg, __unused wait_result_t wr)
 	}
 	if (!err && sgpu_dev.stage_reached >= SGPU_STAGE_CP) {
 		/* This thread stays as the DCVS tick: lowest level once idle. */
-		for (;;) {
+		uint64_t last_wired = 0;
+		for (uint32_t tick = 1;; tick++) {
 			IOSleep(50);
 			IOLockLock(sgpu_lock);
 			sgpu_dcvs_tick(&sgpu_dev);
+			/* every 10 s, when it changed: what clients keep on the GPU */
+			if (tick % 200 == 0 && sgpu_wired != last_wired) {
+				last_wired = sgpu_wired;
+				IOLog("SWEET GPU: %llu MiB in %u buffers wired\n", sgpu_wired >> 20,
+				    sgpu_buffers);
+			}
 			IOLockUnlock(sgpu_lock);
 		}
 	}
@@ -415,11 +435,13 @@ SweetAdrenoUserClient::memAlloc(struct sgpu_mem_alloc *req)
 		return kIOReturnBadArgument;
 	}
 	if (sgpu_wired + size > SGPU_MAX_WIRED) {
+		sgpu_alloc_failed("MEM_ALLOC", size, kIOReturnNoMemory);
 		return kIOReturnNoMemory;
 	}
 	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
 	    kIODirectionInOut | kIOMemoryKernelUserShared, size, PAGE_SIZE);
 	if (md == NULL) {
+		sgpu_alloc_failed("MEM_ALLOC", size, kIOReturnNoMemory);
 		return kIOReturnNoMemory;
 	}
 	bzero(md->getBytesNoCopy(), size);
@@ -432,6 +454,7 @@ SweetAdrenoUserClient::memAlloc(struct sgpu_mem_alloc *req)
 		return kIOReturnNoMemory;
 	}
 	struct sgpu_umem *m = IOMallocType(struct sgpu_umem);
+	sgpu_buffers++;
 	m->md = md;
 	m->prepared = true;
 	m->size = size;
@@ -488,6 +511,7 @@ SweetAdrenoUserClient::importUser(struct sgpu_import_user *req)
 		return kIOReturnBadArgument;
 	}
 	if (sgpu_wired + req->size > SGPU_MAX_WIRED) {
+		sgpu_alloc_failed("IMPORT_USER", req->size, kIOReturnNoMemory);
 		return kIOReturnNoMemory;
 	}
 	/*
@@ -508,6 +532,7 @@ SweetAdrenoUserClient::importUser(struct sgpu_import_user *req)
 		return kIOReturnNoMemory;
 	}
 	struct sgpu_umem *m = IOMallocType(struct sgpu_umem);
+	sgpu_buffers++;
 	m->md = md;
 	m->size = req->size;
 	m->flags = req->flags;
@@ -515,6 +540,7 @@ SweetAdrenoUserClient::importUser(struct sgpu_import_user *req)
 	m->prepared = md->prepare() == kIOReturnSuccess;     /* wires the pages */
 	if (!m->prepared) {
 		sgpu_umem_destroy(m);
+		sgpu_alloc_failed("IMPORT_USER", req->size, kIOReturnVMError);
 		return kIOReturnVMError;
 	}
 	/* the GPU does not snoop: no dirty line may be written back over what
@@ -554,6 +580,7 @@ SweetAdrenoUserClient::importSurface(struct sgpu_import_surface *req)
 	}
 	uint64_t size = (s->memory->getLength() + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
 	struct sgpu_umem *m = IOMallocType(struct sgpu_umem);
+	sgpu_buffers++;
 	m->surface = s;
 	m->size = size;
 	m->flags = req->flags;
