@@ -89,6 +89,37 @@ void     smtl_compute_pipeline_release(smtl_compute_pipeline *p);
 /* color_formats[i] = MTLPixelFormat of color attachment i (0 = none) */
 smtl_render_pipeline *smtl_device_new_render_pipeline(smtl_device *d, smtl_function *vertex,
     smtl_function *fragment, const uint32_t *color_formats, uint32_t color_count);
+/*
+ * The full MTLRenderPipelineDescriptor, raw Metal enum values throughout.
+ * An attachment with pixel_format 0 is absent; a vertex attribute with
+ * format 0 is unset; a layout counts when its stride is non-zero or an
+ * attribute names its buffer (stride UINT32_MAX = MTLBufferLayoutStrideDynamic).
+ */
+struct smtl_color_attachment_desc {
+	uint32_t pixel_format;
+	uint32_t blending_enabled;
+	uint32_t source_rgb, destination_rgb, rgb_operation;        /* MTLBlendFactor/Operation */
+	uint32_t source_alpha, destination_alpha, alpha_operation;
+	uint32_t write_mask;                                         /* MTLColorWriteMask */
+};
+struct smtl_vertex_attribute_desc {
+	uint32_t format;                /* MTLVertexFormat */
+	uint32_t offset, buffer_index;
+};
+struct smtl_vertex_layout_desc {
+	uint32_t stride, step_function, step_rate;   /* MTLVertexStepFunction */
+};
+struct smtl_render_pipeline_desc {
+	smtl_function *vertex, *fragment;
+	struct smtl_color_attachment_desc colors[8];
+	uint32_t depth_format, stencil_format;      /* MTLPixelFormat, 0 = none */
+	uint32_t sample_count;                      /* 0 = 1 */
+	uint32_t has_vertex_descriptor;
+	struct smtl_vertex_attribute_desc attributes[31];
+	struct smtl_vertex_layout_desc layouts[31];
+};
+smtl_render_pipeline *smtl_device_new_render_pipeline_desc(smtl_device *d,
+    const struct smtl_render_pipeline_desc *desc);
 void smtl_render_pipeline_release(smtl_render_pipeline *p);
 
 /* ---- queues and command buffers ---- */

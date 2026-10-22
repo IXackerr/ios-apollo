@@ -70,6 +70,7 @@ $CC -bundle -fobjc-arc -fmodules -I"$ROOT/userland/sweetmetal/core/include" \
   -I"$ROOT/userland/libsweetgpu" -I"$ROOT/kernel" -o "$B/SweetMetal" \
   "$ROOT/userland/sweetmetal/bundle/SweetMetal.m" "$WORK/sweetgpu.o" \
   -L"$OUT" -lsweetmetal_core -framework Foundation -framework Metal -framework IOSurface \
+  '-Wl,-U,_OBJC_CLASS_$__MTLDevice' '-Wl,-U,_OBJC_METACLASS_$__MTLDevice' \
   -framework IOKit -framework CoreFoundation -Wl,-rpath,@loader_path
 cp "$OUT"/libsweetmetal_core.dylib "$OUT"/libsweetvk.dylib "$OUT"/libvulkan_freedreno.dylib "$B/"
 fi

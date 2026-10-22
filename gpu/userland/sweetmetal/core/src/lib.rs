@@ -13,7 +13,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
-use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
+use metal2vulkan::pipeline::{
+    ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor,
+    VertexBufferLayoutDescriptor, VertexDescriptor,
+};
 use metal2vulkan_runtime::{
     BlitCommandEncoder, BlitOption, Buffer, ClearColor, CommandBuffer, CommandBufferStatus,
     CommandQueue, ComputeCommandEncoder, ComputePipelineState, Device, DeviceOptions, Function,
@@ -365,6 +368,129 @@ pub unsafe extern "C" fn smtl_device_new_render_pipeline(
         d.device
             .new_render_pipeline_state(&desc, &PipelineOptions::default()),
     )
+}
+#[repr(C)]
+pub struct SmtlColorAttachmentDesc {
+    pixel_format: u32,
+    blending_enabled: u32,
+    source_rgb: u32,
+    destination_rgb: u32,
+    rgb_operation: u32,
+    source_alpha: u32,
+    destination_alpha: u32,
+    alpha_operation: u32,
+    write_mask: u32,
+}
+
+#[repr(C)]
+pub struct SmtlVertexAttributeDesc {
+    format: u32,
+    offset: u32,
+    buffer_index: u32,
+}
+
+#[repr(C)]
+pub struct SmtlVertexLayoutDesc {
+    stride: u32,
+    step_function: u32,
+    step_rate: u32,
+}
+
+#[repr(C)]
+pub struct SmtlRenderPipelineDesc {
+    vertex: *mut Function,
+    fragment: *mut Function,
+    colors: [SmtlColorAttachmentDesc; 8],
+    depth_format: u32,
+    stencil_format: u32,
+    sample_count: u32,
+    has_vertex_descriptor: u32,
+    attributes: [SmtlVertexAttributeDesc; 31],
+    layouts: [SmtlVertexLayoutDesc; 31],
+}
+
+/// A raw Metal enum value as its Rust type, or a message naming the field.
+fn raw<T: TryFrom<u32>>(what: &str, v: u32) -> Result<T, String> {
+    T::try_from(v).map_err(|_| format!("{what} {v}"))
+}
+
+fn render_descriptor(desc: &SmtlRenderPipelineDesc) -> Result<RenderPipelineDescriptor, String> {
+    let vertex = unsafe { desc.vertex.as_mut() }.ok_or("no vertex function")?;
+    let mut d = RenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
+    if let Some(fragment) = unsafe { desc.fragment.as_mut() } {
+        d.fragment = Some(StageSource::Function(fragment.function_descriptor()));
+    }
+    for (i, c) in desc.colors.iter().enumerate() {
+        if c.pixel_format == 0 {
+            continue;
+        }
+        let mut a = ColorAttachmentDescriptor::new(pixel_format(c.pixel_format)?);
+        a.blending_enabled = c.blending_enabled != 0;
+        a.source_rgb_blend_factor = raw("MTLBlendFactor", c.source_rgb)?;
+        a.destination_rgb_blend_factor = raw("MTLBlendFactor", c.destination_rgb)?;
+        a.rgb_blend_operation = raw("MTLBlendOperation", c.rgb_operation)?;
+        a.source_alpha_blend_factor = raw("MTLBlendFactor", c.source_alpha)?;
+        a.destination_alpha_blend_factor = raw("MTLBlendFactor", c.destination_alpha)?;
+        a.alpha_blend_operation = raw("MTLBlendOperation", c.alpha_operation)?;
+        a.write_mask = raw("MTLColorWriteMask", c.write_mask)?;
+        d.color_attachments[i] = Some(a);
+    }
+    if desc.depth_format != 0 {
+        d.depth_format = Some(pixel_format(desc.depth_format)?);
+    }
+    if desc.stencil_format != 0 {
+        d.stencil_format = Some(pixel_format(desc.stencil_format)?);
+    }
+    d.raster_sample_count = desc.sample_count.max(1);
+    if desc.has_vertex_descriptor != 0 {
+        let mut v = VertexDescriptor::new();
+        let mut used = [false; 31];
+        for (i, a) in desc.attributes.iter().enumerate() {
+            if a.format == 0 {
+                continue;
+            }
+            if let Some(u) = used.get_mut(a.buffer_index as usize) {
+                *u = true;
+            }
+            v.attributes.insert(
+                i as u32,
+                VertexAttributeDescriptor::new(raw("MTLVertexFormat", a.format)?, a.offset, a.buffer_index),
+            );
+        }
+        for (i, l) in desc.layouts.iter().enumerate() {
+            if l.stride == 0 && !used[i] {
+                continue;
+            }
+            let mut layout = VertexBufferLayoutDescriptor::new(if l.stride == u32::MAX { None } else { Some(l.stride) });
+            layout.step_function = raw("MTLVertexStepFunction", l.step_function)?;
+            layout.step_rate = l.step_rate;
+            v.layouts.insert(i as u32, layout);
+        }
+        d.vertex_descriptor = Some(v);
+    }
+    Ok(d)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_device_new_render_pipeline_desc(
+    d: *mut SmtlDevice,
+    desc: *const SmtlRenderPipelineDesc,
+) -> *mut RenderPipelineState {
+    let d = handle!(d, std::ptr::null_mut());
+    let Some(desc) = desc.as_ref() else {
+        set_error("NULL descriptor".into());
+        return std::ptr::null_mut();
+    };
+    match render_descriptor(desc) {
+        Ok(rd) => boxed(
+            "newRenderPipelineStateWithDescriptor:error:",
+            d.device.new_render_pipeline_state(&rd, &PipelineOptions::default()),
+        ),
+        Err(e) => {
+            set_error(e);
+            std::ptr::null_mut()
+        }
+    }
 }
 release!(smtl_render_pipeline_release, RenderPipelineState);
 

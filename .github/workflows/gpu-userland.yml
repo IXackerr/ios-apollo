@@ -37,6 +37,15 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      # Mesa and the Rust crates build incrementally from the last run
+      - uses: actions/cache@v4
+        with:
+          path: |
+            gpu/build-ios/mesa
+            gpu/build-ios/mesa-build
+            gpu/build-ios/cargo
+          key: gpu-ios-${{ hashFiles('gpu/mesa/**', 'gpu/userland/sweetmetal/core/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: gpu-ios-${{ hashFiles('gpu/mesa/**', 'gpu/userland/sweetmetal/core/Cargo.lock') }}-
       - name: Build
         env:
           PARTS: ${{ github.event.inputs.parts || 'mesa tools' }}

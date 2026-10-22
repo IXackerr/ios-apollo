@@ -1,7 +1,7 @@
 # Small iOS programs for the phone: ios/sweetrun (runs a program handed
 # over in the boot image) and the GPU user-space tests (gpu/userland/gputest,
-# gpu/hosttest/vktest.c, gpu/userland/vkcompute, vkdraw, smtltest; turnip
-# and libsweetmetal_core come from gpu-userland).
+# gpu/hosttest/vktest.c, gpu/userland/vkcompute, vkdraw, smtltest, mtltest;
+# turnip, libsweetmetal_core and SweetMetal.bundle come from gpu-userland).
 name: ios-tools
 on:
   workflow_dispatch:
@@ -16,6 +16,7 @@ on:
       - "gpu/userland/vkcompute/**"
       - "gpu/userland/vkdraw/**"
       - "gpu/userland/smtltest/**"
+      - "gpu/userland/mtltest/**"
       - ".github/workflows/ios-tools.yml"
 jobs:
   build:
@@ -49,6 +50,9 @@ jobs:
           xcrun -sdk iphoneos metallib gen/test.air -o out/test.metallib
           $CC -Igpu/userland/sweetmetal/core/include -Iios/sweetrun -o out/smtltest \
             gpu/userland/smtltest/smtltest.c ios/sweetrun/sweetlog.c -framework IOKit -framework CoreFoundation -lz
+          $CC -fobjc-arc -fmodules -Iios/sweetrun -o out/mtltest gpu/userland/mtltest/mtltest.m \
+            ios/sweetrun/sweetlog.c -framework Foundation -framework Metal -framework IOKit \
+            -framework CoreFoundation -lz
           for f in out/*; do [ "${f%.metallib}" = "$f" ] && codesign -f -s - "$f"; done
           file out/*
       - uses: actions/upload-artifact@v4

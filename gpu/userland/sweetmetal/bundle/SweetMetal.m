@@ -6,12 +6,10 @@
  *   --> libsweetmetal_core (C ABI over metal2vulkan-runtime)
  *   --> Vulkan (Mesa turnip, sweet backend) --> SweetAdreno (XNU)
  *
- * STATUS: skeleton, not compiled yet (needs the iOS 16 SDK; build notes in
- * docs/METAL.md). The Objective-C side is deliberately thin: each class
- * holds one smtl_* handle and forwards. The open questions that decide its
- * final shape are RE items in docs/METAL.md section 4 (does iOS 16 load the
- * plugin through -initWithAcceleratorPort:, must the device subclass
- * MTLIOAccelDevice, which selectors QuartzCore sends).
+ * The Objective-C side is deliberately thin: each class holds one smtl_*
+ * handle and forwards. Metal accepts the device only as a subclass of its
+ * private _MTLDevice that also conforms to MTLDeviceSPI (docs/METAL.md
+ * section 2.1); the resources, queues and encoders are plain NSObjects.
  *
  * Bring-up aid: every class answers unknown selectors with a log line
  * ("SweetMetal: -[SweetMetalDevice fooBar:] not implemented") and nil/0
@@ -29,13 +27,27 @@
 #include "sweetmetal.h"
 #include "sweetgpu.h"
 
-#define SMLOG(fmt, ...) os_log(OS_LOG_DEFAULT, "SweetMetal: " fmt, ##__VA_ARGS__)
+/* Metal's private device base class: exported by Metal.framework, without
+ * a header in the SDK. */
+@interface _MTLDevice : NSObject
+@end
+
+/* os_log, and stderr too: the SWEET kernel prints a daemon's /dev/null
+ * output (boot-arg sweetnull), which is where launchd sends stderr. */
+#define SMLOG(...) smlog([NSString stringWithFormat:__VA_ARGS__])
+
+static void
+smlog(NSString *msg)
+{
+	os_log(OS_LOG_DEFAULT, "SweetMetal: %{public}@", msg);
+	fprintf(stderr, "SweetMetal: %s\n", msg.UTF8String);
+}
 
 static NSError *
 SMError(NSString *what)
 {
 	NSString *why = [NSString stringWithFormat:@"%@: %s", what, smtl_last_error()];
-	SMLOG("%{public}@", why);
+	SMLOG(@"%@", why);
 	return [NSError errorWithDomain:@"SweetMetal" code:-1
 	    userInfo:@{ NSLocalizedDescriptionKey: why }];
 }
@@ -60,7 +72,7 @@ SMError(NSString *what)
 
 - (void)forwardInvocation:(NSInvocation *)inv
 {
-	SMLOG("-[%{public}s %{public}s] not implemented", class_getName([self class]),
+	SMLOG(@"-[%s %s] not implemented", class_getName([self class]),
 	    sel_getName(inv.selector));
 	id nilResult = nil;
 	if (inv.methodSignature.methodReturnLength == sizeof(id)) {
@@ -272,9 +284,52 @@ SMError(NSString *what)
 	smtl_blit_copy_buffer(_e, ((SweetMetalBuffer *)src)->_b, so, ((SweetMetalBuffer *)dst)->_b,
 	    dof, size);
 }
+- (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)slice
+    sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)origin sourceSize:(MTLSize)size
+    toBuffer:(id<MTLBuffer>)dst destinationOffset:(NSUInteger)off
+    destinationBytesPerRow:(NSUInteger)bpr destinationBytesPerImage:(NSUInteger)bpi
+{
+	smtl_blit_copy_texture_to_buffer(_e, ((SweetMetalTexture *)src)->_t, slice, level, origin.x,
+	    origin.y, size.width, size.height, ((SweetMetalBuffer *)dst)->_b, off, bpr, bpi);
+}
 - (void)endEncoding
 {
 	smtl_blit_end(_e);
+	_e = NULL;
+}
+@end
+
+@interface SweetMetalComputeEncoder : SMBase <MTLComputeCommandEncoder> {
+@public
+	smtl_compute_encoder *_e;
+}
+@property (copy, atomic) NSString *label;
+@end
+
+@implementation SweetMetalComputeEncoder
+- (void)setComputePipelineState:(id<MTLComputePipelineState>)s
+{
+	smtl_compute_set_pipeline(_e, ((SweetMetalComputePipelineState *)s)->_p);
+}
+- (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i
+{
+	smtl_compute_set_buffer(_e, b ? ((SweetMetalBuffer *)b)->_b : NULL, o, (uint32_t)i);
+}
+- (void)dispatchThreads:(MTLSize)grid threadsPerThreadgroup:(MTLSize)tg
+{
+	smtl_compute_dispatch_threads(_e, grid.width, grid.height, grid.depth, tg.width, tg.height,
+	    tg.depth);
+}
+- (void)dispatchThreadgroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)tg
+{
+	smtl_compute_dispatch_threads(_e, groups.width * tg.width, groups.height * tg.height,
+	    groups.depth * tg.depth, tg.width, tg.height, tg.depth);
+}
+- (void)endEncoding
+{
+	if (smtl_compute_end(_e) != 0) {
+		SMError(@"compute endEncoding");
+	}
 	_e = NULL;
 }
 @end
@@ -308,6 +363,17 @@ SMError(NSString *what)
 	SweetMetalRenderEncoder *enc = [SweetMetalRenderEncoder new];
 	enc->_e = e;
 	enc->_cb = self;
+	return enc;
+}
+- (id<MTLComputeCommandEncoder>)computeCommandEncoder
+{
+	smtl_compute_encoder *e = smtl_cmdbuf_compute_encoder(_c);
+	if (e == NULL) {
+		SMError(@"computeCommandEncoder");
+		return nil;
+	}
+	SweetMetalComputeEncoder *enc = [SweetMetalComputeEncoder new];
+	enc->_e = e;
 	return enc;
 }
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder
@@ -388,7 +454,7 @@ SMError(NSString *what)
 /* The device                                                       */
 /* ---------------------------------------------------------------- */
 
-@interface SweetMetalDevice : SMBase <MTLDevice> {
+@interface SweetMetalDevice : _MTLDevice <MTLDevice> {
 @public
 	smtl_device *_d;
 	sgpu_dev *_gpu;
@@ -399,11 +465,36 @@ SMError(NSString *what)
 
 @implementation SweetMetalDevice
 
+/* MTLDeviceSPI has no declaration in the SDK; Metal checks the device
+ * conforms to it before it registers the device. */
++ (void)load
+{
+	Protocol *spi = objc_getProtocol("MTLDeviceSPI");
+	if (spi != NULL) {
+		class_addProtocol(self, spi);
+	}
+}
+
+/* Same unknown-selector logging as SMBase, for what _MTLDevice lacks. */
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
+{
+	NSMethodSignature *sig = [super methodSignatureForSelector:sel];
+	return sig ?: [NSMethodSignature signatureWithObjCTypes:"@@:"];
+}
+
+- (void)forwardInvocation:(NSInvocation *)inv
+{
+	SMLOG(@"-[SweetMetalDevice %s] not implemented", sel_getName(inv.selector));
+	id nilResult = nil;
+	if (inv.methodSignature.methodReturnLength == sizeof(id)) {
+		[inv setReturnValue:&nilResult];
+	}
+}
+
 /*
- * Plugin entry point (macOS: Metal.framework calls this on the
- * MetalPluginClassName class; to verify for iOS 16, docs/METAL.md RE-1).
- * We do NOT call -[MTLIOAccelDevice initWithAcceleratorPort:]: that would
- * need the IOAccelerator kernel ABI, which our XNU does not have.
+ * Plug-in entry point: Metal.framework calls it on the MetalPluginClassName
+ * class with the SweetAdreno service. -[_MTLDevice init] does no IOKit
+ * work, unlike Apple's IOGPUMetalDevice, whose kernel ABI we do not have.
  */
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port
 {
@@ -421,7 +512,7 @@ SMError(NSString *what)
 	}
 	_name = [NSString stringWithUTF8String:smtl_device_name(_d)];
 	sgpu_open(&_gpu);       /* for IOSurface import (IMPORT_SURFACE) */
-	SMLOG("device %{public}@ ready in %{public}s", _name, getprogname());
+	SMLOG(@"device %@ ready in %s", _name, getprogname());
 	return self;
 }
 
@@ -429,6 +520,35 @@ SMError(NSString *what)
 
 - (NSString *)name { return _name; }
 - (uint64_t)registryID { return smtl_device_registry_id(_d); }
+- (mach_port_t)acceleratorPort { return _acceleratorPort; }
+
+/* MTLDeviceSPI: what Metal and QuartzCore ask beyond the public protocol */
+- (uint32_t)featureProfile { return 5; }       /* the A11's */
+- (NSString *)vendorName { return @"Qualcomm"; }
+- (NSUInteger)minConstantBufferAlignmentBytes { return 64; }
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes { return 64; }
+- (NSUInteger)deviceLinearReadOnlyTextureAlignmentBytes { return 64; }
+- (NSUInteger)maxColorAttachments { return 8; }
+- (NSUInteger)maxFragmentTextures { return 31; }
+- (NSUInteger)maxFragmentSamplers { return 16; }
+- (NSUInteger)maxTextureWidth2D { return 16384; }
+- (NSUInteger)maxTextureHeight2D { return 16384; }
+- (BOOL)supportsMemorylessRenderTargets { return NO; }
+- (BOOL)supportsRasterOrderGroups { return NO; }
+- (BOOL)supportsYCBCRFormats12 { return NO; }
+- (BOOL)supportsExtendedXR10Formats { return NO; }
+- (BOOL)supportsNativeHardwareFP16 { return YES; }
+- (BOOL)supportsTileShaders { return NO; }
+- (BOOL)supportsSIMDGroup { return NO; }
+- (id)newPipelineLibraryWithFilePath:(NSString *)path error:(NSError **)error
+{
+	/* QuartzCore only logs this and compiles its pipelines at run time */
+	if (error) {
+		*error = [NSError errorWithDomain:@"SweetMetal" code:-1
+		    userInfo:@{ NSLocalizedDescriptionKey: @"no precompiled pipeline libraries" }];
+	}
+	return nil;
+}
 - (BOOL)isLowPower { return NO; }
 - (BOOL)isHeadless { return NO; }
 - (BOOL)isRemovable { return NO; }
@@ -525,7 +645,7 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 	size_t planes = IOSurfaceGetPlaneCount(surface);
 	uint64_t offset = planes ? (uint64_t)((uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface, plane) -
 	    (uint8_t *)IOSurfaceGetBaseAddress(surface)) : 0;
-	SMLOG("iosurface %u %zux%zu plane %lu bpr %zu (import path pending, docs/METAL.md)",
+	SMLOG(@"iosurface %u %zux%zu plane %lu bpr %zu (import path pending, docs/METAL.md)",
 	    IOSurfaceGetID(surface), IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
 	    (unsigned long)plane, bpr);
 	SweetMetalBuffer *backing = wrapBuffer(self, smtl_device_new_buffer(_d, size, 0), 0);
@@ -599,19 +719,41 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d
     error:(NSError **)error
 {
-	uint32_t formats[8] = { 0 };
-	uint32_t n = 0;
+	struct smtl_render_pipeline_desc rd = {
+		.vertex = ((SweetMetalFunction *)d.vertexFunction)->_f,
+		.fragment = d.fragmentFunction ? ((SweetMetalFunction *)d.fragmentFunction)->_f : NULL,
+		.depth_format = (uint32_t)d.depthAttachmentPixelFormat,
+		.stencil_format = (uint32_t)d.stencilAttachmentPixelFormat,
+		.sample_count = (uint32_t)d.rasterSampleCount,
+	};
 	for (uint32_t i = 0; i < 8; i++) {
-		MTLPixelFormat f = d.colorAttachments[i].pixelFormat;
-		if (f != MTLPixelFormatInvalid) {
-			formats[i] = (uint32_t)f;
-			n = i + 1;
+		MTLRenderPipelineColorAttachmentDescriptor *a = d.colorAttachments[i];
+		rd.colors[i] = (struct smtl_color_attachment_desc){
+			.pixel_format = (uint32_t)a.pixelFormat,
+			.blending_enabled = a.blendingEnabled,
+			.source_rgb = (uint32_t)a.sourceRGBBlendFactor,
+			.destination_rgb = (uint32_t)a.destinationRGBBlendFactor,
+			.rgb_operation = (uint32_t)a.rgbBlendOperation,
+			.source_alpha = (uint32_t)a.sourceAlphaBlendFactor,
+			.destination_alpha = (uint32_t)a.destinationAlphaBlendFactor,
+			.alpha_operation = (uint32_t)a.alphaBlendOperation,
+			.write_mask = (uint32_t)a.writeMask,
+		};
+	}
+	MTLVertexDescriptor *vd = d.vertexDescriptor;
+	if (vd != nil) {
+		rd.has_vertex_descriptor = 1;
+		for (uint32_t i = 0; i < 31; i++) {
+			MTLVertexAttributeDescriptor *a = vd.attributes[i];
+			rd.attributes[i] = (struct smtl_vertex_attribute_desc){
+				(uint32_t)a.format, (uint32_t)a.offset, (uint32_t)a.bufferIndex };
+			MTLVertexBufferLayoutDescriptor *l = vd.layouts[i];
+			rd.layouts[i] = (struct smtl_vertex_layout_desc){
+				l.stride == NSUIntegerMax ? UINT32_MAX : (uint32_t)l.stride,
+				(uint32_t)l.stepFunction, (uint32_t)l.stepRate };
 		}
 	}
-	/* TODO: blending, vertex descriptor, depth/stencil formats, sample count */
-	smtl_render_pipeline *p = smtl_device_new_render_pipeline(_d,
-	    ((SweetMetalFunction *)d.vertexFunction)->_f,
-	    d.fragmentFunction ? ((SweetMetalFunction *)d.fragmentFunction)->_f : NULL, formats, n);
+	smtl_render_pipeline *p = smtl_device_new_render_pipeline_desc(_d, &rd);
 	if (p == NULL) {
 		if (error) {
 			*error = SMError(@"newRenderPipelineStateWithDescriptor:");
