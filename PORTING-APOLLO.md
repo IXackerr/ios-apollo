@@ -229,6 +229,10 @@ Results on the phone (kernel and bare-metal shim agree):
   through a render pass; every pixel of the read-back image is right, at
   256x256 and at the iOS screen size 1125x2436 (5 ms per frame including
   the 11 MB copy back, at the lowest GPU level).
+- GPU clock: the GMU sets the levels from the HFI perf table (305 to
+  587 MHz on this speed bin); 587 MHz measured 1.93x the compute
+  throughput of 305 MHz. The driver raises the level on submission and
+  drops it after 100 ms idle (sweetgpu_freq=N pins a level).
 - XNU's `pmap_sync_page_attributes_phys` shifted the page number in 32
   bits; on apollo, whose kernel RAM is all above 4 GiB, faulting in a
   write-combined user mapping panicked (patch 0095).
