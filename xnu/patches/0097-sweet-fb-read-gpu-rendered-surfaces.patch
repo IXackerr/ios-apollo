@@ -1,0 +1,17 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -406,6 +406,14 @@
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			/*
++			 * The GPU may have rendered the surface without going
++			 * through the CPU caches (an Adreno that does not snoop
++			 * them): lines the CPU cached before would hide what it
++			 * wrote. Clean and invalidate the rows read here.
++			 */
++			s->memory->performOperation(kIOMemoryIncoherentIOFlush,
++			    s->offset + (uint64_t)sy * s->bytesPerRow, (uint64_t)h * s->bytesPerRow);
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
