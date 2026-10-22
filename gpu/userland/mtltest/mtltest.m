@@ -23,7 +23,9 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <libkern/OSCacheControl.h>
 #import <objc/runtime.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include "sweetrun.h"
 
 typedef mach_port_t io_object_t;
@@ -218,6 +220,10 @@ main(void)
 		/* the loader's directory, as the root install makes it */
 		mkdir("/private/var/sweetmetal", 01777);
 		chmod("/private/var/sweetmetal", 01777);
+		/* the loader's lock, usable by mobile processes even when root made it
+		 * (loaders before the read-only open needed write access) */
+		close(open("/private/var/sweetmetal/.lock", O_RDONLY | O_CREAT, 0666));
+		chmod("/private/var/sweetmetal/.lock", 0666);
 		if (!sweetrun_file("bundle", B "/SweetMetal") || !sweetrun_file("plist", B "/Info.plist") ||
 		    !sweetrun_file("metallib", "/private/var/tmp/sweetmetal-test/test.metallib")) {
 			printf("FAIL: files missing from the boot image\nMTLTEST FAILED\n");
