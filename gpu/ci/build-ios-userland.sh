@@ -2,7 +2,8 @@
 # Build the GPU userland for iOS 16 arm64 on macOS (Xcode 15, as the kernel CI):
 #   mesa   libvulkan_freedreno.dylib (Mesa turnip + sweet backend)
 #   tools  libsweetvk.dylib, vktest (hosttest/vktest.c for the phone)
-#   metal  libsweetmetal_core.dylib (metal2vulkan runtime, LGPL) and SweetMetal.bundle
+#   metal  libsweetmetal_core.dylib (metal2vulkan runtime, LGPL), SweetMetalImpl.bundle
+#          (the driver) and SweetMetal.bundle (the loader installed on the root)
 # PARTS selects them (default: all three, in this order).
 # Output: $OUT/  (default build-ios/out).
 set -euo pipefail
@@ -51,7 +52,7 @@ $CC -dynamiclib -I"$WORK/mesa/include" -o "$OUT/libsweetvk.dylib" \
   -install_name @rpath/libsweetvk.dylib -Wl,-rpath,@loader_path
 $CC -c -I"$ROOT/kernel" -o "$WORK/sweetgpu.o" "$ROOT/userland/libsweetgpu/sweetgpu.c"
 $CC -I"$WORK/mesa/include" -I"$REPO/ios/sweetrun" -o "$OUT/vktest" \
-  "$ROOT/hosttest/vktest.c" "$REPO/ios/sweetrun/sweetlog.c" -framework IOKit -framework CoreFoundation -lz
+  "$ROOT/hosttest/vktest.c" "$REPO/ios/sweetrun/sweetlog.c" "$REPO/ios/sweetrun/sweetfile.c" -framework IOKit -framework CoreFoundation -lz
 fi
 
 # ---- sweetmetal-core (Rust, LGPL: separate dylib; metal2vulkan pinned in Cargo.toml) ----
@@ -62,21 +63,36 @@ rustup target add aarch64-apple-ios
 cp "$WORK/cargo/aarch64-apple-ios/release/libsweetmetal_core.dylib" "$OUT/"
 install_name_tool -id @rpath/libsweetmetal_core.dylib "$OUT/libsweetmetal_core.dylib"
 
-# ---- SweetMetal.bundle ----
-B="$OUT/SweetMetal.bundle"
-mkdir -p "$B"
-cp "$ROOT/userland/sweetmetal/bundle/Info.plist" "$B/"
-$CC -bundle -fobjc-arc -fmodules -I"$ROOT/userland/sweetmetal/core/include" \
-  -I"$ROOT/userland/libsweetgpu" -I"$ROOT/kernel" -o "$B/SweetMetal" \
+# ---- SweetMetalImpl.bundle: the driver, from the boot image (mkadt.py --metal-file) ----
+# Built with the device class renamed: SweetMetalDevice is the loader's.
+I="$OUT/SweetMetalImpl.bundle"
+mkdir -p "$I"
+sed -e 's|<string>SweetMetal</string>|<string>SweetMetalImpl</string>|' \
+    -e 's|org.sweet.SweetMetal<|org.sweet.SweetMetalImpl<|' \
+    -e 's|<string>SweetMetalDevice</string>|<string>SweetMetalDeviceImpl</string>|' \
+    "$ROOT/userland/sweetmetal/bundle/Info.plist" > "$I/Info.plist"
+$CC -bundle -fobjc-arc -fmodules -DSweetMetalDevice=SweetMetalDeviceImpl \
+  -I"$ROOT/userland/sweetmetal/core/include" \
+  -I"$ROOT/userland/libsweetgpu" -I"$ROOT/kernel" -o "$I/SweetMetalImpl" \
   "$ROOT/userland/sweetmetal/bundle/SweetMetal.m" "$WORK/sweetgpu.o" \
   -L"$OUT" -lsweetmetal_core -framework Foundation -framework Metal -framework IOSurface \
   '-Wl,-U,_OBJC_CLASS_$__MTLDevice' '-Wl,-U,_OBJC_METACLASS_$__MTLDevice' \
   -framework IOKit -framework CoreFoundation -Wl,-rpath,@loader_path
-cp "$OUT"/libsweetmetal_core.dylib "$OUT"/libsweetvk.dylib "$OUT"/libvulkan_freedreno.dylib "$B/"
+cp "$OUT"/libsweetmetal_core.dylib "$OUT"/libsweetvk.dylib "$OUT"/libvulkan_freedreno.dylib "$I/"
+
+# ---- SweetMetal.bundle: the loader installed on the root ----
+B="$OUT/SweetMetal.bundle"
+mkdir -p "$B"
+cp "$ROOT/userland/sweetmetal/bundle/Info.plist" "$B/"
+$CC -bundle -fobjc-arc -fmodules -I"$REPO/ios/sweetrun" -o "$B/SweetMetal" \
+  "$ROOT/userland/sweetmetal/loader/SweetMetalLoader.m" "$REPO/ios/sweetrun/sweetfile.c" \
+  '-Wl,-U,_OBJC_CLASS_$__MTLDevice' '-Wl,-U,_OBJC_METACLASS_$__MTLDevice' \
+  -framework Foundation -framework IOKit -framework CoreFoundation -lz
 fi
 
 # The iOS root is unsigned-friendly (permissive AMFI), but sign ad hoc anyway.
-for f in "$OUT"/*.dylib "$OUT"/vktest "$OUT"/SweetMetal.bundle/SweetMetal "$OUT"/SweetMetal.bundle/*.dylib; do
+for f in "$OUT"/*.dylib "$OUT"/vktest "$OUT"/SweetMetal.bundle/SweetMetal \
+    "$OUT"/SweetMetalImpl.bundle/SweetMetalImpl "$OUT"/SweetMetalImpl.bundle/*.dylib; do
   [ -f "$f" ] && codesign -f -s - "$f"
 done
 echo "built into $OUT ($PARTS)"

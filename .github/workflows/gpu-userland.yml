@@ -16,6 +16,7 @@ on:
       - "gpu/ci/**"
       - "gpu/hosttest/vktest.c"
       - "gpu/userland/sweetmetal/**"
+      - "ios/sweetrun/sweetfile.c"
       - ".github/workflows/gpu-userland.yml"
 jobs:
   hosttest:

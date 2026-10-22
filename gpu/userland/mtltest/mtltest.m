@@ -1,8 +1,10 @@
 /*
  * mtltest - the SweetMetal plug-in through Metal's own objects, before it
- * is installed: the bundle comes with the boot image, is loaded from
- * /private/var/tmp, and its device class is instantiated the way Metal
- * does it (-initWithAcceleratorPort: with the IOAcceleratorES service).
+ * is installed: the loader bundle (what goes on the root) comes with the
+ * boot image, is loaded from /private/var/tmp, and its device class is
+ * instantiated the way Metal does it (-initWithAcceleratorPort: with the
+ * IOAcceleratorES service); the loader unpacks the driver from
+ * /sweet-metal as it does in backboardd.
  *
  *   the checks Metal makes before it registers a device; buffers; a
  *   compute kernel and a triangle from test.metal through
@@ -12,8 +14,9 @@
  *   loads it; and a triangle drawn into an IOSurface, read back by the CPU
  *   from the surface's own memory, as CoreAnimation's output is.
  *
- * Files (mkadt.py --run-file): bundle (SweetMetal), core, sweetvk, vk,
- * plist (Info.plist), metallib (test.metallib). Started by ios/sweetrun.
+ * Files (mkadt.py --run-file): bundle (the loader), plist (its Info.plist),
+ * metallib (test.metallib); the driver itself with --metal-file. Started
+ * by ios/sweetrun.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -212,10 +215,10 @@ main(void)
 	@autoreleasepool {
 		mkdir("/private/var/tmp/sweetmetal-test", 0755);
 		mkdir(B, 0755);
+		/* the loader's directory, as the root install makes it */
+		mkdir("/private/var/sweetmetal", 01777);
+		chmod("/private/var/sweetmetal", 01777);
 		if (!sweetrun_file("bundle", B "/SweetMetal") || !sweetrun_file("plist", B "/Info.plist") ||
-		    !sweetrun_file("core", B "/libsweetmetal_core.dylib") ||
-		    !sweetrun_file("sweetvk", B "/libsweetvk.dylib") ||
-		    !sweetrun_file("vk", B "/libvulkan_freedreno.dylib") ||
 		    !sweetrun_file("metallib", "/private/var/tmp/sweetmetal-test/test.metallib")) {
 			printf("FAIL: files missing from the boot image\nMTLTEST FAILED\n");
 			return 1;

@@ -12,4 +12,7 @@
  */
 const char *sweetrun_file(const char *prop, const char *path);
 
+/* The same for any device tree node, e.g. "IODeviceTree:/sweet-metal". */
+const char *sweet_dt_file(const char *node, const char *prop, const char *path);
+
 #endif

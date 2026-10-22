@@ -8,6 +8,7 @@ address comes from the sweet live FDT. Usage:
   mkadt.py OUT.adt --board apollo --phys-base HEX --mem-size HEX  # Mi 10T (Pro)
            [--touch-fw novatek_nt36675_j3s_fw01.bin] [--gpu-fw DIR]
            [--run PROGRAM [--run-args "ARGS"] [--run-delay SECONDS] [--run-file NAME=FILE]...]
+           [--metal-file NAME=FILE]...
 
 --gpu-fw DIR adds /sweet-gpu with the phone's own a650_sqe.fw, a650_gmu.bin
 and a650_zap (.mbn, or .mdt + .bNN which are joined like tools/mkzap.py)
@@ -22,6 +23,10 @@ as it is. --run-file NAME=FILE (repeatable; --run-lib FILE is lib=FILE)
 adds more files for the program, zlib-compressed (properties NAME-z,
 NAME-0, NAME-1, ...; ios/sweetrun/sweetrun.h sweetrun_file), e.g. the
 Vulkan driver.
+
+--metal-file NAME=FILE (repeatable) adds /sweet-metal: the Metal driver
+the SweetMetal loader on the root unpacks (gpu/userland/sweetmetal/loader),
+the same encoding plus an "id" that changes with the files.
 
 For apollo the RAM window has no default on purpose: take it from the
 phone's live FDT with tools/fdtmem.py (see PORTING-APOLLO.md). The touch
@@ -127,6 +132,17 @@ cstr = lambda s: s.encode() + b'\0'
 RUN_CHUNK = 512 * 1024
 
 
+def file_props(files):
+    """Files as zlib streams in properties NAME-0, NAME-1, ..., the size in NAME-z."""
+    props = []
+    for name, data in files:
+        z = zlib.compress(data, 9)
+        props.append((f'{name}-z', u32(len(data))))
+        props += [(f'{name}-{i}', z[o:o + RUN_CHUNK])
+                  for i, o in enumerate(range(0, len(z), RUN_CHUNK))]
+    return props
+
+
 def node(name, props=(), children=()):
     n = adt.Node()
     n.props = [('name', 0, cstr(name))] + [(k, 0, v) for k, v in props]
@@ -171,7 +187,7 @@ def gpu_node(fwdir, ph):
 
 
 def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, mem_size=None,
-          touch_fw=None, gpu_fw=None, run=None):
+          touch_fw=None, gpu_fw=None, run=None, metal=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     b = BOARDS[board]
     if phys_base is None or mem_size is None:
@@ -353,12 +369,12 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
             ('args', b''.join(cstr(a) for a in args)),
             ('delay', u32(delay)),
         ]
-        for name, data in files:
-            z = zlib.compress(data, 9)
-            props.append((f'{name}-z', u32(len(data))))
-            props += [(f'{name}-{i}', z[o:o + RUN_CHUNK])
-                      for i, o in enumerate(range(0, len(z), RUN_CHUNK))]
-        extra.append(node('sweet-run', props))
+        extra.append(node('sweet-run', props + file_props(files)))
+    if metal:
+        # read by the SweetMetal loader on the root: the Metal driver itself,
+        # unpacked once per boot image into /private/var/sweetmetal/<id>
+        digest = hashlib.sha256(b''.join(n.encode() + d for n, d in metal)).hexdigest()[:16]
+        extra.append(node('sweet-metal', [ph(), ('id', cstr(digest))] + file_props(metal)))
     if b['touch']:
         extra.append(node('sweet-touch', [
             ph(),
@@ -383,12 +399,12 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
     ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + extra + product + ([] if qemu else [ufs, spmi]))
 
 
-def run_files():
-    """--run-file NAME=FILE (repeatable) and --run-lib FILE (NAME lib)."""
+def run_files(option='--run-file'):
+    """OPTION NAME=FILE (repeatable); --run-lib FILE is --run-file lib=FILE."""
     files = []
     for i, a in enumerate(sys.argv):
-        if a in ('--run-file', '--run-lib') and i + 1 < len(sys.argv):
-            spec = sys.argv[i + 1] if a == '--run-file' else 'lib=' + sys.argv[i + 1]
+        if a in (option, '--run-lib' if option == '--run-file' else None) and i + 1 < len(sys.argv):
+            spec = sys.argv[i + 1] if a == option else 'lib=' + sys.argv[i + 1]
             name, _, path = spec.partition('=')
             files.append((name, open(path, 'rb').read()))
     return files
@@ -415,7 +431,8 @@ if __name__ == '__main__':
                  run=_opt('--run', lambda f: (open(f, 'rb').read(),
                                               _opt('--run-args', default='').split(),
                                               _opt('--run-delay', int, 0),
-                                              run_files())))
+                                              run_files())),
+                 metal=run_files('--metal-file'))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
