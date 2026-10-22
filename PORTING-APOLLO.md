@@ -229,6 +229,13 @@ Results on the phone (kernel and bare-metal shim agree):
   through a render pass; every pixel of the read-back image is right, at
   256x256 and at the iOS screen size 1125x2436 (5 ms per frame including
   the 11 MB copy back, at the lowest GPU level).
+- Metal on Vulkan: libsweetmetal_core (metal2vulkan, built for iOS by the
+  gpu-userland workflow) runs on the phone through its C ABI
+  (gpu/userland/smtltest): a Metal kernel compiled by Apple's compiler
+  gives exact results, a Metal render pass is right to the pixel, and
+  QuartzCore's own default.metallib loads, its kernels compile, and its
+  render pipelines compile once they get the vertex descriptor QuartzCore
+  passes.
 - GPU clock: the GMU sets the levels from the HFI perf table (305 to
   587 MHz on this speed bin); 587 MHz measured 1.93x the compute
   throughput of 305 MHz. The driver raises the level on submission and
