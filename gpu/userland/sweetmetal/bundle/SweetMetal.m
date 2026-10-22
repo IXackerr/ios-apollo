@@ -27,6 +27,14 @@
 #include "sweetmetal.h"
 #include "sweetgpu.h"
 
+/* The iOS SDK ships IOKit.framework without headers. */
+typedef mach_port_t io_object_t;
+typedef io_object_t io_registry_entry_t;
+extern io_registry_entry_t IORegistryEntryFromPath(mach_port_t mainPort, const char *path);
+extern CFTypeRef IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key,
+    CFAllocatorRef allocator, uint32_t options);
+extern kern_return_t IOObjectRelease(io_object_t object);
+
 /* Metal's private device base class: exported by Metal.framework, without
  * a header in the SDK. */
 @interface _MTLDevice : NSObject
@@ -825,9 +833,39 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
  * class with the SweetAdreno service. -[_MTLDevice init] does no IOKit
  * work, unlike Apple's IOGPUMetalDevice, whose kernel ABI we do not have.
  */
+/*
+ * mkadt.py --metal-processes: while the driver grows, only the processes
+ * named get a device; the others see no Metal and render as before.
+ */
+static BOOL
+processAllowed(void)
+{
+	io_registry_entry_t node = IORegistryEntryFromPath(MACH_PORT_NULL, "IODeviceTree:/sweet-metal");
+	if (node == MACH_PORT_NULL) {
+		return YES;
+	}
+	CFTypeRef v = IORegistryEntryCreateCFProperty(node, CFSTR("processes"), NULL, 0);
+	IOObjectRelease(node);
+	if (v == NULL || CFGetTypeID(v) != CFDataGetTypeID()) {
+		if (v != NULL) {
+			CFRelease(v);
+		}
+		return YES;
+	}
+	NSData *d = CFBridgingRelease(v);
+	const char *p = d.bytes, *end = p + d.length, *me = getprogname();
+	for (; p < end; p += strlen(p) + 1) {
+		if (strcmp(p, me) == 0) {
+			return YES;
+		}
+	}
+	SMLOG(@"no device for %s (not in /sweet-metal processes)", me);
+	return NO;
+}
+
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port
 {
-	if ((self = [super init]) == nil) {
+	if (!processAllowed() || (self = [super init]) == nil) {
 		return nil;
 	}
 	_acceleratorPort = port;
@@ -881,6 +919,7 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 	return nil;
 }
 - (BOOL)isLowPower { return NO; }
+- (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return count <= 1; }
 - (BOOL)isHeadless { return NO; }
 - (BOOL)isRemovable { return NO; }
 - (BOOL)hasUnifiedMemory { return YES; }
