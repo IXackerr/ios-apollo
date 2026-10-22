@@ -111,6 +111,26 @@ only after the read-only boot works.
 6. **Touch driver** (NT36675 over GENI SPI), then the WLED backlight for
    display power, then the USB live log with the 7nm PHY.
 
+## Boot time (2026-10-22)
+
+Measured with patch 0087 (time since boot on every `exec` line, UFS totals
+every 10 s), launchd starting about 11 s after the kernel:
+
+- QuartzCore's `CAMetalContextCreate` waits up to 30 s (300 lookups,
+  100 ms apart) for an `IOAcceleratorES` service before CoreAnimation
+  falls back to the CPU. Patch 0089 publishes a placeholder, which names
+  no Metal plug-in: the first frame now comes 14.7 s after launchd instead
+  of 44.6 s, about 26 s after the kernel starts instead of 56 s.
+- ABL leaves the A55s at 1516 MHz and the A77s at their lowest level
+  (710 / 844 MHz). Patch 0088 sets 1804 / 1958 / 1977 MHz through EPSS
+  `PERF_STATE`; the big cores stay below their 2419 / 2841 MHz maximum
+  because the vendor thermal (LMh) setup does not run here.
+- UFS is not the bottleneck: the device is busy for about 6 s over the
+  whole boot (1.6 GiB read). The `ufscache=1 ufswait=1` options of the
+  sweet driver made the early boot slower, not faster.
+- Patch 0085 ends IOKitInitializeTime's 30 s IORTC wait and starts the
+  calendar from the PMIC RTC.
+
 ## NT36675 touch: bare-metal probe works (2026-10-22)
 
 `BOARD=apollo TOUCHFW=<firmware> shim/build.sh` boots a touch probe
