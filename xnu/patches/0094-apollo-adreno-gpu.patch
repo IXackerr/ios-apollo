@@ -4886,7 +4886,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,840 @@
+@@ -0,0 +1,844 @@
 +/*
 + * SweetAdreno - IOKit front end of the SWEET Adreno 650 driver.
 + *
@@ -5394,6 +5394,9 @@
 +		sgpu_umem_destroy(m);
 +		return kIOReturnVMError;
 +	}
++	/* the GPU does not snoop: no dirty line may be written back over what
++	 * it renders, and no stale one may hide it */
++	md->performOperation(kIOMemoryIncoherentIOFlush, 0, req->size);
 +	uint32_t prot = SGPU_PROT_READ;
 +	if (!(req->flags & SGPU_MEM_GPU_READONLY)) {
 +		prot |= SGPU_PROT_WRITE;
@@ -5438,6 +5441,7 @@
 +		sgpu_umem_destroy(m);
 +		return kIOReturnNoMemory;
 +	}
++	m->md->performOperation(kIOMemoryIncoherentIOFlush, 0, m->md->getLength());
 +	uint32_t prot = SGPU_PROT_READ;
 +	if (!(req->flags & SGPU_MEM_GPU_READONLY)) {
 +		prot |= SGPU_PROT_WRITE;

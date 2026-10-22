@@ -18,6 +18,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
+#import <libkern/OSCacheControl.h>
 #import <objc/runtime.h>
 #include <sys/stat.h>
 #include "sweetrun.h"
@@ -177,6 +178,9 @@ test_iosurface(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibrary> lib)
 	IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
 	const uint8_t *base = IOSurfaceGetBaseAddress(surf);
 	size_t bpr = IOSurfaceGetBytesPerRow(surf);
+	/* the display reads memory, not this CPU's cache: drop the lines the
+	 * CPU may hold over the surface before reading it as the display would */
+	sys_dcache_flush((void *)base, IOSurfaceGetAllocSize(surf));
 	/* BGRA8 in memory: clear red = 00 00 ff ff, triangle = 80 ff 40 ff */
 	const uint32_t clear = 0xffff0000u, tri = 0xff40ff80u;
 	uint32_t ntri = 0, other = 0, center = 0, corner = 0;
@@ -186,7 +190,9 @@ test_iosurface(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibrary> lib)
 			if (row[x] == tri) {
 				ntri++;
 			} else if (row[x] != clear) {
-				other++;
+				if (other++ < 4) {
+					printf("  pixel %d,%d: %#x\n", x, y, row[x]);
+				}
 			}
 		}
 	}

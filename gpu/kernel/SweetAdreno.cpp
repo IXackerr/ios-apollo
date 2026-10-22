@@ -505,6 +505,9 @@ SweetAdrenoUserClient::importUser(struct sgpu_import_user *req)
 		sgpu_umem_destroy(m);
 		return kIOReturnVMError;
 	}
+	/* the GPU does not snoop: no dirty line may be written back over what
+	 * it renders, and no stale one may hide it */
+	md->performOperation(kIOMemoryIncoherentIOFlush, 0, req->size);
 	uint32_t prot = SGPU_PROT_READ;
 	if (!(req->flags & SGPU_MEM_GPU_READONLY)) {
 		prot |= SGPU_PROT_WRITE;
@@ -549,6 +552,7 @@ SweetAdrenoUserClient::importSurface(struct sgpu_import_surface *req)
 		sgpu_umem_destroy(m);
 		return kIOReturnNoMemory;
 	}
+	m->md->performOperation(kIOMemoryIncoherentIOFlush, 0, m->md->getLength());
 	uint32_t prot = SGPU_PROT_READ;
 	if (!(req->flags & SGPU_MEM_GPU_READONLY)) {
 		prot |= SGPU_PROT_WRITE;
