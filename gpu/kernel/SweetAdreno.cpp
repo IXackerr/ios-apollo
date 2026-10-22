@@ -490,8 +490,20 @@ SweetAdrenoUserClient::importUser(struct sgpu_import_user *req)
 	if (sgpu_wired + req->size > SGPU_MAX_WIRED) {
 		return kIOReturnNoMemory;
 	}
+	/*
+	 * Pages the caller may only read (memory another process shares with
+	 * it read-only, as CoreAnimation's clients do with backboardd) cannot
+	 * be wired for writing: those are mapped for the GPU to read.
+	 */
 	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(req->addr, req->size,
 	    kIODirectionInOut, fTask);
+	if (md != NULL && md->prepare() != kIOReturnSuccess) {
+		md->release();
+		md = IOMemoryDescriptor::withAddressRange(req->addr, req->size, kIODirectionOut, fTask);
+		req->flags |= SGPU_MEM_GPU_READONLY;
+	} else if (md != NULL) {
+		md->complete();
+	}
 	if (md == NULL) {
 		return kIOReturnNoMemory;
 	}

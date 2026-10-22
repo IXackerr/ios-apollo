@@ -122,6 +122,7 @@ SMError(NSString *what)
 - (MTLStorageMode)storageMode { return (MTLStorageMode)((_options >> 4) & 0xf); }
 - (MTLCPUCacheMode)cpuCacheMode { return (MTLCPUCacheMode)(_options & 0xf); }
 - (void)didModifyRange:(NSRange)range { /* unified memory: nothing to do */ }
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
 - (void)dealloc
 {
 	smtl_buffer_release(_b);
@@ -161,6 +162,7 @@ SMError(NSString *what)
 - (BOOL)isFramebufferOnly { return NO; }
 - (MTLStorageMode)storageMode { return _iosurface ? MTLStorageModeShared : MTLStorageModePrivate; }
 - (MTLCPUCacheMode)cpuCacheMode { return MTLCPUCacheModeDefaultCache; }
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
 - (uint64_t)protectionOptions { return 0; }
 static uint64_t
 regionBytes(MTLRegion r, NSUInteger bpr, NSUInteger bpi)
@@ -731,6 +733,7 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 	}
 }
 - (void)enqueue { }
+- (NSError *)error { return nil; }
 - (void)commitAndWaitUntilSubmitted { [self commit]; }
 - (void)waitUntilScheduled { }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)h
@@ -865,7 +868,8 @@ processAllowed(void)
 
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port
 {
-	if (!processAllowed() || (self = [super init]) == nil) {
+	/* initialized either way: -[_MTLDevice dealloc] expects it */
+	if ((self = [super init]) == nil || !processAllowed()) {
 		return nil;
 	}
 	_acceleratorPort = port;
