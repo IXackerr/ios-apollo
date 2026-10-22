@@ -151,6 +151,42 @@ SMError(NSString *what)
 - (IOSurfaceRef)iosurface { return _iosurface; }
 - (NSUInteger)iosurfacePlane { return _plane; }
 - (BOOL)isFramebufferOnly { return NO; }
+static uint64_t
+regionBytes(MTLRegion r, NSUInteger bpr, NSUInteger bpi)
+{
+	return r.size.depth > 1 ? bpi * r.size.depth : bpr * r.size.height;
+}
+- (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice
+    withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
+{
+	const uint64_t reg[6] = { r.origin.x, r.origin.y, r.origin.z, r.size.width, r.size.height,
+		r.size.depth };
+	if (smtl_texture_replace_region(_t, reg, level, slice, bytes, regionBytes(r, bpr, bpi), bpr,
+	    bpi) != 0) {
+		SMError(@"replaceRegion:");
+	}
+}
+- (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes
+    bytesPerRow:(NSUInteger)bpr
+{
+	[self replaceRegion:r mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:bpr
+	    bytesPerImage:0];
+}
+- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
+    fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice
+{
+	const uint64_t reg[6] = { r.origin.x, r.origin.y, r.origin.z, r.size.width, r.size.height,
+		r.size.depth };
+	if (smtl_texture_get_bytes(_t, bytes, regionBytes(r, bpr, bpi), bpr, bpi, reg, level,
+	    slice) != 0) {
+		SMError(@"getBytes:");
+	}
+}
+- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)r
+    mipmapLevel:(NSUInteger)level
+{
+	[self getBytes:bytes bytesPerRow:bpr bytesPerImage:0 fromRegion:r mipmapLevel:level slice:0];
+}
 - (void)dealloc
 {
 	smtl_texture_release(_t);
@@ -637,7 +673,9 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 	_acceleratorPort = port;
 	NSString *bundle = [NSBundle bundleForClass:[self class]].bundlePath;
 	NSString *vk = [bundle stringByAppendingPathComponent:@"libsweetvk.dylib"];
-	NSString *cache = [NSTemporaryDirectory() stringByAppendingPathComponent:@"SweetMetalCache"];
+	/* per user: a cache root made can not be written by mobile processes */
+	NSString *cache = [NSTemporaryDirectory() stringByAppendingPathComponent:
+	    [NSString stringWithFormat:@"SweetMetalCache-%u", getuid()]];
 	_d = smtl_device_create(vk.fileSystemRepresentation, cache.fileSystemRepresentation);
 	if (_d == NULL) {
 		SMError(@"device");

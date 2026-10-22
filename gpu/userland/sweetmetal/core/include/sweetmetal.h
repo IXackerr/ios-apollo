@@ -78,6 +78,12 @@ smtl_texture *smtl_buffer_new_iosurface_texture(smtl_buffer *surface, uint32_t p
     uint64_t width, uint64_t height, uint32_t usage, uint64_t offset, uint64_t bytes_per_row,
     int planar);
 void          smtl_texture_release(smtl_texture *t);
+/* region: x, y, z, width, height, depth; len: bytes readable/writable at bytes */
+int smtl_texture_replace_region(smtl_texture *t, const uint64_t region[6], uint64_t level,
+    uint64_t slice, const void *bytes, uint64_t len, uint64_t bytes_per_row,
+    uint64_t bytes_per_image);
+int smtl_texture_get_bytes(smtl_texture *t, void *bytes, uint64_t len, uint64_t bytes_per_row,
+    uint64_t bytes_per_image, const uint64_t region[6], uint64_t level, uint64_t slice);
 
 /* ---- shaders and pipelines ---- */
 smtl_library  *smtl_device_new_library_with_data(smtl_device *d, const void *metallib, size_t len);

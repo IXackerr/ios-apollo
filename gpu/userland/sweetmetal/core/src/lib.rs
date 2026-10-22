@@ -23,7 +23,7 @@ use metal2vulkan_runtime::{
     BlitCommandEncoder, BlitOption, Buffer, ClearColor, CommandBuffer, CommandBufferStatus,
     CommandQueue, ComputeCommandEncoder, ComputePipelineState, DepthStencilState, Device,
     DeviceOptions, Function,
-    HostMemory, IoSurfacePlane, Library, LoadAction, Origin, PipelineOptions, RenderCommandEncoder,
+    HostMemory, IoSurfacePlane, Library, Region, LoadAction, Origin, PipelineOptions, RenderCommandEncoder,
     RenderPassDescriptor, RenderPipelineState, ResourceOptions, Size, StoreAction, Texture,
     TextureDescriptor,
 };
@@ -281,6 +281,71 @@ pub unsafe extern "C" fn smtl_buffer_new_iosurface_texture(
     )
 }
 release!(smtl_texture_release, Texture);
+
+/// `replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:`; `len` is how many
+/// bytes at `bytes` may be read.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_texture_replace_region(
+    t: *mut Texture,
+    region: *const u64,             // x, y, z, width, height, depth
+    level: u64,
+    slice: u64,
+    bytes: *const c_void,
+    len: u64,
+    bytes_per_row: u64,
+    bytes_per_image: u64,
+) -> i32 {
+    let t = handle!(t, -1);
+    if region.is_null() || bytes.is_null() {
+        set_error("replaceRegion: NULL region or bytes".into());
+        return -1;
+    }
+    let r = std::slice::from_raw_parts(region, 6);
+    let data = std::slice::from_raw_parts(bytes as *const u8, len as usize);
+    status(
+        "replaceRegion:",
+        t.replace_region(
+            Region::new_3d(r[0], r[1], r[2], r[3], r[4], r[5]),
+            level,
+            slice,
+            data,
+            bytes_per_row,
+            bytes_per_image,
+        ),
+    )
+}
+
+/// `getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:`
+#[no_mangle]
+pub unsafe extern "C" fn smtl_texture_get_bytes(
+    t: *mut Texture,
+    bytes: *mut c_void,
+    len: u64,
+    bytes_per_row: u64,
+    bytes_per_image: u64,
+    region: *const u64,
+    level: u64,
+    slice: u64,
+) -> i32 {
+    let t = handle!(t, -1);
+    if region.is_null() || bytes.is_null() {
+        set_error("getBytes: NULL region or bytes".into());
+        return -1;
+    }
+    let r = std::slice::from_raw_parts(region, 6);
+    let data = std::slice::from_raw_parts_mut(bytes as *mut u8, len as usize);
+    status(
+        "getBytes:",
+        t.get_bytes(
+            data,
+            bytes_per_row,
+            bytes_per_image,
+            Region::new_3d(r[0], r[1], r[2], r[3], r[4], r[5]),
+            level,
+            slice,
+        ),
+    )
+}
 
 // ---------------------------------------------------------------- shaders, pipelines
 
