@@ -42,6 +42,7 @@ enum sgpu_selector {
 	SGPU_SEL_GPU_TIME       = 10,   /* -> sgpu_gpu_time */
 	SGPU_SEL_GET_STATUS     = 11,   /* -> sgpu_status (bring-up diagnostics) */
 	SGPU_SEL_IMPORT_USER    = 12,   /* sgpu_import_user -> same (v2) */
+	SGPU_SEL_SURFACE_BUSY   = 13,   /* sgpu_surface_busy */
 	SGPU_SEL_COUNT
 };
 
@@ -130,6 +131,17 @@ struct sgpu_import_user {
 	uint32_t flags;                 /* in: SGPU_MEM_GPU_READONLY, SGPU_MEM_CACHED */
 	uint32_t id;                    /* out: memory handle (free with MEM_FREE) */
 	uint64_t gpuaddr;               /* out */
+};
+
+/*
+ * GPU work that writes an IOSurface: +1 when submitted, -1 once complete.
+ * The framebuffer shows no surface the GPU is still rendering (a swap
+ * names the surface as soon as the work is submitted, as on Apple's GPUs,
+ * whose display waits for it).
+ */
+struct sgpu_surface_busy {
+	uint32_t surface_id;
+	int32_t delta;
 };
 
 struct sgpu_sync_cache {

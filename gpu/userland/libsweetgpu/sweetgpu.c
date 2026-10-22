@@ -213,6 +213,13 @@ sgpu_import_user(sgpu_dev *dev, struct sgpu_import_user *req)
 }
 
 int
+sgpu_surface_busy(sgpu_dev *dev, uint32_t surface_id, int32_t delta)
+{
+	struct sgpu_surface_busy b = { .surface_id = surface_id, .delta = delta };
+	return call(dev, SGPU_SEL_SURFACE_BUSY, &b, sizeof(b), NULL, 0);
+}
+
+int
 sgpu_submit(sgpu_dev *dev, uint32_t ctx_id, const struct sgpu_ib *ibs, uint32_t num_ibs,
     uint32_t flags, uint32_t *timestamp)
 {

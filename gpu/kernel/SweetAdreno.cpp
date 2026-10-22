@@ -374,9 +374,11 @@ class SweetAdrenoUserClient : public IOUserClient {
 	task_t            fTask;
 	struct sgpu_umem *fMem;
 	uint64_t          fCtxMask;     /* contexts owned (bit = ctx id) */
+	uint64_t          fIds[SGPU_MAX_CLIENT_MEM / 64];       /* memory ids in use */
 
 	struct sgpu_umem *findMem(uint32_t id, struct sgpu_umem ***link);
 	uint32_t allocId();
+	void freeId(uint32_t id);
 	bool ibInClientMemory(uint64_t gpuaddr, uint64_t bytes);
 	IOReturn memAlloc(struct sgpu_mem_alloc *req);
 	IOReturn importSurface(struct sgpu_import_surface *req);
@@ -402,6 +404,7 @@ SweetAdrenoUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 
 	}
 	fTask = owningTask;
 	fMem = NULL;
+	bzero(fIds, sizeof(fIds));
 	fCtxMask = 0;
 	return true;
 }
@@ -424,6 +427,7 @@ SweetAdrenoUserClient::clientClose(void)
 		sgpu_cp_ctx_free(&sgpu_dev, c);
 	}
 	fCtxMask = 0;
+	bzero(fIds, sizeof(fIds));
 	while (fMem) {
 		struct sgpu_umem *m = fMem;
 		fMem = m->next;
@@ -470,10 +474,27 @@ SweetAdrenoUserClient::ibInClientMemory(uint64_t gpuaddr, uint64_t bytes)
 uint32_t
 SweetAdrenoUserClient::allocId()
 {
-	for (uint32_t id = 1;; id++) {
-		if (findMem(id, NULL) == NULL) {
-			return id;
+	/*
+	 * The lowest free id, a word of the map at a time: turnip indexes its
+	 * buffers by id, so ids stay small. (Probing each id against the list
+	 * of buffers cost milliseconds per allocation with a few thousand.)
+	 */
+	for (uint32_t w = 0; w < SGPU_MAX_CLIENT_MEM / 64; w++) {
+		uint64_t used = fIds[w] | (w == 0 ? 1 : 0);     /* id 0 is none */
+		if (used != ~0ull) {
+			uint32_t bit = (uint32_t)__builtin_ctzll(~used);
+			fIds[w] |= 1ull << bit;
+			return w * 64 + bit;
 		}
+	}
+	return 0;
+}
+
+void
+SweetAdrenoUserClient::freeId(uint32_t id)
+{
+	if (id < SGPU_MAX_CLIENT_MEM) {
+		fIds[id / 64] &= ~(1ull << (id % 64));
 	}
 }
 
@@ -556,6 +577,10 @@ SweetAdrenoUserClient::memAlloc(struct sgpu_mem_alloc *req)
 		}
 	}
 	m->id = allocId();
+	if (m->id == 0) {
+		sgpu_umem_release(m);
+		return kIOReturnNoResources;
+	}
 	m->next = fMem;
 	fMem = m;
 
@@ -639,6 +664,10 @@ SweetAdrenoUserClient::importUser(struct sgpu_import_user *req)
 		return sgpu_ioreturn(err);
 	}
 	m->id = allocId();
+	if (m->id == 0) {
+		sgpu_umem_release(m);
+		return kIOReturnNoResources;
+	}
 	m->next = fMem;
 	fMem = m;
 	req->id = m->id;
@@ -692,6 +721,10 @@ SweetAdrenoUserClient::importSurface(struct sgpu_import_surface *req)
 		return sgpu_ioreturn(err);
 	}
 	m->id = allocId();
+	if (m->id == 0) {
+		sgpu_umem_release(m);
+		return kIOReturnNoResources;
+	}
 	m->next = fMem;
 	fMem = m;
 	req->id = m->id;
@@ -834,6 +867,7 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		struct sgpu_mem_free       free;
 		struct sgpu_import_surface import;
 		struct sgpu_import_user    user;
+		struct sgpu_surface_busy   busy;
 		struct sgpu_wait_ts        wait;
 		struct sgpu_read_ts        rts;
 		struct sgpu_sync_cache     sync;
@@ -894,6 +928,7 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 				ret = kIOReturnNotFound;
 			} else {
 				*link = m->next;
+				freeId(m->id);
 				sgpu_umem_release(m);
 			}
 		}
@@ -915,6 +950,18 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		}
 		if (ret == kIOReturnSuccess) {
 			ret = struct_out(args, &u.user, sizeof(u.user));
+		}
+		break;
+	case SGPU_SEL_SURFACE_BUSY:
+		ret = struct_in(args, &u.busy, sizeof(u.busy));
+		if (ret == kIOReturnSuccess) {
+			SweetSurface *s = sweet_surface_copy(u.busy.surface_id);
+			if (s == NULL) {
+				ret = kIOReturnNotFound;
+			} else {
+				sweet_surface_gpu_writes(s, u.busy.delta);
+				s->release();
+			}
 		}
 		break;
 	case SGPU_SEL_SYNC_CACHE:
