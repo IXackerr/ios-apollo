@@ -1,0 +1,154 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_nt36675.c			standard
++bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -0,0 +1,123 @@
++/*
++ * CPU frequency on Qualcomm EPSS (apollo), set once after the CPUs start.
++ *
++ * The bootloader leaves the big clusters at their lowest level. Each
++ * frequency domain has a lookup table of levels and takes a level index
++ * in PERF_STATE; the hardware sequences voltage itself. The ADT node
++ * /sweet-cpufreq lists the domains and a target per domain; the highest
++ * level at or below the target is used. Boot-arg cpufreq=0 leaves the
++ * bootloader's levels, cpufreq=A,B,C sets the targets in MHz.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_cpufreq_init(void);
++
++#define EPSS_DOMAIN_STATE	0x020u
++#define EPSS_FREQ_LUT		0x100u
++#define EPSS_PERF_STATE		0x320u
++#define LUT_ROWS		40u
++#define XO_KHZ			19200u
++#define MAX_DOMAINS		4u
++
++static uint32_t
++lut_mhz(uint32_t row)
++{
++	return (row & 0xffu) * XO_KHZ / 1000u;
++}
++
++/* "1804,2016,2016" -> targets; returns how many were given. */
++static unsigned
++parse_targets(const char *s, uint32_t *mhz, unsigned max)
++{
++	unsigned n = 0;
++	uint32_t v = 0;
++	bool digits = false;
++
++	for (;; s++) {
++		if (*s >= '0' && *s <= '9') {
++			v = v * 10 + (uint32_t)(*s - '0');
++			digits = true;
++		} else {
++			if (digits && n < max) {
++				mhz[n++] = v;
++			}
++			v = 0;
++			digits = false;
++			if (*s != ',') {
++				break;
++			}
++		}
++	}
++	return n;
++}
++
++void
++sweet_cpufreq_init(void)
++{
++	DTEntry node;
++	void const *prop;
++	unsigned int reg_size, tgt_size;
++	const uint64_t *reg;
++	uint32_t target[MAX_DOMAINS];
++	char arg[64];
++
++	if (SecureDTLookupEntry(NULL, "/sweet-cpufreq", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", &prop, &reg_size) != kSuccess) {
++		return;
++	}
++	reg = prop;
++	unsigned n = reg_size / (2 * sizeof(uint64_t));
++	if (n > MAX_DOMAINS) {
++		n = MAX_DOMAINS;
++	}
++	if (SecureDTGetProperty(node, "target-mhz", &prop, &tgt_size) != kSuccess ||
++	    tgt_size < n * sizeof(uint32_t)) {
++		return;
++	}
++	memcpy(target, prop, n * sizeof(uint32_t));
++	if (PE_parse_boot_arg_str("cpufreq", arg, sizeof(arg))) {
++		if (arg[0] == '0' && arg[1] == '\0') {
++			printf("SWEET CPUFREQ: left at the bootloader's levels (cpufreq=0)\n");
++			return;
++		}
++		(void)parse_targets(arg, target, n);
++	}
++
++	for (unsigned d = 0; d < n; d++) {
++		vm_offset_t base = ml_io_map((vm_offset_t)reg[2 * d], (vm_size_t)reg[2 * d + 1]);
++		if (!base) {
++			continue;
++		}
++		volatile uint32_t *r = (volatile uint32_t *)base;
++		uint32_t before = lut_mhz(r[EPSS_DOMAIN_STATE / 4]);
++		uint32_t prev = 0, pick = 0, rows = 0;
++		for (uint32_t i = 0; i < LUT_ROWS; i++) {
++			uint32_t mhz = lut_mhz(r[EPSS_FREQ_LUT / 4 + i]);
++			if (!mhz || (i && mhz == prev)) {
++				break;
++			}
++			if (mhz <= target[d]) {
++				pick = i;
++			}
++			prev = mhz;
++			rows++;
++		}
++		if (!rows) {
++			continue;
++		}
++		r[EPSS_PERF_STATE / 4] = pick;
++		__asm__ volatile("dsb sy" ::: "memory");
++		delay(1000);
++		printf("SWEET CPUFREQ: domain %u: level %u of %u = %u MHz (max %u), was %u MHz, now %u MHz\n",
++		    d, pick, rows, lut_mhz(r[EPSS_FREQ_LUT / 4 + pick]), prev, before,
++		    lut_mhz(r[EPSS_DOMAIN_STATE / 4]));
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -20,6 +20,7 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++extern "C" void sweet_cpufreq_init(void);
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -175,6 +176,7 @@
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
++	sweet_cpufreq_init();
+ 	thread_terminate(current_thread());
+ }
+ 

@@ -57,6 +57,7 @@ BOARDS = {
         memory_hz=1866000000,
         keys=None,  # kernel defaults: PM6150L GPIO2 (SID 4) for volume up
         touch=None,  # kernel probes GT9896 / FT on QUP1 SE7
+        cpufreq=None,  # left as the bootloader set it
     ),
     'apollo': dict(
         soc_compat=['xiaomi,sweet', 'xiaomi,apollo', 'qcom,sm8250'],
@@ -72,6 +73,11 @@ BOARDS = {
         keys=dict(volup_ppid=0x0c5, volup_base=0xc500),
         # NT36675 on QUP0 SE4 (bsd/dev/sweet_nt36675.c, patch 0086)
         touch='novatek,nt36675',
+        # EPSS frequency domains (A55 / A77 / A77 prime) and the targets
+        # bsd/dev/sweet_cpufreq.c sets (patch 0088). ABL leaves the A77s at
+        # their lowest level; without the vendor thermal (LMh) setup the big
+        # cores stay well below their 2419 / 2841 MHz maximum.
+        cpufreq=[(0x18591000, 1804), (0x18592000, 2000), (0x18593000, 2000)],
     ),
 }
 
@@ -270,6 +276,13 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
             ph(),
             ('volup-ppid', u32(b['keys']['volup_ppid'])),
             ('volup-base', u32(b['keys']['volup_base'])),
+        ]))
+    if b['cpufreq'] and not qemu:
+        extra.append(node('sweet-cpufreq', [
+            ph(),
+            ('compatible', cstr('qcom,cpufreq-epss')),
+            ('reg', b''.join(u64(base, 0x1000) for base, _ in b['cpufreq'])),
+            ('target-mhz', b''.join(u32(mhz) for _, mhz in b['cpufreq'])),
         ]))
     if b['touch']:
         extra.append(node('sweet-touch', [
