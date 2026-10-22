@@ -8,7 +8,7 @@ on:
     inputs:
       parts:
         description: "build-ios-userland.sh PARTS"
-        default: "mesa tools"
+        default: "mesa tools metal"
   push:
     branches: [apollo]
     paths:
@@ -48,7 +48,7 @@ jobs:
           restore-keys: gpu-ios-${{ hashFiles('gpu/mesa/**', 'gpu/userland/sweetmetal/core/Cargo.lock') }}-
       - name: Build
         env:
-          PARTS: ${{ github.event.inputs.parts || 'mesa tools' }}
+          PARTS: ${{ github.event.inputs.parts || 'mesa tools metal' }}
         run: gpu/ci/build-ios-userland.sh
       - uses: actions/upload-artifact@v4
         with:
