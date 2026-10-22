@@ -111,7 +111,7 @@ coherence(sgpu_dev *dev, uint32_t ctx, struct sgpu_mem_alloc *ib, uint32_t flags
 		for (uint32_t i = 0; i < words; i++) {
 			sum += b[i];
 		}
-		__asm__ volatile("dsb sy" ::: "memory");
+		__sync_synchronize();
 		if ((err = sgpu_submit(dev, ctx, &copy, 1, 0, &ts)) ||
 		    (err = sgpu_wait_ts(dev, ctx, ts, 2000))) {
 			fprintf(stderr, "gputest: coherence %s: copy failed: %d (sum %u)\n", name, err,
