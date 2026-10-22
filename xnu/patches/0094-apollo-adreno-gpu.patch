@@ -1555,7 +1555,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_gmu.c
-@@ -0,0 +1,1025 @@
+@@ -0,0 +1,1050 @@
 +/*
 + * sweet_gpu_gmu.c - Adreno 650 GMU (graphics management unit) on SM8250.
 + *
@@ -1626,6 +1626,9 @@
 +#define GMU_GMU2HOST_INTR_MASK          0x1464c
 +#define GMU_HOST2GMU_INTR_SET           0x14650
 +#define GMU_GENERAL_7                   0x14730
++/* gpu_cc registers read only in gmu_dump (sweet_gpu_clk.c owns the clocks) */
++#define GPUCC_CX_GMU_CBCR_DUMP          0x1098
++#define GPUCC_GMU_CMD_RCGR_DUMP         0x1120
 +#define GMU_AO_HOST_INTERRUPT_CLR       0x24c10
 +#define GMU_AO_HOST_INTERRUPT_STATUS    0x24c14
 +#define GMU_AO_HOST_INTERRUPT_MASK      0x24c18
@@ -2293,6 +2296,27 @@
 +	return (chip & 0xffff0000u) | ((chip << 4) & 0xf000u) | ((chip << 8) & 0x0f00u);
 +}
 +
++/* What the host can see of a GMU that does not answer. */
++static void
++gmu_dump(struct sgpu *g)
++{
++	sgpu_log("gmu: SYSRESET %#x BOOT_CONFIG %#x CFG %#x GENERAL_7 %#x FW_BUSY %#x",
++	    gmu_rd(g, GMU_CM3_SYSRESET), gmu_rd(g, GMU_CM3_BOOT_CONFIG), gmu_rd(g, GMU_CM3_CFG),
++	    gmu_rd(g, GMU_GENERAL_7), gmu_rd(g, GMU_CM3_FW_BUSY));
++	sgpu_log("gmu: ITCM %#x %#x %#x %#x, DTCM %#x %#x, HFI_QTBL %#x, CP_MSG %#x",
++	    gmu_rd(g, GMU_CM3_ITCM_START), gmu_rd(g, GMU_CM3_ITCM_START + 4),
++	    gmu_rd(g, GMU_CM3_ITCM_START + 8), gmu_rd(g, GMU_CM3_ITCM_START + 12),
++	    gmu_rd(g, GMU_CM3_DTCM_START), gmu_rd(g, GMU_CM3_DTCM_START + 4),
++	    gmu_rd(g, GMU_HFI_QTBL_ADDR), gmu_rd(g, GMU_PWR_COL_CP_MSG));
++	sgpu_log("gmu: AO int status %#x, RSCC ack %#x, cx-gmu cbcr %#x, gmu rcg %#x/%#x",
++	    gmu_rd(g, GMU_AO_HOST_INTERRUPT_STATUS), gmu_rd(g, GMU_RSCC_CONTROL_ACK),
++	    sgpu_rd(g->gpucc, GPUCC_CX_GMU_CBCR_DUMP), sgpu_rd(g->gpucc, GPUCC_GMU_CMD_RCGR_DUMP),
++	    sgpu_rd(g->gpucc, GPUCC_GMU_CMD_RCGR_DUMP + 4));
++	if (!sgpu_smmu_check_faults(g)) {
++		sgpu_log("gmu: no SMMU faults recorded");
++	}
++}
++
 +static int
 +gmu_fw_start(struct sgpu *g, struct sgpu_gmu *m)
 +{
@@ -2341,6 +2365,7 @@
 +	sgpu_wmb();
 +	gmu_wr(g, GMU_CM3_SYSRESET, 0);
 +	if (sgpu_poll(g->gmu, GMU_CM3_FW_INIT_RESULT, mask, want, 10000)) {
++		gmu_dump(g);
 +		return sgpu_fail(g, -60, "gmu: firmware init timed out (INIT_RESULT %#x, "
 +		           "FW_BUSY %#x, AO status %#x)", gmu_rd(g, GMU_CM3_FW_INIT_RESULT),
 +		           gmu_rd(g, GMU_CM3_FW_BUSY), gmu_rd(g, GMU_AO_HOST_INTERRUPT_STATUS));
