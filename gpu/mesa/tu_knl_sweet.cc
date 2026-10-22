@@ -27,6 +27,8 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "util/os_time.h"
@@ -49,6 +51,74 @@ static inline sgpu_dev *
 sweet_dev(struct tu_device *dev)
 {
    return (sgpu_dev *) dev->physical_device->sweet_dev;
+}
+
+/*
+ * SWEET_BO_STATS=N: every N allocations, the live buffers by the name
+ * turnip gives them, to stderr. Each allocation is a kernel call that
+ * wires, zeroes and maps memory, so who makes them matters.
+ */
+struct sweet_bo_stat {
+   char name[40];
+   uint32_t live, made;
+   uint64_t bytes;
+};
+static struct sweet_bo_stat sweet_stats[32];
+static pthread_mutex_t sweet_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t sweet_stats_every = UINT32_MAX, sweet_stats_allocs;
+
+static uint8_t
+sweet_stat_add(const char *name, uint64_t size)
+{
+   static pthread_once_t once = PTHREAD_ONCE_INIT;
+   pthread_once(&once, [] {
+      const char *e = getenv("SWEET_BO_STATS");
+      if (e && atoi(e) > 0)
+         sweet_stats_every = (uint32_t) atoi(e);
+   });
+   if (sweet_stats_every == UINT32_MAX)
+      return 0;
+   if (!name)
+      name = "?";
+   pthread_mutex_lock(&sweet_stats_lock);
+   unsigned i = 1;
+   for (; i < ARRAY_SIZE(sweet_stats) && sweet_stats[i].name[0]; i++) {
+      if (!strncmp(sweet_stats[i].name, name, sizeof(sweet_stats[i].name) - 1))
+         break;
+   }
+   if (i == ARRAY_SIZE(sweet_stats))
+      i = 0; /* "other" */
+   else if (!sweet_stats[i].name[0])
+      snprintf(sweet_stats[i].name, sizeof(sweet_stats[i].name), "%s", name);
+   sweet_stats[i].live++;
+   sweet_stats[i].made++;
+   sweet_stats[i].bytes += size;
+   if (++sweet_stats_allocs % sweet_stats_every == 0) {
+      char line[1024];
+      int len = snprintf(line, sizeof(line), "sweet: %u BO allocations; live (made):",
+                         sweet_stats_allocs);
+      for (unsigned j = 0; j < ARRAY_SIZE(sweet_stats) && len < (int) sizeof(line); j++) {
+         if (!sweet_stats[j].made)
+            continue;
+         len += snprintf(line + len, sizeof(line) - len, " [%s] %u (%u) %" PRIu64 "K",
+                         j ? sweet_stats[j].name : "other", sweet_stats[j].live,
+                         sweet_stats[j].made, sweet_stats[j].bytes >> 10);
+      }
+      fprintf(stderr, "%s\n", line);
+   }
+   pthread_mutex_unlock(&sweet_stats_lock);
+   return (uint8_t) i;
+}
+
+static void
+sweet_stat_del(uint8_t i, uint64_t size)
+{
+   if (sweet_stats_every == UINT32_MAX)
+      return;
+   pthread_mutex_lock(&sweet_stats_lock);
+   sweet_stats[i].live--;
+   sweet_stats[i].bytes -= size;
+   pthread_mutex_unlock(&sweet_stats_lock);
 }
 
 static VkResult
@@ -141,6 +211,7 @@ sweet_bo_init(struct tu_device *dev,
       .name = tu_debug_bos_add(dev, req.alloc_size, name),
       .refcnt = 1,
       .sweet_map = (void *) (uintptr_t) req.cpu_addr,
+      .sweet_stat = sweet_stat_add(name, req.alloc_size),
       .base = base,
    };
    /* the CPU mapping belongs to the kernel object: tu_bo_unmap must not
@@ -197,6 +268,7 @@ sweet_bo_init_userptr(struct tu_device *dev, struct tu_bo **out_bo,
       .name = tu_debug_bos_add(dev, size, "host pointer"),
       .refcnt = 1,
       .sweet_map = ptr,
+      .sweet_stat = sweet_stat_add("host pointer", size),
    };
    bo->never_unmap = true;      /* the caller's mapping, not ours */
 
@@ -244,6 +316,7 @@ sweet_bo_finish(struct tu_device *dev, struct tu_bo *bo)
    TU_RMV(bo_destroy, dev, bo);
 
    uint32_t id = bo->gem_handle;
+   sweet_stat_del(bo->sweet_stat, bo->size);
 
    /* Tell sparse array that entry is free before the id can be reused */
    memset(bo, 0, sizeof(*bo));
