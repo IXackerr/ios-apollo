@@ -111,6 +111,35 @@ only after the read-only boot works.
 6. **Touch driver** (NT36675 over GENI SPI), then the WLED backlight for
    display power, then the USB live log with the 7nm PHY.
 
+## Backlight, battery, boot menu (2026-10-22)
+
+- **Backlight:** the LCD is lit by the PM8150L WLED5 (SPMI SID 5,
+  0xd800/0xd900), which ABL leaves configured. Patch 0090 adds PMIC writes
+  through the arbiter's per-APID channel page (0x0c600000 + 0x10000 ×
+  APID), whitelisted to the module enable (0xd846) and the MOD_A
+  brightness and latch (0xd953/0xd954/0xd965), on peripherals owned by
+  this EE only. The framebuffer switches the WLED off after its fade to
+  black and back on with the display. An `AppleARMBacklight` service
+  (`backlight-control`, `IODisplayParameters` with raw and milli-nit
+  ranges) receives `brightness-nits` from CoreBrightness, so the iOS
+  brightness slider works. Patches 0091–0093: a channel's STATUS still
+  reads the previous command's DONE right after a new one is posted, so
+  writes wait and retry; switching is serialized with display power; a
+  brightness of 0, which CoreBrightness sends at boot before it sees the
+  display on, is ignored.
+- **Battery:** the PM8150B fuel gauge (FG gen4, SID 2) gives the
+  monotonic SOC, voltage and current; the smb5 charger has the same
+  register layout as sweet's PM6150. Charging is reported only while
+  current flows into the battery (a computer's USB port may not cover the
+  load without the external charge pump). USB plug and unplug are seen
+  within 2 s.
+- **Boot menu:** with a payload in the ramdisk the shim shows a menu for
+  3 s: iOS, iOS with the kernel log, a safe mode (one CPU, stock clocks,
+  no touch), reboot to fastboot or recovery, power off. Keys are read
+  from the PMIC. Flashed to the `boot` partition, the phone starts iOS on
+  its own; fastboot (power + volume down) and recovery (power + volume
+  up) are ABL's and stay available.
+
 ## Boot time (2026-10-22)
 
 Measured with patch 0087 (time since boot on every `exec` line, UFS totals
