@@ -28,6 +28,7 @@
 #include <os/lock.h>
 #include "sweetmetal.h"
 #include "sweetgpu.h"
+#include "profile.h"
 
 /* The iOS SDK ships IOKit.framework without headers. */
 typedef mach_port_t io_object_t;
@@ -1244,6 +1245,7 @@ countCompleted(void *ctx)
 {
 	/* every buffer reports its completion: smstats, its queue slot, and
 	 * what waits for it to be done (smSeqDone) */
+	smprof_note_thread();
 	NSArray<SweetSurfaceImage *> *written = _written;
 	_written = nil;
 	uint64_t encode = mach_absolute_time() - _made;
@@ -1569,6 +1571,7 @@ processAllowed(void)
 	}
 	_noSurfaceImages = getenv("SWEETMETAL_COPY_SURFACES") != NULL;
 	smLinearOnly = getenv("SWEETMETAL_LINEAR_SURFACES") != NULL;
+	smprof_start();
 	SMLOG(@"device %@ ready in %s", _name, getprogname());
 	return self;
 }

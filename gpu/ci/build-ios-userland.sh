@@ -74,7 +74,8 @@ sed -e 's|<string>SweetMetal</string>|<string>SweetMetalImpl</string>|' \
 $CC -bundle -fobjc-arc -fmodules -DSweetMetalDevice=SweetMetalDeviceImpl \
   -I"$ROOT/userland/sweetmetal/core/include" \
   -I"$ROOT/userland/libsweetgpu" -I"$ROOT/kernel" -o "$I/SweetMetalImpl" \
-  "$ROOT/userland/sweetmetal/bundle/SweetMetal.m" "$WORK/sweetgpu.o" \
+  "$ROOT/userland/sweetmetal/bundle/SweetMetal.m" "$ROOT/userland/sweetmetal/bundle/profile.c" \
+  "$WORK/sweetgpu.o" \
   -L"$OUT" -lsweetmetal_core -framework Foundation -framework Metal -framework IOSurface \
   '-Wl,-U,_OBJC_CLASS_$__MTLDevice' '-Wl,-U,_OBJC_METACLASS_$__MTLDevice' \
   -framework IOKit -framework CoreFoundation -Wl,-rpath,@loader_path
