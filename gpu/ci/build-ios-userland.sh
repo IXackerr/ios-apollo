@@ -27,6 +27,10 @@ python3 -m venv "$WORK/venv"
 . "$WORK/venv/bin/activate"
 pip install -q meson ninja mako pyyaml packaging
 command -v glslangValidator >/dev/null || brew install glslang
+# Xcode's bison 2.3 is too old for ir3_parser.y
+brew list bison >/dev/null 2>&1 || brew install bison
+brew list flex >/dev/null 2>&1 || brew install flex
+export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
 meson setup "$WORK/mesa-build" "$WORK/mesa" --cross-file "$ROOT/mesa/ios-arm64.ini" \
   --buildtype=release -Db_ndebug=true \
   -Dvulkan-drivers=freedreno -Dfreedreno-kmds=sweet -Dgallium-drivers= -Dplatforms= \
