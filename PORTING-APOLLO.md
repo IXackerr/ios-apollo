@@ -221,6 +221,10 @@ Results on the phone (kernel and bare-metal shim agree):
   "Turnip Adreno (TM) 650, Vulkan 1.3", 157 device extensions, memory,
   events set by the GPU, 300 submissions with fences. It needs user-space
   reads of CTR_EL0 (patch 0096, SCTLR_EL1.UCT) for Mesa's cache flushes.
+- Shaders: gpu/userland/vkcompute compiles a compute shader (ir3, 8 ms) and
+  runs it over 1M elements; every result matches the CPU. 256 dependent
+  integer multiply-adds per element take 17 ms (about 15.7 G per second)
+  at the lowest GPU level.
 - XNU's `pmap_sync_page_attributes_phys` shifted the page number in 32
   bits; on apollo, whose kernel RAM is all above 4 GiB, faulting in a
   write-combined user mapping panicked (patch 0095).
