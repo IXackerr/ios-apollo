@@ -43,6 +43,7 @@ enum sgpu_selector {
 	SGPU_SEL_GET_STATUS     = 11,   /* -> sgpu_status (bring-up diagnostics) */
 	SGPU_SEL_IMPORT_USER    = 12,   /* sgpu_import_user -> same (v2) */
 	SGPU_SEL_SURFACE_BUSY   = 13,   /* sgpu_surface_busy */
+	SGPU_SEL_SURFACE_USE    = 14,   /* sgpu_surface_busy: GPU work reading it */
 	SGPU_SEL_COUNT
 };
 
@@ -134,10 +135,12 @@ struct sgpu_import_user {
 };
 
 /*
- * GPU work that writes an IOSurface: +1 when submitted, -1 once complete.
- * The framebuffer shows no surface the GPU is still rendering (a swap
- * names the surface as soon as the work is submitted, as on Apple's GPUs,
- * whose display waits for it).
+ * GPU work that writes (SURFACE_BUSY) or reads (SURFACE_USE) an IOSurface:
+ * +1 when submitted, -1 once complete. Either holds the surface in use for
+ * its clients (IOSurfaceIsInUse), as Apple's GPU driver does; and the
+ * framebuffer shows no surface the GPU is still rendering (a swap names the
+ * surface as soon as the work is submitted, as on Apple's GPUs, whose
+ * display waits for it).
  */
 struct sgpu_surface_busy {
 	uint32_t surface_id;

@@ -656,8 +656,11 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 	uint64_t _seq;                  /* smSeqTake, until its completion takes it */
 	uint32_t _surfaces[8];          /* IOSurfaces it renders into */
 	unsigned _surfaceCount;
+	uint32_t _reads[32];            /* IOSurfaces its commands read */
+	unsigned _readCount;
 }
 @property (copy, atomic) NSString *label;
+- (void)readsTexture:(id<MTLTexture>)t;
 @end
 
 @interface SweetMetalRenderEncoder : SMBase <MTLRenderCommandEncoder> {
@@ -703,6 +706,7 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 - (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i
 {
 	SMCHECK(smtl_render_set_vertex_texture(_e, t ? ((SweetMetalTexture *)t)->_t : NULL, (uint32_t)i));
+	[_cb readsTexture:t];
 }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i
 {
@@ -788,6 +792,7 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i
 {
 	SMCHECK(smtl_render_set_fragment_texture(_e, t ? ((SweetMetalTexture *)t)->_t : NULL, (uint32_t)i));
+	[_cb readsTexture:t];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)p vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n
 {
@@ -810,6 +815,7 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 @interface SweetMetalBlitEncoder : SMBase <MTLBlitCommandEncoder> {
 @public
 	smtl_blit_encoder *_e;
+	SweetMetalCommandBuffer *_cb;
 }
 @property (copy, atomic) NSString *label;
 @end
@@ -828,6 +834,7 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 {
 	SMCHECK(smtl_blit_copy_texture_to_buffer(_e, ((SweetMetalTexture *)src)->_t, slice, level, origin.x,
 	    origin.y, size.width, size.height, ((SweetMetalBuffer *)dst)->_b, off, bpr, bpi));
+	[_cb readsTexture:src];
 }
 - (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl
     sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)dst
@@ -839,6 +846,8 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 	    ((SweetMetalTexture *)dst)->_t, ds, dl, d) != 0) {
 		SMError(@"copyFromTexture:toTexture:");
 	}
+	[_cb readsTexture:src];
+	[_cb readsTexture:dst];
 }
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t
 {
@@ -900,6 +909,24 @@ runHandler(void *ctx)
 - (id<MTLCommandQueue>)commandQueue { return _queue; }
 - (id<MTLDevice>)device { return _queue.device; }
 - (MTLCommandBufferStatus)status { return (MTLCommandBufferStatus)smtl_cmdbuf_status(_c); }
+/* an IOSurface its commands read: held in use until it completes */
+- (void)readsTexture:(id<MTLTexture>)texture
+{
+	SweetMetalTexture *t = (SweetMetalTexture *)texture;
+	if (t == nil || t->_iosurface == NULL) {
+		return;
+	}
+	uint32_t sid = IOSurfaceGetID(t->_iosurface);
+	for (unsigned k = 0; k < _readCount; k++) {
+		if (_reads[k] == sid) {
+			return;
+		}
+	}
+	if (_readCount < 32) {
+		_reads[_readCount++] = sid;
+	}
+}
+
 static void
 smAttachment(struct smtl_attachment *to, MTLRenderPassAttachmentDescriptor *a)
 {
@@ -985,6 +1012,7 @@ smAttachment(struct smtl_attachment *to, MTLRenderPassAttachmentDescriptor *a)
 	}
 	SweetMetalBlitEncoder *enc = [SweetMetalBlitEncoder new];
 	enc->_e = e;
+	enc->_cb = self;
 	return enc;
 }
 - (void)addCompletedHandler:(MTLCommandBufferHandler)h
@@ -1006,6 +1034,8 @@ struct smDone {
 	int given;              /* the slot and seq went back already */
 	uint32_t surfaces[8];   /* IOSurfaces marked busy for the framebuffer */
 	unsigned surfaceCount;
+	uint32_t reads[32];     /* IOSurfaces held in use while it reads them */
+	unsigned readCount;
 };
 
 static void
@@ -1019,6 +1049,9 @@ smGiveBack(struct smDone *d)
 	}
 	for (unsigned i = 0; i < d->surfaceCount; i++) {
 		sgpu_surface_busy(smGpu, d->surfaces[i], -1);
+	}
+	for (unsigned i = 0; i < d->readCount; i++) {
+		sgpu_surface_use(smGpu, d->reads[i], -1);
 	}
 	smSeqDone(d->seq);
 }
@@ -1060,6 +1093,12 @@ countCompleted(void *ctx)
 		for (unsigned i = 0; smGpu != NULL && i < _surfaceCount; i++) {
 			if (sgpu_surface_busy(smGpu, _surfaces[i], 1) == 0) {
 				d->surfaces[d->surfaceCount++] = _surfaces[i];
+			}
+		}
+		/* and its clients do not draw into what it reads (IOSurfaceIsInUse) */
+		for (unsigned i = 0; smGpu != NULL && i < _readCount; i++) {
+			if (sgpu_surface_use(smGpu, _reads[i], 1) == 0) {
+				d->reads[d->readCount++] = _reads[i];
 			}
 		}
 	}

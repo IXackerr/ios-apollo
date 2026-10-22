@@ -39,6 +39,8 @@ int  sgpu_import_surface(sgpu_dev *dev, struct sgpu_import_surface *req);
 int  sgpu_import_user(sgpu_dev *dev, struct sgpu_import_user *req);
 /* GPU work writing IOSurface surface_id submitted (+1) or complete (-1) */
 int  sgpu_surface_busy(sgpu_dev *dev, uint32_t surface_id, int32_t delta);
+/* GPU work reading IOSurface surface_id submitted (+1) or complete (-1) */
+int  sgpu_surface_use(sgpu_dev *dev, uint32_t surface_id, int32_t delta);
 
 int  sgpu_submit(sgpu_dev *dev, uint32_t ctx_id, const struct sgpu_ib *ibs,
     uint32_t num_ibs, uint32_t flags, uint32_t *timestamp);

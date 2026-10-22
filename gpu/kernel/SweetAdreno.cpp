@@ -953,13 +953,17 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		}
 		break;
 	case SGPU_SEL_SURFACE_BUSY:
+	case SGPU_SEL_SURFACE_USE:
 		ret = struct_in(args, &u.busy, sizeof(u.busy));
 		if (ret == kIOReturnSuccess) {
 			SweetSurface *s = sweet_surface_copy(u.busy.surface_id);
 			if (s == NULL) {
 				ret = kIOReturnNotFound;
-			} else {
+			} else if (selector == SGPU_SEL_SURFACE_BUSY) {
 				sweet_surface_gpu_writes(s, u.busy.delta);
+				s->release();
+			} else {
+				sweet_surface_gpu_uses(s, u.busy.delta);
 				s->release();
 			}
 		}
