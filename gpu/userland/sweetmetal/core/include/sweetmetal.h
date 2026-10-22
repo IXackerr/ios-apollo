@@ -213,6 +213,10 @@ int          smtl_cmdbuf_wait(smtl_cmdbuf *c, uint32_t timeout_ms);
 /* MTLCommandBufferStatus raw value */
 uint32_t     smtl_cmdbuf_status(const smtl_cmdbuf *c);
 void         smtl_cmdbuf_release(smtl_cmdbuf *c);
+/* another handle, released with smtl_cmdbuf_release */
+smtl_cmdbuf *smtl_cmdbuf_retain(const smtl_cmdbuf *c);
+/* GPUStartTime / GPUEndTime in seconds, once completed */
+int smtl_cmdbuf_gpu_times(const smtl_cmdbuf *c, double *start, double *end);
 
 /* ---- compute ---- */
 smtl_compute_encoder *smtl_cmdbuf_compute_encoder(smtl_cmdbuf *c);

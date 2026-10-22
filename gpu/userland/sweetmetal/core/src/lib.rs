@@ -925,6 +925,36 @@ pub unsafe extern "C" fn smtl_queue_command_buffer(q: *mut CommandQueue) -> *mut
 }
 release!(smtl_cmdbuf_release, CommandBuffer);
 
+/// Another handle of the command buffer, released with `smtl_cmdbuf_release`: for its times
+/// once it completed, after its owner let go.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_cmdbuf_retain(c: *const CommandBuffer) -> *mut CommandBuffer {
+    match c.as_ref() {
+        Some(c) => Box::into_raw(Box::new(c.clone())),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// `GPUStartTime` and `GPUEndTime`, in seconds.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_cmdbuf_gpu_times(
+    c: *const CommandBuffer,
+    start: *mut f64,
+    end: *mut f64,
+) -> i32 {
+    let (Some(c), Some(start), Some(end)) = (c.as_ref(), start.as_mut(), end.as_mut()) else {
+        return -1;
+    };
+    match (c.gpu_start_time(), c.gpu_end_time()) {
+        (Ok(s), Ok(e)) => {
+            *start = s;
+            *end = e;
+            0
+        }
+        _ => -1,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn smtl_cmdbuf_commit(c: *mut CommandBuffer) -> i32 {
     let c = handle!(c, -1);

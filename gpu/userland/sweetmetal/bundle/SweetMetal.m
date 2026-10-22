@@ -119,6 +119,7 @@ smcount(Class c, int delta)
 static unsigned smCompleted;
 static sgpu_dev *smGpu;         /* the device's kernel client, for SURFACE_BUSY */
 static uint64_t smLatencySum, smLatencyMax;    /* commit to completion, mach ticks */
+static uint64_t smGpuSum, smGpuMax, smGpuCount; /* GPUEndTime - GPUStartTime, ns */
 
 /*
  * Which command buffers may still run, for what outlives the textures they
@@ -209,9 +210,14 @@ smstats(void)
 	uint64_t sum = __atomic_exchange_n(&smLatencySum, 0, __ATOMIC_RELAXED);
 	uint64_t max = __atomic_exchange_n(&smLatencyMax, 0, __ATOMIC_RELAXED);
 	double ms = (double)tb.numer / tb.denom / 1e6;
+	uint64_t gsum = __atomic_exchange_n(&smGpuSum, 0, __ATOMIC_RELAXED);
+	uint64_t gmax = __atomic_exchange_n(&smGpuMax, 0, __ATOMIC_RELAXED);
+	uint64_t gn = __atomic_exchange_n(&smGpuCount, 0, __ATOMIC_RELAXED);
 	NSMutableString *line = [NSMutableString stringWithFormat:
-	    @"%u commits (%.1f/s), %u completed, latency %.1f ms (max %.1f), live:", commits,
-	    per_s, done, done > done_before ? sum * ms / (done - done_before) : 0, max * ms];
+	    @"%u commits (%.1f/s), %u completed, latency %.1f ms (max %.1f), GPU %.1f ms "
+	    "(max %.1f), live:", commits, per_s, done,
+	    done > done_before ? sum * ms / (done - done_before) : 0, max * ms,
+	    gn ? gsum / 1e6 / gn : 0, gmax / 1e6];
 	done_before = done;
 	@synchronized ([SMBase class]) {
 		for (NSString *k in [smLive.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
@@ -1036,6 +1042,7 @@ struct smDone {
 	unsigned surfaceCount;
 	uint32_t reads[32];     /* IOSurfaces held in use while it reads them */
 	unsigned readCount;
+	smtl_cmdbuf *cb;        /* for its GPU times */
 };
 
 static void
@@ -1066,6 +1073,19 @@ countCompleted(void *ctx)
 	while (latency > max && !__atomic_compare_exchange_n(&smLatencyMax, &max, latency, false,
 	    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
 	}
+	double start, end;
+	if (d->cb != NULL && smtl_cmdbuf_gpu_times(d->cb, &start, &end) == 0 && end >= start) {
+		uint64_t gpu = (uint64_t)((end - start) * 1e9);
+		__atomic_fetch_add(&smGpuSum, gpu, __ATOMIC_RELAXED);
+		__atomic_fetch_add(&smGpuCount, 1, __ATOMIC_RELAXED);
+		uint64_t gmax = __atomic_load_n(&smGpuMax, __ATOMIC_RELAXED);
+		while (gpu > gmax && !__atomic_compare_exchange_n(&smGpuMax, &gmax, gpu, false,
+		    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+		}
+	}
+	if (d->cb != NULL) {
+		smtl_cmdbuf_release(d->cb);
+	}
 	__atomic_fetch_add(&smCompleted, 1, __ATOMIC_RELAXED);
 	smGiveBack(d);
 	free(d);
@@ -1089,6 +1109,7 @@ countCompleted(void *ctx)
 	} else {
 		_slot = nil;
 		_seq = 0;
+		d->cb = smtl_cmdbuf_retain(_c);
 		/* the framebuffer shows these surfaces only once this completes */
 		for (unsigned i = 0; smGpu != NULL && i < _surfaceCount; i++) {
 			if (sgpu_surface_busy(smGpu, _surfaces[i], 1) == 0) {

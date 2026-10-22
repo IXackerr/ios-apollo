@@ -1,0 +1,11 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -305,6 +305,8 @@
+ 	 */
+ 	uint64_t hz = (uint64_t)frames * 1000000000ull / ns;
+ 	fFrames = (uint32_t)((hz + 30) / 60);
++	/* sweetfb_frames=1: a tick every panel frame (the panel's own rate) */
++	PE_parse_boot_argn("sweetfb_frames", &fFrames, sizeof(fFrames));
+ 	if (fFrames == 0) {
+ 		fFrames = 1;
+ 	}
