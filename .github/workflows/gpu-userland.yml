@@ -25,12 +25,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Kernel driver host test (register model)
         run: make -C gpu/hosttest check
+      # The runner's clang targets arm64 as it is: a cross gcc from apt took
+      # 20 minutes to download on some runs.
       - name: arm64 compile of the driver C (inline asm, no XNU headers needed)
         run: |
-          sudo apt-get install -y -q gcc-aarch64-linux-gnu
           for f in gpu/kernel/sweet_gpu_*.c; do
             case $f in *os_xnu.c) continue;; esac
-            aarch64-linux-gnu-gcc -std=gnu11 -O2 -Wall -Werror -Wno-unused-parameter \
+            clang --target=aarch64-linux-gnu -std=gnu11 -O2 -Wall -Werror -Wno-unused-parameter \
               -ffreestanding -mgeneral-regs-only -DARM64_BOARD_CONFIG_SWEET -c "$f" -o /dev/null
           done
   ios:
