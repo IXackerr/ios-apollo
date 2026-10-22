@@ -8,7 +8,7 @@ address comes from the sweet live FDT. Usage:
   mkadt.py OUT.adt --board apollo --phys-base HEX --mem-size HEX  # Mi 10T (Pro)
            [--touch-fw novatek_nt36675_j3s_fw01.bin] [--gpu-fw DIR]
            [--run PROGRAM [--run-args "ARGS"] [--run-delay SECONDS] [--run-file NAME=FILE]...]
-           [--metal-file NAME=FILE]...
+           [--metal-file NAME=FILE]... [--display-gamut sRGB|P3]
 
 --gpu-fw DIR adds /sweet-gpu with the phone's own a650_sqe.fw, a650_gmu.bin
 and a650_zap (.mbn, or .mdt + .bNN which are joined like tools/mkzap.py)
@@ -27,6 +27,8 @@ Vulkan driver.
 --metal-file NAME=FILE (repeatable) adds /sweet-metal: the Metal driver
 the SweetMetal loader on the root unpacks (gpu/userland/sweetmetal/loader),
 the same encoding plus an "id" that changes with the files.
+
+--display-gamut overrides /product artwork-display-gamut (D22AP: P3).
 
 For apollo the RAM window has no default on purpose: take it from the
 phone's live FDT with tools/fdtmem.py (see PORTING-APOLLO.md). The touch
@@ -187,7 +189,7 @@ def gpu_node(fwdir, ph):
 
 
 def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, mem_size=None,
-          touch_fw=None, gpu_fw=None, run=None, metal=None):
+          touch_fw=None, gpu_fw=None, run=None, metal=None, display_gamut=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     b = BOARDS[board]
     if phys_base is None or mem_size is None:
@@ -382,6 +384,12 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
         ] + ([('firmware', touch_fw)] if touch_fw else [])))
 
     product_props = d22ap_product()
+    if product_props and display_gamut:
+        # MobileGestalt's HasExtendedColorDisplay is ArtworkDisplayGamut == P3,
+        # and with it CoreAnimation renders into two-plane 10-bit (b3a8)
+        # framebuffers; "sRGB" keeps them BGRA8, which the display shows.
+        product_props = [(k, cstr(display_gamut) if k == 'artwork-display-gamut' else v)
+                         for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
@@ -432,7 +440,8 @@ if __name__ == '__main__':
                                               _opt('--run-args', default='').split(),
                                               _opt('--run-delay', int, 0),
                                               run_files())),
-                 metal=run_files('--metal-file'))
+                 metal=run_files('--metal-file'),
+                 display_gamut=_opt('--display-gamut'))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
