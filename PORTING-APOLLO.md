@@ -194,6 +194,27 @@ boot.img kernel; it is not part of this repository.
 - Reports: 10 fingers, 65-byte point buffer at `EVENT_BUF_ADDR`; feed
   `sweet_hid_touch()` like the Goodix path (scale to the presented 1125×2436).
 
+## GPU (Adreno 650)
+
+Driver: `gpu/kernel` (kernel patch 0094), staged with `sweetgpu=N`.
+Results on the phone (kernel and bare-metal shim agree):
+
+- All bring-up stages pass: clocks, SMMU, GMU (firmware 2.1.8, HFI),
+  GX power, CP with the zap shader authenticated by TrustZone (PAS 13),
+  and a selftest whose ring and IB writes land and whose timestamp retires.
+- SMMU: MMU-500 r2p4, 5 context banks, 6 SMRs, no stage 2. The hypervisor
+  emulates the global space and keeps `SCTLR.ASIDPNE` clear in the banks.
+  GPU SID 0/0x401 and GMU SID 5/0x400 get SME0/CB0 and SME1/CB1.
+- The vendor `a650_sqe.fw` is version 0x93, older than the 0x95 the driver
+  requires. The linux-firmware `qcom/a650_sqe.fw` (0x112) works.
+- Memory the GPU, GMU and SMMU read must really be non-cacheable for the
+  CPU. A write-combined `IOMemoryMap` of a wired kernel buffer is not; the
+  GMU then faults on its page tables. The driver maps the pages again with
+  `ml_io_map_unmappable(..., VM_WIMG_WCOMB)` (not `ml_io_map_wcomb`: its
+  8 MiB submap cannot hold the GMU's 16 MiB code space).
+- `shim/build.sh GPUFW=dir` runs the same driver bare metal and leaves its
+  log in the recovery's pstore console, about a minute per try.
+
 ## Needed from the phone
 
 - `dmesg` from Android.
