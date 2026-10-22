@@ -7,43 +7,15 @@
 #include <stdint.h>
 #include "console.h"
 #include "pmic.h"
+#include "spmi.h"
 
 #define ARB_CORE	0x0c440000UL
 #define ARB_CNFG	0x0c40a000UL
-#define ARB_OBS		0x0e600000UL
 #define ARB_CHNLS	0x0c600000UL
 #define NO_APID		0xffff
 
 static inline uint32_t rd(uintptr_t a) { return *(volatile uint32_t *)a; }
 static inline void wr(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
-
-static unsigned apids;
-
-static unsigned find_apid(unsigned ppid)
-{
-	for (unsigned i = 0; i < apids; i++) {
-		uint32_t map = rd(ARB_CORE + 0x900 + 4 * i);
-		if (map && ((map >> 8) & 0xfff) == ppid)
-			return i;
-	}
-	return NO_APID;
-}
-
-/* One-byte EXT_READL through the observer; returns -1 on any failure. */
-static int spmi_rd(unsigned sid, unsigned addr)
-{
-	unsigned apid = find_apid(sid << 8 | addr >> 8);
-	if (apid == NO_APID)
-		return -1;
-	uintptr_t ch = ARB_OBS + 0x80 * apid;
-	wr(ch, 1u << 27 | (addr & 0xff) << 4);
-	for (int i = 0; i < 100000; i++) {
-		uint32_t st = rd(ch + 0x08);
-		if (st & 1)
-			return st & 0x0e ? -1 : (int)(rd(ch + 0x18) & 0xff);
-	}
-	return -1;
-}
 
 /*
  * One-byte EXT_WRITEL on the APID's channel page. Only used to write a
@@ -51,7 +23,7 @@ static int spmi_rd(unsigned sid, unsigned addr)
  */
 static void write_back(unsigned sid, unsigned addr)
 {
-	unsigned apid = find_apid(sid << 8 | addr >> 8);
+	unsigned apid = spmi_apid(sid << 8 | addr >> 8);
 	int v = spmi_rd(sid, addr);
 	if (apid == NO_APID || v < 0) {
 		con_str("WRITE", "no apid / read failed");
@@ -80,7 +52,7 @@ static void pair(const char *label, unsigned sid, unsigned a, unsigned b)
 
 static void owner(const char *label, unsigned ppid)
 {
-	unsigned apid = find_apid(ppid);
+	unsigned apid = spmi_apid(ppid);
 	con_hex2(label, "apid=", apid, "owner=", apid == NO_APID ? 0xff : rd(ARB_CNFG + 0x700 + 4 * apid) & 7);
 }
 
@@ -98,11 +70,7 @@ void test_pmic(void)
 		0x1006, 0x1007, 0x100d, 0x110b, 0x1210, 0x1310, 0x1651, 0x1653,
 	};
 
-	uint32_t ver = rd(ARB_CORE);
-	apids = rd(ARB_CORE + 4) & 0x7ff;
-	if (apids > 512)
-		apids = 512;
-	con_hex2("SPMI", "arb=", ver, "apids=", apids);
+	con_hex2("SPMI", "arb=", rd(ARB_CORE), "apids=", rd(ARB_CORE + 4) & 0x7ff);
 	pair("REVID", 2, 0x0105, 0);
 	pair("REVID", 4, 0x0103, 0x0105);
 	owner("WLED d8", 0x5d8);

@@ -76,7 +76,17 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
-const char *loader_boot(uintptr_t dtb)
+int loader_has_payload(uintptr_t dtb)
+{
+	uint64_t rd_start, rd_end;
+
+	return fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) &&
+	       fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end) &&
+	       rd_end - rd_start >= sizeof(struct payload) &&
+	       magic_ok(((const struct payload *)rd_start)->magic);
+}
+
+const char *loader_boot(uintptr_t dtb, const char *prefix)
 {
 	uint64_t rd_start, rd_end;
 
@@ -131,8 +141,14 @@ const char *loader_boot(uintptr_t dtb)
 	ba->Video.v_depth = 32;
 	ba->deviceTreeP = adt_pa - pa_of_va_base;	/* xnu reads it with the MMU on: a VA */
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
-	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
-		ba->CommandLine[i] = p->cmdline[i];
+	int n = 0;
+	for (; prefix && *prefix && n < BOOT_LINE_LENGTH - 1; prefix++)
+		ba->CommandLine[n++] = *prefix;
+	if (n && n < BOOT_LINE_LENGTH - 1)
+		ba->CommandLine[n++] = ' ';
+	for (int i = 0; p->cmdline[i] && n < BOOT_LINE_LENGTH - 1; i++)
+		ba->CommandLine[n++] = p->cmdline[i];
+	ba->CommandLine[n] = 0;
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 

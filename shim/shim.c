@@ -14,6 +14,7 @@
 #include "touch.h"
 #include "cpufreq.h"
 #include "pmic.h"
+#include "menu.h"
 #include "board.h"
 
 #define GICR_SIZE		0x100000UL
@@ -35,6 +36,7 @@
 #define PSCI_CPU_OFF		0x84000002UL
 #define PSCI_CPU_ON		0xc4000003UL
 #define PSCI_MIGRATE_INFO_TYPE	0x84000006UL
+#define PSCI_SYSTEM_OFF		0x84000008UL
 #define PSCI_SYSTEM_RESET	0x84000009UL
 #define PSCI_FEATURES		0x8400000aUL
 #define PSCI_SYSTEM_SUSPEND	0xc400000eUL
@@ -109,6 +111,20 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 #if HAVE_PSHOLD
 	wr32(PSHOLD, 0);
 #endif
+	for (;;)
+		__asm__ volatile("wfe");
+}
+
+/* Reboot at once into the bootloader mode `reason` selects (IMEM magic). */
+static void __attribute__((noreturn)) reboot_now(uint32_t reason)
+{
+#if HAVE_IMEM_RESTART
+	wr32(IMEM_RESTART_REASON, reason);
+	__asm__ volatile("dsb sy" ::: "memory");
+#else
+	(void)reason;
+#endif
+	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
 	for (;;)
 		__asm__ volatile("wfe");
 }
@@ -543,12 +559,31 @@ void shim_main(uint64_t dtb)
 	diag_main();
 #endif
 
-	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
+	/* An xnu payload in the ramdisk means: boot menu, then boot it (MMU stays off). */
+	stage = "menu";
+	const char *prefix = "";
+	if (loader_has_payload(dtb)) {
+		enum menu_action a = boot_menu();
+		switch (a) {
+		case MENU_FASTBOOT:
+			reboot_now(RESTART_BOOTLOADER);
+		case MENU_RECOVERY:
+			reboot_now(RESTART_RECOVERY);
+		case MENU_POWER_OFF:
+			smc(PSCI_SYSTEM_OFF, 0, 0, 0);
+			reboot_now(RESTART_BOOTLOADER);
+		default:
+			prefix = menu_boot_args(a);
+			con_clear(0xff000000U);
+			break;
+		}
+	} else {
+		con_clear(RED);
+	}
 	stage = "loader";
-	con_clear(RED);
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	con_skip();
-	const char *why = loader_boot(dtb);
+	const char *why = loader_boot(dtb, prefix);
 	con_str("LOADER", why);
 	con_skip();
 

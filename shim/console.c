@@ -98,3 +98,36 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 	}
 	row++;
 }
+
+void con_rect(int x, int y, int w, int h, uint32_t color)
+{
+	for (int yy = y; yy < y + h && yy < con_h; yy++) {
+		volatile uint32_t *line = con_fb + yy * (con_stride / 4);
+		for (int xx = x; xx < x + w && xx < con_w; xx++)
+			line[xx] = color;
+	}
+}
+
+int con_text(int x, int y, int scale, const char *s, uint32_t fg, uint32_t bg)
+{
+	for (; *s; s++, x += 8 * scale) {
+		char ch = *s < 0x20 || *s > 0x7e ? '?' : *s;
+		const unsigned char *g = font8x16[ch - 0x20];
+		if (x + 8 * scale > con_w || y + 16 * scale > con_h)
+			break;
+		for (int gy = 0; gy < 16 * scale; gy++) {
+			volatile uint32_t *p = con_fb + (y + gy) * (con_stride / 4) + x;
+			for (int gx = 0; gx < 8 * scale; gx++)
+				p[gx] = (g[gy / scale] & (0x80 >> (gx / scale))) ? fg : bg;
+		}
+	}
+	return x;
+}
+
+int con_text_width(const char *s, int scale)
+{
+	int n = 0;
+	while (s[n])
+		n++;
+	return n * 8 * scale;
+}
