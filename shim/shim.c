@@ -13,6 +13,7 @@
 #include "ufs.h"
 #include "touch.h"
 #include "cpufreq.h"
+#include "pmic.h"
 #include "board.h"
 
 #define GICR_SIZE		0x100000UL
@@ -551,6 +552,15 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 
+#if defined(PMIC_PROBE)
+	stage = "pmic";
+	con_str("BOARD", BOARD_NAME);
+	test_pmic();
+	con_skip();
+	con_str("PMIC", "done, reset in ~2 min");
+	delay_ms(120000);
+	reset(20);
+#endif
 #if defined(CPUFREQ_PROBE)
 	stage = "cpufreq";
 	con_str("BOARD", BOARD_NAME);

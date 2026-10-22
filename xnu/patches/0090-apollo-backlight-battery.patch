@@ -1,0 +1,697 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
++bsd/dev/sweet_wled.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -1,16 +1,19 @@
+ /*
+- * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
+- * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+- * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+- * Init runs first from SweetPlatformExpert::start, before any driver that
+- * reads through it can match. Battery and RTC APIDs are disjoint from the
+- * existing keys' 008/4c1 APIDs.
++ * PMIC access through the SPMI arbiter v5 (adapted from input/sweet_keys.c).
++ * Reads use the observer (EXT_READL). Writes use the APID's channel page
++ * and are limited to a short list of backlight registers, each one only
++ * on a peripheral this execution environment owns. No interrupt clear,
++ * charger, regulator or fuel gauge writes. Init runs first from
++ * SweetPlatformExpert::start, before any driver that reads through it can
++ * match, and only when the ADT has a /spmi node (absent under QEMU).
++ * Battery, RTC and backlight APIDs are disjoint from the keys' 008/4c1/0c5.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
++#include <pexpert/device_tree.h>
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -18,9 +21,11 @@
+ #define SP_CORE_PA 0x0c440000u
+ #define SP_OBS_PA  0x0e600000u
+ #define SP_CFG_PA  0x0c40a000u
++#define SP_CHNL_PA 0x0c600000u	/* EE 0 channels, 0x10000 per APID */
+ #define SP_NO_APID 0xffffu
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
++static vm_offset_t sp_chnl[512];
+ static IOLock *sp_lock;
+ static unsigned sp_count;
+ static bool sp_attempted, sp_ready;
+@@ -52,6 +57,42 @@
+ 	return found;
+ }
+ 
++/*
++ * Charger and fuel gauge (SID 0 on sweet's PM6150, SID 2 on apollo's
++ * PM8150B), the PMIC RTC and apollo's WLED backlight (PM8150L, SID 5).
++ */
++static bool
++sp_readable(unsigned sid, unsigned peripheral)
++{
++	switch (sid) {
++	case 0:
++	case 2:
++		return (peripheral >= 0x10 && peripheral <= 0x13) || peripheral == 0x16 ||
++		       (peripheral >= 0x40 && peripheral <= 0x42) || peripheral == 0x48 ||
++		       (sid == 0 && peripheral == 0x60);
++	case 5:
++		return peripheral == 0xd8 || peripheral == 0xd9;
++	default:
++		return false;
++	}
++}
++
++/* WLED5 module enable, MOD_A brightness and its latch. */
++static bool
++sp_writable(unsigned sid, unsigned addr)
++{
++	static const uint16_t wled[] = { 0xd846, 0xd953, 0xd954, 0xd965 };
++	if (sid != 5) {
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(wled) / sizeof(wled[0]); i++) {
++		if (wled[i] == addr) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ int
+ sweet_spmi_init(void)
+ {
+@@ -59,6 +100,10 @@
+ 		return sp_ready ? 0 : -1;
+ 	}
+ 	sp_attempted = true;
++	DTEntry spmi;
++	if (SecureDTLookupEntry(NULL, "/spmi", &spmi) != kSuccess) {
++		return -1;
++	}
+ 	sp_lock = IOLockAlloc();
+ 	if (!sp_lock) {
+ 		return -1;
+@@ -67,31 +112,27 @@
+ 	sp_cfg = ml_io_map(SP_CFG_PA, 0x1000);
+ 	sp_obs = ml_io_map(SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
+ 	if (!sp_core || !sp_cfg || !sp_obs) {
+-		printf("SWEET BATTERY: SPMI mapping failed\n");
++		printf("SWEET SPMI: mapping failed\n");
+ 		return -1;
+ 	}
+ 	uint32_t arb_version = sp_rd(sp_core, 0);
+ 	sp_count = sp_rd(sp_core, 4) & 0x7ffu;
+ 	if (arb_version < 0x50000000u || arb_version >= 0x70000000u ||
+ 	    !sp_count || sp_count > 512) {
+-		printf("SWEET BATTERY: unsupported SPMI arb=%#x APIDs=%u\n",
++		printf("SWEET SPMI: unsupported arbiter %#x APIDs=%u\n",
+ 		    arb_version, sp_count);
+ 		return -1;
+ 	}
+ 	sp_ready = true;
+-	printf("SWEET BATTERY: SPMI arb=%#x APIDs=%u, observer reads only\n",
+-	    arb_version, sp_count);
++	printf("SWEET SPMI: arb=%#x APIDs=%u\n", arb_version, sp_count);
+ 	return 0;
+ }
+ 
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery and RTC blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {
++	if (!sp_ready || !out || addr > 0xffffu || !sp_readable(sid, peripheral)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -119,9 +160,48 @@
+ 		delay(1);
+ 	}
+ 	sp_poisoned[apid] = true;
+-	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
++	printf("SWEET SPMI: read timeout sid=%u addr=%#x APID=%u disabled\n",
+ 	    sid, addr, apid);
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++/* One-byte EXT_WRITEL on the APID's channel page; owner must be EE 0. */
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
++{
++	if (!sp_ready || addr > 0xffffu || !sp_writable(sid, addr)) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
++	if (apid == SP_NO_APID || sp_poisoned[apid] ||
++	    (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	if (!sp_chnl[apid]) {
++		sp_chnl[apid] = ml_io_map(SP_CHNL_PA + 0x10000u * apid, 0x1000);
++		if (!sp_chnl[apid]) {
++			IOLockUnlock(sp_lock);
++			return -1;
++		}
++	}
++	vm_offset_t ch = sp_chnl[apid];
++	*(volatile uint32_t *)(ch + 0x10u) = value;		/* WDATA0 */
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)ch = (addr & 0xffu) << 4;	/* EXT_WRITEL, BC=0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(ch, 0x08u);
++		if (status & 1u) {
++			IOLockUnlock(sp_lock);
++			return (status & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	printf("SWEET SPMI: write timeout sid=%u addr=%#x APID=%u disabled\n", sid, addr, apid);
++	IOLockUnlock(sp_lock);
++	return -1;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -1,4 +1,4 @@
+-/* Shared C/C++ interface. Init once, on the SweetBattery start thread. */
++/* Shared C/C++ interface. Init once, from SweetPlatformExpert::start. */
+ #ifndef SWEET_BATTERY_SPMI_H
+ #define SWEET_BATTERY_SPMI_H
+ #include <stdint.h>
+@@ -8,6 +8,8 @@
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* Thread context only; backlight registers only; 0 success, -1 failure. */
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ #ifdef __cplusplus
+ }
+ #endif
+--- /dev/null
++++ b/bsd/dev/sweet_wled.c
+@@ -0,0 +1,94 @@
++/*
++ * apollo LCD backlight: WLED5 in PM8150L (SPMI SID 5, ctrl 0xd800, sink
++ * 0xd900). The bootloader has already set the strings, currents, OVP and
++ * switching frequency for its splash screen; this file only switches the
++ * module and sets the 12-bit MOD_A brightness. On sweet (AMOLED) there is
++ * no WLED at SID 5 and every call is a no-op.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include "sweet_spmi.h"
++
++#define WLED_SID		5
++#define WLED_TYPE		0xd804u
++#define WLED_SUBTYPE		0xd805u
++#define WLED_MOD_ENABLE		0xd846u
++#define WLED_MOD_EN		0x80u
++#define WLED_MOD_A_BRT_LSB	0xd953u
++#define WLED_MOD_A_BRT_MSB	0xd954u
++#define WLED_MOD_SYNC		0xd965u
++#define WLED_MOD_SYNC_A		0x01u
++#define WLED_MAX		4095u
++
++bool sweet_wled_present(void);
++void sweet_wled_power(bool on);
++void sweet_wled_brightness(unsigned level);
++unsigned sweet_wled_get_brightness(void);
++
++static int wled_state = -1;	/* -1 unknown, 0 absent, 1 present */
++
++bool
++sweet_wled_present(void)
++{
++	uint8_t type, subtype;
++
++	if (wled_state < 0) {
++		wled_state = sweet_spmi_init() == 0 &&
++		    !sweet_spmi_read(WLED_SID, WLED_TYPE, &type) && type == 0x17 &&
++		    !sweet_spmi_read(WLED_SID, WLED_SUBTYPE, &subtype) && subtype == 0x12;
++		if (wled_state) {
++			printf("SWEET WLED: PM8150L WLED5, brightness %u of %u\n",
++			    sweet_wled_get_brightness(), WLED_MAX);
++		}
++	}
++	return wled_state == 1;
++}
++
++void
++sweet_wled_power(bool on)
++{
++	uint8_t v;
++
++	if (!sweet_wled_present() || sweet_spmi_read(WLED_SID, WLED_MOD_ENABLE, &v)) {
++		return;
++	}
++	uint8_t want = on ? (v | WLED_MOD_EN) : (v & ~WLED_MOD_EN);
++	if (want != v && sweet_spmi_write(WLED_SID, WLED_MOD_ENABLE, want) == 0 && on) {
++		delay(10000);	/* soft start */
++	}
++}
++
++/* 0..4095; the hardware's lowest usable non-zero level is 4. */
++void
++sweet_wled_brightness(unsigned level)
++{
++	if (!sweet_wled_present()) {
++		return;
++	}
++	if (level > WLED_MAX) {
++		level = WLED_MAX;
++	} else if (level && level < 4) {
++		level = 4;
++	}
++	if (sweet_spmi_write(WLED_SID, WLED_MOD_A_BRT_LSB, level & 0xff) ||
++	    sweet_spmi_write(WLED_SID, WLED_MOD_A_BRT_MSB, (level >> 8) & 0x0f) ||
++	    sweet_spmi_write(WLED_SID, WLED_MOD_SYNC, 0) ||
++	    sweet_spmi_write(WLED_SID, WLED_MOD_SYNC, WLED_MOD_SYNC_A)) {
++		printf("SWEET WLED: brightness %u not applied\n", level);
++	}
++}
++
++unsigned
++sweet_wled_get_brightness(void)
++{
++	uint8_t lo, hi;
++
++	if (sweet_spmi_read(WLED_SID, WLED_MOD_A_BRT_LSB, &lo) ||
++	    sweet_spmi_read(WLED_SID, WLED_MOD_A_BRT_MSB, &hi)) {
++		return 0;
++	}
++	return (unsigned)lo | (unsigned)(hi & 0x0f) << 8;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetAccelerator.cpp                            optional iokitcpp
++iokit/Kernel/arm/SweetBacklight.cpp                              optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetBacklight.cpp
+@@ -0,0 +1,149 @@
++/*
++ * AppleARMBacklight for the apollo LCD backlight (WLED5, bsd/dev/sweet_wled.c).
++ *
++ * CoreBrightness, BrightnessControl and QuartzCore find the backlight by
++ * IOPropertyMatch {backlight-control = true}; CoreBrightness then requires
++ * the class to conform to AppleARMBacklight and reads IODisplayParameters
++ * (brightness {min, max, value} and BrightnessMilliNits {min, max, value}).
++ * Brightness arrives through setProperties as "brightness-nits" (16.16
++ * nits) or, on the legacy path, as a raw "brightness" in min..max. Every
++ * other key is accepted and ignored. Display power is not sent here: the
++ * framebuffer switches the WLED and this service only relays the
++ * will-power-off / has-powered-on messages CoreBrightness listens for.
++ * Boot-arg sweetbacklight=0 leaves it out.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMessage.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <pexpert/pexpert.h>
++
++extern "C" bool sweet_wled_present(void);
++extern "C" void sweet_wled_brightness(unsigned level);
++extern "C" unsigned sweet_wled_get_brightness(void);
++extern "C" void sweet_backlight_power(bool on);
++
++#define LEVEL_MAX       4095u
++#define MILLINITS_MIN   2000u
++#define MILLINITS_MAX   500000u        /* ~500 nits panel */
++
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	void powerChanged(bool on);
++
++private:
++	unsigned fLevel;
++	void publishParameters(void);
++	void apply(unsigned level);
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++static AppleARMBacklight *gSweetBacklight;
++
++static OSDictionary *
++range(unsigned min, unsigned max, unsigned value)
++{
++	OSDictionary *d = OSDictionary::withCapacity(3);
++	const char *keys[] = {"min", "max", "value"};
++	unsigned values[] = {min, max, value};
++	for (unsigned i = 0; d && i < 3; i++) {
++		OSNumber *n = OSNumber::withNumber(values[i], 32);
++		if (n) {
++			d->setObject(keys[i], n);
++			n->release();
++		}
++	}
++	return d;
++}
++
++void
++AppleARMBacklight::publishParameters(void)
++{
++	OSDictionary *params = OSDictionary::withCapacity(2);
++	OSDictionary *raw = range(0, LEVEL_MAX, fLevel);
++	OSDictionary *nits = range(MILLINITS_MIN, MILLINITS_MAX,
++	    (unsigned)((uint64_t)fLevel * MILLINITS_MAX / LEVEL_MAX));
++	if (params && raw && nits) {
++		params->setObject("brightness", raw);
++		params->setObject("BrightnessMilliNits", nits);
++		setProperty("IODisplayParameters", params);
++	}
++	OSSafeReleaseNULL(raw);
++	OSSafeReleaseNULL(nits);
++	OSSafeReleaseNULL(params);
++}
++
++void
++AppleARMBacklight::apply(unsigned level)
++{
++	if (level > LEVEL_MAX) {
++		level = LEVEL_MAX;
++	}
++	if (level != fLevel) {
++		fLevel = level;
++		sweet_wled_brightness(level);
++		publishParameters();
++	}
++}
++
++bool
++AppleARMBacklight::start(IOService *provider)
++{
++	int enabled = 1;
++
++	(void)PE_parse_boot_argn("sweetbacklight", &enabled, sizeof(enabled));
++	if (!enabled || !sweet_wled_present() || !IOService::start(provider)) {
++		return false;
++	}
++	fLevel = sweet_wled_get_brightness();
++	setProperty("backlight-control", true);
++	publishParameters();
++	gSweetBacklight = this;
++	registerService();
++	IOLog("SWEET BACKLIGHT: AppleARMBacklight registered, level %u of %u\n", fLevel, LEVEL_MAX);
++	return true;
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (!dict) {
++		return kIOReturnSuccess;
++	}
++	OSNumber *nits = OSDynamicCast(OSNumber, dict->getObject("brightness-nits"));
++	OSNumber *raw = OSDynamicCast(OSNumber, dict->getObject("brightness"));
++	if (nits) {
++		/* 16.16 nits -> level; the scale is linear in nits up to the panel max. */
++		uint64_t milli = (nits->unsigned64BitValue() * 1000u) >> 16;
++		apply((unsigned)(milli * LEVEL_MAX / MILLINITS_MAX));
++	} else if (raw) {
++		apply(raw->unsigned32BitValue());
++	}
++	return kIOReturnSuccess;
++}
++
++void
++AppleARMBacklight::powerChanged(bool on)
++{
++	messageClients(on ? kIOMessageDeviceHasPoweredOn : kIOMessageDeviceWillPowerOff);
++}
++
++/* Called by the framebuffer when the display goes off (after its fade) or on. */
++extern "C" void
++sweet_backlight_power(bool on)
++{
++	if (gSweetBacklight) {
++		gSweetBacklight->powerChanged(on);
++	}
++}
++#endif /* SWEET */
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -2,6 +2,9 @@
+  * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
++ * apollo (PM8150B with an FG gen4 fuel gauge at SID 2) is detected and
++ * polled by default: the gauge's own monotonic SOC, voltage and current,
++ * and the smb5 charger status, which has the same layout as PM6150's.
+  * See report.md for binary evidence, register provenance and integration.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -26,13 +29,16 @@
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fFuelGauge;
++	unsigned fDesign;       /* design capacity, mAh */
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
++	void pollFuelGauge(void);
++	static bool readPair(unsigned lo, unsigned copy, uint16_t *value);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+@@ -51,7 +57,8 @@
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fFuelGauge = false;
++	fDesign = 5020;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -101,11 +108,11 @@
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (design capacity). powerd computes C*100/M. */
++	const unsigned capacity = (fDesign * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(fDesign);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,14 +126,14 @@
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", fDesign);
++	putNumber("DesignCapacity", fDesign);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+-	putBool("SweetBatterySOCEstimated", measured);
++	putBool("SweetBatterySOCEstimated", measured && !fFuelGauge);
+ 	putBool("SweetBatteryTemperatureEstimated", true);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+@@ -137,7 +144,7 @@
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, fDesign, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -154,7 +161,8 @@
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    !measured ? "static fallback" :
++		    fFuelGauge ? "PM8150B fuel gauge" : "PM6150 / estimated SOC",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -203,9 +211,73 @@
+ 	return 100;
+ }
+ 
++/* A gen4 register and its _CP copy, read until both words agree. */
++bool
++SweetBattery::readPair(unsigned lo, unsigned copy, uint16_t *value)
++{
++	for (unsigned attempt = 0; attempt < 5; ++attempt) {
++		uint8_t a, b, c, d;
++		if (sweet_spmi_read(2, lo, &a) || sweet_spmi_read(2, lo + 1, &b) ||
++		    sweet_spmi_read(2, copy, &c) || sweet_spmi_read(2, copy + 1, &d)) {
++			return false;
++		}
++		if (a == c && b == d) {
++			*value = (uint16_t)(a | b << 8);
++			return true;
++		}
++	}
++	return false;
++}
++
++/* apollo: PM8150B, SID 2. Temperature stays the fixed 25 C: the gauge keeps
++ * it in its SRAM, which can only be read through writes to MEM_IF. */
++void
++SweetBattery::pollFuelGauge(void)
++{
++	uint8_t soc = 0, socCopy = 1, usb, path, charger, error, temperature, batif;
++	uint16_t rawVoltage, rawCurrent;
++	bool valid = false;
++	for (unsigned attempt = 0; attempt < 5 && !valid; ++attempt) {
++		valid = !sweet_spmi_read(2, 0x4009, &soc) && !sweet_spmi_read(2, 0x400a, &socCopy) &&
++		    soc == socCopy;
++	}
++	valid = valid &&
++	    readPair(0x41a0, 0x41a6, &rawVoltage) &&
++	    readPair(0x41a2, 0x41a8, &rawCurrent) &&
++	    !sweet_spmi_read(2, 0x1210, &batif) && !(batif & 0x30u) &&
++	    !sweet_spmi_read(2, 0x1310, &usb) &&
++	    !sweet_spmi_read(2, 0x110b, &path) &&
++	    !sweet_spmi_read(2, 0x1006, &charger) &&
++	    !sweet_spmi_read(2, 0x1007, &error) &&
++	    !sweet_spmi_read(2, 0x100d, &temperature);
++	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 122070u) / 1000000u) : 0;
++	valid = valid && mv >= 2800 && mv <= 4600;
++	if (!valid) {
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	/* CAF msoc scaling: 0 -> 0 %, 255 -> 100 %, linear in between. */
++	unsigned percent = soc == 0 ? 0 : soc == 255 ? 100 : ((soc - 1u) * 98u + 126u) / 253u + 1u;
++	/* Gauge: positive = discharging, 488.281 uA/LSB; IOPMPowerSource: positive = charging. */
++	int ma = (int)(-((int64_t)(int16_t)rawCurrent * 488281) / 1000000);
++	bool external = (usb & 0x10u) != 0;
++	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
++	unsigned state = charger & 7u;
++	/* Without the BQ charge pump a USB port may not cover the load: report
++	 * charging only while current really flows into the battery. */
++	bool charging = capable && state >= 1 && state <= 4 && ma > 0 &&
++	    !(error & 2u) && !(temperature & 0x0cu);
++	bool full = external && (state == 5 || (percent == 100 && !charging));
++	publish(full ? 100 : percent, mv, ma, external, capable, charging, full, true, true);
++}
++
+ void
+ SweetBattery::poll(void)
+ {
++	if (fFuelGauge) {
++		pollFuelGauge();
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -263,8 +335,15 @@
+ 		return false;
+ 	}
+ 	int real = 0;
++	uint8_t socType, infoType;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	fFuelGauge = sweet_spmi_init() == 0 &&
++	    !sweet_spmi_read(2, 0x4005, &socType) && socType == 0x10 &&
++	    !sweet_spmi_read(2, 0x4105, &infoType) && infoType == 0x11;
++	if (fFuelGauge) {
++		fDesign = 5000;
++	}
++	fReal = fFuelGauge || (real == 1 && sweet_spmi_init() == 0);
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,8 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void sweet_wled_power(bool on);      /* bsd/dev/sweet_wled.c */
++extern "C" void sweet_backlight_power(bool on); /* SweetBacklight.cpp */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -239,6 +241,11 @@
+ 				}
+ 			}
+ 		}
++		if (step == 6) {
++			/* LCD: the panel is black, now the backlight */
++			sweet_backlight_power(false);
++			sweet_wled_power(false);
++		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
+@@ -542,6 +549,10 @@
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++			if (!off) {
++				sweet_wled_power(true);
++				sweet_backlight_power(true);
++			}
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -68,6 +68,11 @@
+     "     'IOMatchCategory' = IOAcceleratorES;"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleARMBacklight;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleARMBacklight;"
++    "   },"
++    "   {"
+     "     'IOClass'         = AppleCLCD;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+     "     'IONameMatch'     = 'sweet,display';"
