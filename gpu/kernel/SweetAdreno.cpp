@@ -335,7 +335,14 @@ SweetAdreno::start(IOService *provider)
 	fDelay = 10;
 	PE_parse_boot_argn("sweetgpu", &fStage, sizeof(fStage));
 	PE_parse_boot_argn("sweetgpudelay", &fDelay, sizeof(fDelay));
-	uint32_t coherent = 0;
+	/*
+	 * The Adreno 650 snoops the CPU caches through mappings that are
+	 * write-back and shareable for it (gputest -c: no stale or missed word
+	 * through those, thousands through non-cacheable ones), as Linux has it
+	 * (ADRENO_QUIRK_HAS_CACHED_COHERENT). sweetgpu_coherent=0 goes back to
+	 * non-cacheable GPU mappings and write-combined CPU ones.
+	 */
+	uint32_t coherent = 1;
 	PE_parse_boot_argn("sweetgpu_coherent", &coherent, sizeof(coherent));
 	sgpu_dev.io_coherent = coherent == 1;
 	if (fStage == 0) {
@@ -483,6 +490,7 @@ SweetAdrenoUserClient::memAlloc(struct sgpu_mem_alloc *req)
 		sgpu_alloc_failed("MEM_ALLOC", size, kIOReturnNoMemory);
 		return kIOReturnNoMemory;
 	}
+	uint64_t start = sgpu_now_us();
 	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
 	    kIODirectionInOut | kIOMemoryKernelUserShared, size, PAGE_SIZE);
 	if (md == NULL) {
@@ -490,10 +498,19 @@ SweetAdrenoUserClient::memAlloc(struct sgpu_mem_alloc *req)
 		return kIOReturnNoMemory;
 	}
 	bzero(md->getBytesNoCopy(), size);
-	/* the client maps this write-combined: drop the dirty zero lines of
-	 * the kernel's cacheable alias so they can never be written back over
-	 * data the client or the GPU stored later */
-	sgpu_cache_clean(md->getBytesNoCopy(), (size_t)size);
+	/*
+	 * IO-coherent: every mapping is write-back, the CPU's and the GPU's,
+	 * which sees the CPU caches. A write-combined user mapping instead
+	 * changes the cache attributes of every page (and their kernel alias),
+	 * which took milliseconds per buffer. Otherwise the client maps this
+	 * write-combined: drop the dirty zero lines of the kernel's cacheable
+	 * alias so they can never be written back over data the client or the
+	 * GPU stored later.
+	 */
+	bool cached = sgpu_dev.io_coherent || (req->flags & SGPU_MEM_CACHED);
+	if (!sgpu_dev.io_coherent) {
+		sgpu_cache_clean(md->getBytesNoCopy(), (size_t)size);
+	}
 	if (md->prepare() != kIOReturnSuccess) {
 		md->release();
 		return kIOReturnNoMemory;
@@ -515,7 +532,7 @@ SweetAdrenoUserClient::memAlloc(struct sgpu_mem_alloc *req)
 	if (req->flags & SGPU_MEM_GPU_EXEC) {
 		prot |= SGPU_PROT_EXEC;
 	}
-	if (req->flags & SGPU_MEM_CACHED) {
+	if (cached) {
 		prot |= SGPU_PROT_CACHED;       /* inner-shareable WB: snooped if IO-coherent */
 	}
 	int err = sgpu_va_alloc(&sgpu_dev, false, size, align, &m->gpuaddr);
@@ -531,8 +548,7 @@ SweetAdrenoUserClient::memAlloc(struct sgpu_mem_alloc *req)
 		return sgpu_ioreturn(err);
 	}
 	if (!(req->flags & SGPU_MEM_NO_CPU_MAP)) {
-		IOOptionBits cache = (req->flags & SGPU_MEM_CACHED) ?
-		    kIOMapDefaultCache : kIOMapWriteCombineCache;
+		IOOptionBits cache = cached ? kIOMapDefaultCache : kIOMapWriteCombineCache;
 		m->userMap = md->createMappingInTask(fTask, 0, kIOMapAnywhere | cache);
 		if (m->userMap == NULL) {
 			sgpu_umem_destroy(m);
@@ -547,6 +563,12 @@ SweetAdrenoUserClient::memAlloc(struct sgpu_mem_alloc *req)
 	req->gpuaddr = m->gpuaddr;
 	req->cpu_addr = m->userMap ? m->userMap->getAddress() : 0;
 	req->alloc_size = size;
+	uint64_t took = sgpu_now_us() - start;
+	static uint32_t slow_logged;
+	if (took >= 5000 && slow_logged < 32) {
+		slow_logged++;
+		IOLog("SWEET GPU: MEM_ALLOC of %llu KiB took %llu ms\n", size >> 10, took / 1000);
+	}
 	return kIOReturnSuccess;
 }
 
@@ -592,14 +614,16 @@ SweetAdrenoUserClient::importUser(struct sgpu_import_user *req)
 		sgpu_alloc_failed("IMPORT_USER", req->size, kIOReturnVMError);
 		return kIOReturnVMError;
 	}
-	/* the GPU does not snoop: no dirty line may be written back over what
-	 * it renders, and no stale one may hide it */
-	md->performOperation(kIOMemoryIncoherentIOFlush, 0, req->size);
+	/* a GPU that does not snoop: no dirty line may be written back over
+	 * what it renders, and no stale one may hide it */
+	if (!sgpu_dev.io_coherent) {
+		md->performOperation(kIOMemoryIncoherentIOFlush, 0, req->size);
+	}
 	uint32_t prot = SGPU_PROT_READ;
 	if (!(req->flags & SGPU_MEM_GPU_READONLY)) {
 		prot |= SGPU_PROT_WRITE;
 	}
-	if (req->flags & SGPU_MEM_CACHED) {
+	if (sgpu_dev.io_coherent || (req->flags & SGPU_MEM_CACHED)) {
 		prot |= SGPU_PROT_CACHED;
 	}
 	int err = sgpu_va_alloc(&sgpu_dev, false, req->size, PAGE_SIZE, &m->gpuaddr);
@@ -645,12 +669,14 @@ SweetAdrenoUserClient::importSurface(struct sgpu_import_surface *req)
 		sgpu_umem_destroy(m);
 		return kIOReturnNoMemory;
 	}
-	m->md->performOperation(kIOMemoryIncoherentIOFlush, 0, m->md->getLength());
+	if (!sgpu_dev.io_coherent) {
+		m->md->performOperation(kIOMemoryIncoherentIOFlush, 0, m->md->getLength());
+	}
 	uint32_t prot = SGPU_PROT_READ;
 	if (!(req->flags & SGPU_MEM_GPU_READONLY)) {
 		prot |= SGPU_PROT_WRITE;
 	}
-	if (req->flags & SGPU_MEM_CACHED) {
+	if (sgpu_dev.io_coherent || (req->flags & SGPU_MEM_CACHED)) {
 		prot |= SGPU_PROT_CACHED;
 	}
 	int err = sgpu_va_alloc(&sgpu_dev, false, size, PAGE_SIZE, &m->gpuaddr);
