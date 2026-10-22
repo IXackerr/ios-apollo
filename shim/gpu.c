@@ -328,6 +328,10 @@ void sgpu_smc_call(struct sgpu_smc *a)
 	a->x[1] = x1;
 	a->x[2] = x2;
 	a->x[3] = x3;
+	a->x[4] = x4;
+	a->x[5] = x5;
+	a->x[6] = x6;
+	a->x[7] = x7;
 }
 
 bool sgpu_bootarg_u32(const char *name, uint32_t *out)

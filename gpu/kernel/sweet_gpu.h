@@ -65,7 +65,8 @@ void     sgpu_cache_clean(const void *va, size_t len);  /* CPU -> device */
 void     sgpu_cache_inval(const void *va, size_t len);  /* device -> CPU */
 
 struct sgpu_smc {
-	uint64_t x[8];                  /* in: x0..x7, out: x0..x3 */
+	uint64_t x[8];                  /* in and out: x0..x7 (x6 is the resume
+	                                 * token of an interrupted call) */
 };
 void     sgpu_smc_call(struct sgpu_smc *args);
 

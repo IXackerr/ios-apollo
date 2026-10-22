@@ -2623,7 +2623,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.h
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,365 @@
 +/*
 + * sweet_gpu.h - internal interface of the SWEET Adreno 650 driver
 + * (Xiaomi Mi 10T / 10T Pro "apollo", Qualcomm SM8250).
@@ -2691,7 +2691,8 @@
 +void     sgpu_cache_inval(const void *va, size_t len);  /* device -> CPU */
 +
 +struct sgpu_smc {
-+	uint64_t x[8];                  /* in: x0..x7, out: x0..x3 */
++	uint64_t x[8];                  /* in and out: x0..x7 (x6 is the resume
++	                                 * token of an interrupted call) */
 +};
 +void     sgpu_smc_call(struct sgpu_smc *args);
 +
@@ -3168,7 +3169,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_os_xnu.c
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,139 @@
 +/*
 + * sweet_gpu_os_xnu.c - XNU implementation of the sgpu_os_* layer.
 + * The only C file of the GPU driver that includes XNU headers; the
@@ -3282,6 +3283,10 @@
 +	a->x[1] = x1;
 +	a->x[2] = x2;
 +	a->x[3] = x3;
++	a->x[4] = x4;
++	a->x[5] = x5;
++	a->x[6] = x6;
++	a->x[7] = x7;
 +}
 +
 +bool
