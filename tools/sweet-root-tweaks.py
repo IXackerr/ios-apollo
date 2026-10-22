@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
-  sudo sweet-root-tweaks.py MOUNTED_ROOT
+  sudo sweet-root-tweaks.py MOUNTED_ROOT [--sweetrun SWEETRUN]
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
@@ -23,6 +23,9 @@ screen (image versions v8-v14 in NOTES.md):
                   kills), no cloud-configuration UI
   Setup           skipped: SetupDone, SetupFinishedAllSteps, SetupVersion 11,
                   mini-buddy flags off
+  sweetrun        with --sweetrun: /usr/libexec/sweetrun (ios/sweetrun) and a
+                  launchd job that starts it once at boot, so test programs
+                  can come with the boot image (mkadt.py --run)
   activation      mobileactivationd data ark seeded; the actual Activated state
                   comes from its Hactivation branch, selected by the /chosen
                   security-status properties in tools/mkadt.py
@@ -69,6 +72,27 @@ def launchd(root):
         del jobs[k]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
     print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
+
+
+def sweetrun(root, binary):
+    dst = os.path.join(root, 'usr/libexec/sweetrun')
+    shutil.copyfile(binary, dst)
+    os.chown(dst, 0, 0)
+    os.chmod(dst, 0o755)
+    path = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    st = os.stat(path)
+    plist = load(path)
+    plist['LaunchDaemons']['/System/Library/LaunchDaemons/com.sweet.run.plist'] = {
+        'Label': 'com.sweet.run',
+        'ProgramArguments': ['/usr/libexec/sweetrun'],
+        'RunAtLoad': True,
+        'LaunchOnlyOnce': True,
+        'UserName': 'root',
+        'StandardOutPath': '/dev/console',
+        'StandardErrorPath': '/dev/console',
+    }
+    save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    print('sweetrun installed, job com.sweet.run')
 
 
 def containers(root):
@@ -123,10 +147,17 @@ def audio(root):
 
 
 def main():
-    if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
+    args = sys.argv[1:]
+    binary = None
+    if len(args) == 3 and args[1] == '--sweetrun':
+        binary = args.pop(2)
+        args.pop(1)
+    if len(args) != 1 or not os.path.isdir(os.path.join(args[0], 'System/Library/xpc')):
         sys.exit(__doc__)
-    root = sys.argv[1]
+    root = args[0]
     launchd(root)
+    if binary:
+        sweetrun(root, binary)
     containers(root)
     activation(root)
     audio(root)
