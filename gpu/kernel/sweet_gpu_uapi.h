@@ -93,7 +93,13 @@ struct sgpu_mem_alloc {
 	uint64_t cpu_addr;              /* out: mapping in the caller's task, 0 if NO_CPU_MAP */
 	uint64_t alloc_size;            /* out: actual size */
 };
-#define SGPU_MEM_CACHED         (1u << 0)   /* CPU mapping write-back cached */
+/*
+ * MEM_ALLOC: CPU mapping write-back cached. Imports (the caller's pages are
+ * cached already): the GPU mapping is write-back inner-shareable, which the
+ * GPU's accesses snoop the CPU caches through on an IO-coherent device
+ * (SGPU_INFO_IO_COHERENT); without the flag no snoop happens.
+ */
+#define SGPU_MEM_CACHED         (1u << 0)
 #define SGPU_MEM_GPU_READONLY   (1u << 1)
 #define SGPU_MEM_NO_CPU_MAP     (1u << 2)
 #define SGPU_MEM_GPU_EXEC       (1u << 3)   /* holds command streams / shaders */
@@ -106,7 +112,7 @@ struct sgpu_mem_free {
 /* Import an IOSurface (SweetSurface id) so the GPU can render into it. */
 struct sgpu_import_surface {
 	uint32_t surface_id;            /* in */
-	uint32_t flags;                 /* in: SGPU_MEM_GPU_READONLY */
+	uint32_t flags;                 /* in: SGPU_MEM_GPU_READONLY, SGPU_MEM_CACHED */
 	uint32_t id;                    /* out: memory handle (free with MEM_FREE) */
 	uint32_t reserved;
 	uint64_t gpuaddr;               /* out */
@@ -121,7 +127,7 @@ struct sgpu_import_surface {
 struct sgpu_import_user {
 	uint64_t addr;                  /* in: page-aligned address in the caller */
 	uint64_t size;                  /* in: whole pages */
-	uint32_t flags;                 /* in: SGPU_MEM_GPU_READONLY */
+	uint32_t flags;                 /* in: SGPU_MEM_GPU_READONLY, SGPU_MEM_CACHED */
 	uint32_t id;                    /* out: memory handle (free with MEM_FREE) */
 	uint64_t gpuaddr;               /* out */
 };

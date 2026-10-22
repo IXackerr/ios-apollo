@@ -4593,7 +4593,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_uapi.h
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,204 @@
 +/*
 + * sweet_gpu_uapi.h - user/kernel interface of the SWEET Adreno driver.
 + *
@@ -4689,7 +4689,13 @@
 +	uint64_t cpu_addr;              /* out: mapping in the caller's task, 0 if NO_CPU_MAP */
 +	uint64_t alloc_size;            /* out: actual size */
 +};
-+#define SGPU_MEM_CACHED         (1u << 0)   /* CPU mapping write-back cached */
++/*
++ * MEM_ALLOC: CPU mapping write-back cached. Imports (the caller's pages are
++ * cached already): the GPU mapping is write-back inner-shareable, which the
++ * GPU's accesses snoop the CPU caches through on an IO-coherent device
++ * (SGPU_INFO_IO_COHERENT); without the flag no snoop happens.
++ */
++#define SGPU_MEM_CACHED         (1u << 0)
 +#define SGPU_MEM_GPU_READONLY   (1u << 1)
 +#define SGPU_MEM_NO_CPU_MAP     (1u << 2)
 +#define SGPU_MEM_GPU_EXEC       (1u << 3)   /* holds command streams / shaders */
@@ -4702,7 +4708,7 @@
 +/* Import an IOSurface (SweetSurface id) so the GPU can render into it. */
 +struct sgpu_import_surface {
 +	uint32_t surface_id;            /* in */
-+	uint32_t flags;                 /* in: SGPU_MEM_GPU_READONLY */
++	uint32_t flags;                 /* in: SGPU_MEM_GPU_READONLY, SGPU_MEM_CACHED */
 +	uint32_t id;                    /* out: memory handle (free with MEM_FREE) */
 +	uint32_t reserved;
 +	uint64_t gpuaddr;               /* out */
@@ -4717,7 +4723,7 @@
 +struct sgpu_import_user {
 +	uint64_t addr;                  /* in: page-aligned address in the caller */
 +	uint64_t size;                  /* in: whole pages */
-+	uint32_t flags;                 /* in: SGPU_MEM_GPU_READONLY */
++	uint32_t flags;                 /* in: SGPU_MEM_GPU_READONLY, SGPU_MEM_CACHED */
 +	uint32_t id;                    /* out: memory handle (free with MEM_FREE) */
 +	uint64_t gpuaddr;               /* out */
 +};
@@ -4886,7 +4892,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,914 @@
+@@ -0,0 +1,945 @@
 +/*
 + * SweetAdreno - IOKit front end of the SWEET Adreno 650 driver.
 + *
@@ -4942,6 +4948,8 @@
 +static IOLock    *sgpu_lock;            /* serialises every sgpu_* call */
 +static uint64_t   sgpu_wired;
 +static uint32_t   sgpu_buffers;         /* live buffers of every client */
++static uint64_t   sgpu_sel_us[SGPU_SEL_COUNT];  /* time in each call, lock held or waiting */
++static uint32_t   sgpu_sel_n[SGPU_SEL_COUNT];
 +
 +/* A refused allocation, logged a limited number of times. */
 +static void
@@ -5189,6 +5197,24 @@
 +					    k == SGPU_KIND_ALLOC ? "alloc  " : k == SGPU_KIND_USER ?
 +					    "user   " : "surface", n[0], n[1], n[2], n[3], n[4]);
 +				}
++			}
++			/* every 10 s, when clients called: where their calls spent time */
++			if (tick % 200 == 0 && sgpu_sel_n[SGPU_SEL_SUBMIT] != 0) {
++				static const uint8_t sels[] = {
++					SGPU_SEL_SUBMIT, SGPU_SEL_WAIT_TS, SGPU_SEL_MEM_ALLOC,
++					SGPU_SEL_MEM_FREE, SGPU_SEL_IMPORT_USER, SGPU_SEL_IMPORT_SURFACE,
++				};
++				static const char names[] = "submit\0wait\0alloc\0free\0import\0surface";
++				char line[256];
++				int len = 0;
++				for (unsigned i = 0; i < sizeof(sels); i++) {
++					len += snprintf(line + len, sizeof(line) - (size_t)len, " %s %u/%llums",
++					    sgpu_nth(names, i), sgpu_sel_n[sels[i]],
++					    sgpu_sel_us[sels[i]] / 1000);
++				}
++				IOLog("SWEET GPU: 10 s of calls:%s\n", line);
++				bzero(sgpu_sel_us, sizeof(sgpu_sel_us));
++				bzero(sgpu_sel_n, sizeof(sgpu_sel_n));
 +			}
 +			IOLockUnlock(sgpu_lock);
 +		}
@@ -5468,6 +5494,9 @@
 +	if (!(req->flags & SGPU_MEM_GPU_READONLY)) {
 +		prot |= SGPU_PROT_WRITE;
 +	}
++	if (req->flags & SGPU_MEM_CACHED) {
++		prot |= SGPU_PROT_CACHED;
++	}
 +	int err = sgpu_va_alloc(&sgpu_dev, false, req->size, PAGE_SIZE, &m->gpuaddr);
 +	if (!err) {
 +		err = sgpu_map_descriptor(m->md, m->gpuaddr, req->size, prot);
@@ -5515,6 +5544,9 @@
 +	uint32_t prot = SGPU_PROT_READ;
 +	if (!(req->flags & SGPU_MEM_GPU_READONLY)) {
 +		prot |= SGPU_PROT_WRITE;
++	}
++	if (req->flags & SGPU_MEM_CACHED) {
++		prot |= SGPU_PROT_CACHED;
 +	}
 +	int err = sgpu_va_alloc(&sgpu_dev, false, size, PAGE_SIZE, &m->gpuaddr);
 +	if (!err) {
@@ -5682,6 +5714,7 @@
 +
 +	bzero(&u, sizeof(u));
 +	IOLockLock(sgpu_lock);
++	uint64_t start = sgpu_now_us();
 +	switch (selector) {
 +	case SGPU_SEL_GET_INFO:
 +		sgpu_fill_info(&sgpu_dev, &u.info);
@@ -5796,6 +5829,10 @@
 +	default:
 +		ret = kIOReturnUnsupported;
 +		break;
++	}
++	if (selector < SGPU_SEL_COUNT) {
++		sgpu_sel_us[selector] += sgpu_now_us() - start;
++		sgpu_sel_n[selector]++;
 +	}
 +	IOLockUnlock(sgpu_lock);
 +	return ret;

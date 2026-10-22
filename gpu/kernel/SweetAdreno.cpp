@@ -53,6 +53,8 @@ static struct sgpu sgpu_dev;
 static IOLock    *sgpu_lock;            /* serialises every sgpu_* call */
 static uint64_t   sgpu_wired;
 static uint32_t   sgpu_buffers;         /* live buffers of every client */
+static uint64_t   sgpu_sel_us[SGPU_SEL_COUNT];  /* time in each call, lock held or waiting */
+static uint32_t   sgpu_sel_n[SGPU_SEL_COUNT];
 
 /* A refused allocation, logged a limited number of times. */
 static void
@@ -300,6 +302,24 @@ SweetAdreno::bringupThread(void *arg, __unused wait_result_t wr)
 					    k == SGPU_KIND_ALLOC ? "alloc  " : k == SGPU_KIND_USER ?
 					    "user   " : "surface", n[0], n[1], n[2], n[3], n[4]);
 				}
+			}
+			/* every 10 s, when clients called: where their calls spent time */
+			if (tick % 200 == 0 && sgpu_sel_n[SGPU_SEL_SUBMIT] != 0) {
+				static const uint8_t sels[] = {
+					SGPU_SEL_SUBMIT, SGPU_SEL_WAIT_TS, SGPU_SEL_MEM_ALLOC,
+					SGPU_SEL_MEM_FREE, SGPU_SEL_IMPORT_USER, SGPU_SEL_IMPORT_SURFACE,
+				};
+				static const char names[] = "submit\0wait\0alloc\0free\0import\0surface";
+				char line[256];
+				int len = 0;
+				for (unsigned i = 0; i < sizeof(sels); i++) {
+					len += snprintf(line + len, sizeof(line) - (size_t)len, " %s %u/%llums",
+					    sgpu_nth(names, i), sgpu_sel_n[sels[i]],
+					    sgpu_sel_us[sels[i]] / 1000);
+				}
+				IOLog("SWEET GPU: 10 s of calls:%s\n", line);
+				bzero(sgpu_sel_us, sizeof(sgpu_sel_us));
+				bzero(sgpu_sel_n, sizeof(sgpu_sel_n));
 			}
 			IOLockUnlock(sgpu_lock);
 		}
@@ -579,6 +599,9 @@ SweetAdrenoUserClient::importUser(struct sgpu_import_user *req)
 	if (!(req->flags & SGPU_MEM_GPU_READONLY)) {
 		prot |= SGPU_PROT_WRITE;
 	}
+	if (req->flags & SGPU_MEM_CACHED) {
+		prot |= SGPU_PROT_CACHED;
+	}
 	int err = sgpu_va_alloc(&sgpu_dev, false, req->size, PAGE_SIZE, &m->gpuaddr);
 	if (!err) {
 		err = sgpu_map_descriptor(m->md, m->gpuaddr, req->size, prot);
@@ -626,6 +649,9 @@ SweetAdrenoUserClient::importSurface(struct sgpu_import_surface *req)
 	uint32_t prot = SGPU_PROT_READ;
 	if (!(req->flags & SGPU_MEM_GPU_READONLY)) {
 		prot |= SGPU_PROT_WRITE;
+	}
+	if (req->flags & SGPU_MEM_CACHED) {
+		prot |= SGPU_PROT_CACHED;
 	}
 	int err = sgpu_va_alloc(&sgpu_dev, false, size, PAGE_SIZE, &m->gpuaddr);
 	if (!err) {
@@ -793,6 +819,7 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 
 	bzero(&u, sizeof(u));
 	IOLockLock(sgpu_lock);
+	uint64_t start = sgpu_now_us();
 	switch (selector) {
 	case SGPU_SEL_GET_INFO:
 		sgpu_fill_info(&sgpu_dev, &u.info);
@@ -907,6 +934,10 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 	default:
 		ret = kIOReturnUnsupported;
 		break;
+	}
+	if (selector < SGPU_SEL_COUNT) {
+		sgpu_sel_us[selector] += sgpu_now_us() - start;
+		sgpu_sel_n[selector]++;
 	}
 	IOLockUnlock(sgpu_lock);
 	return ret;
