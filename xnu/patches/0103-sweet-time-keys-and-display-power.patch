@@ -1,0 +1,36 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -20,6 +20,7 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
++#include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+ 
+ #include "IOHIDEventService.h"
+@@ -402,8 +403,10 @@
+ 	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, usage, down);
+ 
+ 	if (event) {
+-		IOLog("SWEET HID: key 0x%x %s (%u clients)\n", (unsigned)usage, down ? "down" : "up",
+-		    _clients ? _clients->getCount() : 0);
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		IOLog("SWEET HID: key 0x%x %s (%u clients) at %llu ms\n", (unsigned)usage,
++		    down ? "down" : "up", _clients ? _clients->getCount() : 0, ns / 1000000);
+ 		dispatchEvent(event);
+ 		event->release();
+ 	}
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -733,7 +733,9 @@
+ 				sweet_backlight_power(true);
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+-			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			uint64_t ns;
++			absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++			IOLog("SWEET FB: display %s at %llu ms\n", off ? "off" : "on", ns / 1000000);
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:

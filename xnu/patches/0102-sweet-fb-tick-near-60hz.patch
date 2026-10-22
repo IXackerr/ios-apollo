@@ -1,0 +1,37 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -143,6 +143,7 @@
+ 	uint32_t      fLines;         /* lines per frame, blanking included */
+ 	uint32_t      fActiveStart, fActiveEnd;     /* the visible lines */
+ 	uint32_t      fLineNS;        /* time per line */
++	uint32_t      fFrames;        /* panel frames per tick */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -296,8 +297,17 @@
+ 	fActiveStart = vstart;
+ 	fActiveEnd = vend;
+ 	fLineNS = (uint32_t)(ns / frames / lines);
++	/*
++	 * Ticks near 60 Hz, one every fFrames panel frames: the iPhone X userland
++	 * paces itself for 60, and apollo's panel runs at 144 Hz.
++	 */
++	uint64_t hz = (uint64_t)frames * 1000000000ull / ns;
++	fFrames = (uint32_t)((hz + 30) / 60);
++	if (fFrames == 0) {
++		fFrames = 1;
++	}
+ 	fIntf = intf;
+-	IOLog("SWEET FB: following the scanout, %llu Hz\n", (uint64_t)frames * 1000000000ull / ns);
++	IOLog("SWEET FB: following the scanout, %llu Hz, a tick every %u frames\n", hz, fFrames);
+ }
+ 
+ /* Spin (2 ms at most) until the panel fetches no visible line. */
+@@ -329,6 +339,7 @@
+ 	if (to == 0) {
+ 		to = fLines;    /* at the tick's own line: the next frame's */
+ 	}
++	to += (fFrames - 1) * fLines;
+ 	uint64_t us = (uint64_t)to * fLineNS / 1000;
+ 	return us > 300 ? (uint32_t)(us - 300) : 1;
+ }
