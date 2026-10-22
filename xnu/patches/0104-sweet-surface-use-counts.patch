@@ -1,0 +1,204 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -12,7 +12,7 @@
+  *   sel 4   lookup by id: scalar [id], struct out = lock result
+  *   sel 34  lookup by mach port: scalar [port name], struct out = lock result
+  *   sel 35  create mach port: scalars [id, options], scalar out [port name]
+- *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
++ *   traps   0/1 use count +/- (id, category < 2), 2 lock / 3 unlock
+  *           (id, options, &seed), 4/5 release (id)
+  *
+  * The lock result tells the library where the surface lives in the
+@@ -368,6 +368,7 @@
+ 	IOMemoryMap  *data;
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
++	uint8_t       used;         /* categories this client holds the surface in use for */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -381,6 +382,15 @@
+ 	OSSafeReleaseNULL(data);
+ 	OSSafeReleaseNULL(state);
+ 	if (surface != NULL) {
++		/* the library never gives a use count back as it lets go */
++		for (unsigned int c = 0; c < 2; c++) {
++			if (used & (1u << c)) {
++				sweet_surface_count(&surface->uses[c], -1);
++			}
++		}
++		if (used) {
++			sweet_surface_publish_use(surface);
++		}
+ 		sweet_surface_put(surface);
+ 		surface->release();
+ 		surface = NULL;
+@@ -431,7 +441,9 @@
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+ 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 
+-	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn useCount(void *id, void *category, bool in);
++	IOReturn trapIncrementUse(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapDecrementUse(void *id, void *category, void *, void *, void *, void *);
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+@@ -538,6 +550,7 @@
+ 	s->retain();
+ 	ref->surface = s;
+ 	ref->count = 1;
++	ref->used = 0;
+ 	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+ 	if (ref->data == NULL || ref->state == NULL) {
+@@ -796,11 +809,39 @@
+ 	}
+ }
+ 
++/*
++ * IOSurfaceIncrementUseCount / Decrement: the library counts per process
++ * and traps only as its count leaves or reaches 0, so a client holds a
++ * surface in use for a category or not, and the kernel adds the clients up.
++ */
+ IOReturn
+-IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
+-    void *, void *, void *, void *)
++IOSurfaceRootUserClient::useCount(void *id, void *category, bool in)
+ {
+-	return kIOReturnSuccess;
++	uintptr_t c = (uintptr_t)category;
++	if (c >= 2) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, NULL);
++	if (ref != NULL && ((ref->used >> c) & 1) != in) {
++		ref->used ^= (uint8_t)(1u << c);
++		sweet_surface_count(&ref->surface->uses[c], in ? 1 : -1);
++		sweet_surface_publish_use(ref->surface);
++	}
++	IOLockUnlock(fLock);
++	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapIncrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++	return useCount(id, category, true);
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapDecrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++	return useCount(id, category, false);
+ }
+ 
+ static IOReturn
+@@ -873,8 +914,8 @@
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+-	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapIncrementUse },
++	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDecrementUse },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+ 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -19,6 +19,13 @@
+ 
+ #define SWEET_SURFACE_MAX_PLANES        20
+ 
++/*
++ * In the state page every client maps read-only: how many hold the surface
++ * in use, a u32 per category (0 and 1). IOSurfaceIsInUse reads +0x18 as a
++ * u64, IOSurfaceIsInUseForCategory either u32.
++ */
++#define SWEET_SURFACE_STATE_USE         0x18
++
+ struct sweet_surface_plane {
+ 	uint32_t width, height, bytesPerRow, offset, size;
+ 	uint16_t bytesPerElement;
+@@ -41,27 +48,72 @@
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 	volatile UInt32           gpuWrites;    /* GPU work writing the pixels, in flight */
++	volatile UInt32           gpuUses;      /* GPU work reading them, in flight */
++	volatile UInt32           uses[2];      /* clients holding it in use, per category */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { gpuWrites = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE
++	{
++		gpuWrites = gpuUses = uses[0] = uses[1] = 0;
++		return OSObject::init();
++	}
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+ 	uintptr_t kernelAddress();
+ };
+ 
++/* Add delta to a count, never below 0. */
++static inline void
++sweet_surface_count(volatile UInt32 *count, int32_t delta)
++{
++	UInt32 old, now;
++	do {
++		old = *count;
++		now = (int32_t)old + delta < 0 ? 0 : (UInt32)((int32_t)old + delta);
++	} while (!OSCompareAndSwap(old, now, count));
++}
++
++/*
++ * The use counts clients read (SWEET_SURFACE_STATE_USE): category 0 counts
++ * the GPU's work on the surface too, as Apple's GPU driver holds a surface
++ * in use until the work that reads or writes it completed. Rewritten until
++ * it holds the latest counts, whatever ran meanwhile.
++ */
++static inline void
++sweet_surface_publish_use(SweetSurface *s)
++{
++	if (s->state == NULL) {
++		return;
++	}
++	volatile uint32_t *use = (volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() +
++	    SWEET_SURFACE_STATE_USE);
++	uint32_t u0, u1;
++	do {
++		u0 = s->uses[0] + s->gpuUses + s->gpuWrites;
++		u1 = s->uses[1];
++		use[0] = u0;
++		use[1] = u1;
++	} while (u0 != s->uses[0] + s->gpuUses + s->gpuWrites || u1 != s->uses[1]);
++}
++
+ /*
+  * Count GPU work that writes the surface, submitted (+1) or complete (-1),
+  * as the GPU driver learns of it: the framebuffer does not show a surface
+- * the GPU is still rendering. Never below 0.
++ * the GPU is still rendering.
+  */
+ static inline void
+ sweet_surface_gpu_writes(SweetSurface *s, int32_t delta)
+ {
+-	UInt32 old, now;
+-	do {
+-		old = s->gpuWrites;
+-		now = (int32_t)old + delta < 0 ? 0 : (UInt32)((int32_t)old + delta);
+-	} while (!OSCompareAndSwap(old, now, &s->gpuWrites));
++	sweet_surface_count(&s->gpuWrites, delta);
++	sweet_surface_publish_use(s);
++}
++
++/* Count GPU work that reads the surface, submitted (+1) or complete (-1). */
++static inline void
++sweet_surface_gpu_uses(SweetSurface *s, int32_t delta)
++{
++	sweet_surface_count(&s->gpuUses, delta);
++	sweet_surface_publish_use(s);
+ }
+ 
+ /* Retained surface for an id, or NULL. */
