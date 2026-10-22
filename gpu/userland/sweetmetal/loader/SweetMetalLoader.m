@@ -89,7 +89,9 @@ impl_bundle(void)
 	if (access(done.fileSystemRepresentation, F_OK) == 0) {
 		return bundle;
 	}
-	int lock = open(ROOT "/.lock", O_RDWR | O_CREAT, 0666);
+	/* read-only: whoever made the lock file (root or mobile), any client
+	 * can still flock it */
+	int lock = open(ROOT "/.lock", O_RDONLY | O_CREAT, 0644);
 	if (lock < 0 || flock(lock, LOCK_EX) != 0) {
 		smlog([NSString stringWithFormat:@"cannot lock " ROOT ": %s", strerror(errno)]);
 		if (lock >= 0) {
