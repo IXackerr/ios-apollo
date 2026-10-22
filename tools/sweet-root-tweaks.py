@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
-  sudo sweet-root-tweaks.py MOUNTED_ROOT [--sweetrun SWEETRUN]
+  sudo sweet-root-tweaks.py MOUNTED_ROOT [--sweetrun SWEETRUN] [--sweetmetal BUNDLE]
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
@@ -26,6 +26,9 @@ screen (image versions v8-v14 in NOTES.md):
   sweetrun        with --sweetrun: /usr/libexec/sweetrun (ios/sweetrun) and a
                   launchd job that starts it once at boot, so test programs
                   can come with the boot image (mkadt.py --run)
+  sweetmetal      with --sweetmetal: the SweetMetal loader bundle as
+                  /System/Library/Extensions/SweetMetal.bundle and the
+                  directory it unpacks the driver into, /private/var/sweetmetal
   activation      mobileactivationd data ark seeded; the actual Activated state
                   comes from its Hactivation branch, selected by the /chosen
                   security-status properties in tools/mkadt.py
@@ -95,6 +98,25 @@ def sweetrun(root, binary):
     print('sweetrun installed, job com.sweet.run')
 
 
+def sweetmetal(root, bundle):
+    dst = os.path.join(root, 'System/Library/Extensions/SweetMetal.bundle')
+    if os.path.exists(dst):
+        shutil.rmtree(dst)
+    os.makedirs(dst)
+    for name in ('SweetMetal', 'Info.plist'):
+        shutil.copyfile(os.path.join(bundle, name), os.path.join(dst, name))
+        os.chown(os.path.join(dst, name), 0, 0)
+    os.chmod(os.path.join(dst, 'SweetMetal'), 0o755)
+    os.chmod(os.path.join(dst, 'Info.plist'), 0o644)
+    os.chown(dst, 0, 0)
+    os.chmod(dst, 0o755)
+    var = os.path.join(root, 'private/var/sweetmetal')
+    os.makedirs(var, exist_ok=True)
+    os.chown(var, 0, 0)
+    os.chmod(var, 0o1777)       # every Metal client may unpack the driver there
+    print('SweetMetal loader installed, /private/var/sweetmetal ready')
+
+
 def containers(root):
     base = os.path.join(root, 'private/var/containers')
     for sub, uid in (('Bundle', 33), ('Data/System', 0), ('Shared/SystemGroup', 0), ('Temp', 0)):
@@ -148,16 +170,22 @@ def audio(root):
 
 def main():
     args = sys.argv[1:]
-    binary = None
-    if len(args) == 3 and args[1] == '--sweetrun':
-        binary = args.pop(2)
-        args.pop(1)
+    opts = {}
+    for name in ('--sweetrun', '--sweetmetal'):
+        if name in args:
+            i = args.index(name)
+            if i + 1 >= len(args):
+                sys.exit(__doc__)
+            opts[name] = args[i + 1]
+            del args[i:i + 2]
     if len(args) != 1 or not os.path.isdir(os.path.join(args[0], 'System/Library/xpc')):
         sys.exit(__doc__)
     root = args[0]
     launchd(root)
-    if binary:
-        sweetrun(root, binary)
+    if '--sweetrun' in opts:
+        sweetrun(root, opts['--sweetrun'])
+    if '--sweetmetal' in opts:
+        sweetmetal(root, opts['--sweetmetal'])
     containers(root)
     activation(root)
     audio(root)
