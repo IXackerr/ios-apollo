@@ -177,6 +177,8 @@ sweet_bo_init_userptr(struct tu_device *dev, struct tu_bo **out_bo,
    struct sgpu_import_user req = {
       .addr = (uintptr_t) ptr,
       .size = size,
+      /* the pages are cached for the CPU: an IO-coherent GPU snoops them */
+      .flags = dev->physical_device->has_cached_coherent_memory ? SGPU_MEM_CACHED : 0u,
    };
    int ret = sgpu_import_user(sweet_dev(dev), &req);
    if (ret) {
