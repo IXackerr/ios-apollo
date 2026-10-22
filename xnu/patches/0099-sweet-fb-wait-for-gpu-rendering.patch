@@ -31,7 +31,13 @@
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
  	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
-@@ -328,6 +334,25 @@
+@@ -323,11 +329,30 @@
+ 	}
+ }
+ 
+-void
++bool
+ AppleCLCD::present(const uint8_t *rec)
  {
  	uint32_t mask = get32(rec, 0x104);
  
