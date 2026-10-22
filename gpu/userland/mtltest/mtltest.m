@@ -263,6 +263,16 @@ main(void)
 		    qcl ? "loaded" : err.localizedDescription.UTF8String,
 		    (unsigned long)qcl.functionNames.count);
 		CHECK(qcl != nil, "QuartzCore library");
+		/* QuartzCore makes its functions through descriptors with constants */
+		MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
+		fd.name = @"fixed_frag_lph_cpf";
+		fd.constantValues = [MTLFunctionConstantValues new];
+		bool on = true;
+		[fd.constantValues setConstantValue:&on type:MTLDataTypeBool atIndex:0];
+		id<MTLFunction> ff = qcl ? [qcl newFunctionWithDescriptor:fd error:&err] : nil;
+		printf("QuartzCore %s with constants: %s\n", fd.name.UTF8String,
+		    ff ? "made" : err.localizedDescription.UTF8String);
+		CHECK(ff != nil, "function with constants");
 		printf("%s\n", fails ? "MTLTEST FAILED" : "MTLTEST PASSED");
 		return fails ? 1 : 0;
 	}

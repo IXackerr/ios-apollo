@@ -39,6 +39,7 @@ typedef struct smtl_render_pipeline smtl_render_pipeline;
 typedef struct smtl_compute_encoder smtl_compute_encoder;
 typedef struct smtl_render_encoder smtl_render_encoder;
 typedef struct smtl_blit_encoder smtl_blit_encoder;
+typedef struct smtl_depth_stencil_state smtl_depth_stencil_state;
 
 const char *smtl_last_error(void);
 
@@ -85,6 +86,15 @@ void           smtl_library_release(smtl_library *l);
 smtl_function *smtl_library_new_function(smtl_library *l, const char *name);
 void           smtl_function_release(smtl_function *f);
 uint32_t       smtl_function_type(const smtl_function *f);      /* MTLFunctionType, 0 unknown */
+/*
+ * newFunctionWithName:constantValues:error: - lookup is asked for each
+ * constant the function declares (name, index, MTLDataType) and writes its
+ * packed value (len bytes) to out and returns 1, or returns 0 for none.
+ */
+typedef int (*smtl_constant_lookup)(void *ctx, const char *name, uint32_t index,
+    uint32_t data_type, void *out, uint32_t len);
+smtl_function *smtl_library_new_function_with_constants(smtl_library *l, const char *name,
+    smtl_constant_lookup lookup, void *ctx);
 /* the function names, NUL-separated into out (cut short where they do not
  * fit); returns the bytes the whole list needs */
 size_t         smtl_library_function_names(const smtl_library *l, char *out, size_t out_len);
@@ -130,6 +140,17 @@ smtl_render_pipeline *smtl_device_new_render_pipeline_desc(smtl_device *d,
     const struct smtl_render_pipeline_desc *desc);
 void smtl_render_pipeline_release(smtl_render_pipeline *p);
 
+/* MTLDepthStencilDescriptor, raw Metal values */
+struct smtl_stencil_desc {
+	uint32_t compare;               /* MTLCompareFunction */
+	uint32_t stencil_failure, depth_failure, depth_stencil_pass;   /* MTLStencilOperation */
+	uint32_t read_mask, write_mask;
+};
+smtl_depth_stencil_state *smtl_device_new_depth_stencil_state(smtl_device *d,
+    uint32_t depth_compare, int depth_write, const struct smtl_stencil_desc *front,
+    const struct smtl_stencil_desc *back);
+void smtl_depth_stencil_state_release(smtl_depth_stencil_state *s);
+
 /* ---- queues and command buffers ---- */
 smtl_queue  *smtl_device_new_command_queue(smtl_device *d);
 void         smtl_queue_release(smtl_queue *q);
@@ -164,6 +185,8 @@ int smtl_render_set_fragment_buffer(smtl_render_encoder *e, smtl_buffer *b, uint
 int smtl_render_set_fragment_texture(smtl_render_encoder *e, smtl_texture *t, uint32_t index);
 int smtl_render_draw_primitives(smtl_render_encoder *e, uint32_t primitive_type, uint64_t start,
     uint64_t count, uint64_t instances, uint64_t base_instance);
+int smtl_render_set_depth_stencil_state(smtl_render_encoder *e, smtl_depth_stencil_state *s);
+int smtl_render_set_stencil_reference(smtl_render_encoder *e, uint32_t front, uint32_t back);
 int smtl_render_end(smtl_render_encoder *e);
 
 /* ---- blit ---- */
@@ -173,6 +196,11 @@ int smtl_blit_copy_buffer(smtl_blit_encoder *e, smtl_buffer *src, uint64_t src_o
 int smtl_blit_copy_texture_to_buffer(smtl_blit_encoder *e, smtl_texture *src, uint64_t slice,
     uint64_t level, uint64_t x, uint64_t y, uint64_t w, uint64_t h, smtl_buffer *dst,
     uint64_t dst_offset, uint64_t bytes_per_row, uint64_t bytes_per_image);
+/* origins and size: x, y, z / width, height, depth */
+int smtl_blit_copy_texture(smtl_blit_encoder *e, smtl_texture *src, uint64_t src_slice,
+    uint64_t src_level, const uint64_t src_origin[3], const uint64_t size[3], smtl_texture *dst,
+    uint64_t dst_slice, uint64_t dst_level, const uint64_t dst_origin[3]);
+int smtl_blit_generate_mipmaps(smtl_blit_encoder *e, smtl_texture *t);
 int smtl_blit_end(smtl_blit_encoder *e);
 
 #ifdef __cplusplus

@@ -34,6 +34,14 @@
 
 /* os_log, and stderr too: the SWEET kernel prints a daemon's /dev/null
  * output (boot-arg sweetnull), which is where launchd sends stderr. */
+/* MTLFunctionConstantValues has setters only; Metal's own internal class
+ * answers a value per declared constant. */
+@interface NSObject (SweetMetalConstants)
+- (instancetype)initWithName:(NSString *)name type:(NSUInteger)type index:(NSUInteger)index
+    required:(BOOL)required;
+- (const void *)constantValueWithFunctionConstant:(id)constant;
+@end
+
 #define SMLOG(...) smlog([NSString stringWithFormat:__VA_ARGS__])
 
 static void
@@ -195,6 +203,59 @@ SMError(NSString *what)
 	fn->_name = [name copy];
 	return fn;
 }
+static int
+lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void *out, uint32_t len)
+{
+	MTLFunctionConstantValues *values = (__bridge MTLFunctionConstantValues *)ctx;
+	Class cls = objc_getClass("MTLFunctionConstantInternal");
+	if (cls == Nil || ![values respondsToSelector:@selector(constantValueWithFunctionConstant:)]) {
+		return 0;
+	}
+	id c = [[cls alloc] initWithName:@(name) type:type index:index required:NO];
+	const void *v = [values constantValueWithFunctionConstant:c];
+	if (v == NULL) {
+		return 0;
+	}
+	memcpy(out, v, len);
+	return 1;
+}
+
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name
+    constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error
+{
+	smtl_function *f = values == nil ? smtl_library_new_function(_l, name.UTF8String) :
+	    smtl_library_new_function_with_constants(_l, name.UTF8String, lookupConstant,
+	    (__bridge void *)values);
+	if (f == NULL) {
+		if (error) {
+			*error = SMError([NSString stringWithFormat:@"function %@", name]);
+		}
+		return nil;
+	}
+	SweetMetalFunction *fn = [SweetMetalFunction new];
+	fn->_f = f;
+	fn->_name = name;
+	fn->_device = _device;
+	return fn;
+}
+- (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)desc error:(NSError **)error
+{
+	return [self newFunctionWithName:desc.name constantValues:desc.constantValues error:error];
+}
+- (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values
+    completionHandler:(void (^)(id<MTLFunction>, NSError *))handler
+{
+	NSError *err = nil;
+	id<MTLFunction> f = [self newFunctionWithName:name constantValues:values error:&err];
+	handler(f, err);
+}
+- (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)desc
+    completionHandler:(void (^)(id<MTLFunction>, NSError *))handler
+{
+	NSError *err = nil;
+	id<MTLFunction> f = [self newFunctionWithDescriptor:desc error:&err];
+	handler(f, err);
+}
 - (NSArray<NSString *> *)functionNames
 {
 	size_t len = smtl_library_function_names(_l, NULL, 0);
@@ -238,6 +299,20 @@ SMError(NSString *what)
 - (void)dealloc { smtl_render_pipeline_release(_p); }
 @end
 
+@interface SweetMetalDepthStencilState : SMBase <MTLDepthStencilState> {
+@public
+	smtl_depth_stencil_state *_s;
+	id<MTLDevice> _device;
+	NSString *_label;
+}
+@end
+
+@implementation SweetMetalDepthStencilState
+- (id<MTLDevice>)device { return _device; }
+- (NSString *)label { return _label; }
+- (void)dealloc { smtl_depth_stencil_state_release(_s); }
+@end
+
 /* ---------------------------------------------------------------- */
 /* Command submission                                               */
 /* ---------------------------------------------------------------- */
@@ -271,6 +346,18 @@ SMError(NSString *what)
 - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i
 {
 	smtl_render_set_fragment_buffer(_e, b ? ((SweetMetalBuffer *)b)->_b : NULL, o, (uint32_t)i);
+}
+- (void)setDepthStencilState:(id<MTLDepthStencilState>)s
+{
+	smtl_render_set_depth_stencil_state(_e, s ? ((SweetMetalDepthStencilState *)s)->_s : NULL);
+}
+- (void)setStencilReferenceValue:(uint32_t)v
+{
+	smtl_render_set_stencil_reference(_e, v, v);
+}
+- (void)setStencilFrontReferenceValue:(uint32_t)front backReferenceValue:(uint32_t)back
+{
+	smtl_render_set_stencil_reference(_e, front, back);
 }
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i
 {
@@ -315,6 +402,23 @@ SMError(NSString *what)
 {
 	smtl_blit_copy_texture_to_buffer(_e, ((SweetMetalTexture *)src)->_t, slice, level, origin.x,
 	    origin.y, size.width, size.height, ((SweetMetalBuffer *)dst)->_b, off, bpr, bpi);
+}
+- (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl
+    sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)dst
+    destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dor
+{
+	const uint64_t o[3] = { so.x, so.y, so.z }, z[3] = { size.width, size.height, size.depth },
+	    d[3] = { dor.x, dor.y, dor.z };
+	if (smtl_blit_copy_texture(_e, ((SweetMetalTexture *)src)->_t, ss, sl, o, z,
+	    ((SweetMetalTexture *)dst)->_t, ds, dl, d) != 0) {
+		SMError(@"copyFromTexture:toTexture:");
+	}
+}
+- (void)generateMipmapsForTexture:(id<MTLTexture>)t
+{
+	if (smtl_blit_generate_mipmaps(_e, ((SweetMetalTexture *)t)->_t) != 0) {
+		SMError(@"generateMipmapsForTexture:");
+	}
 }
 - (void)endEncoding
 {
@@ -471,6 +575,11 @@ SMError(NSString *what)
 	return cb;
 }
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
+/* scheduling hints of Apple's driver: one queue to one VkQueue here */
+- (void)setSubmissionQueue:(dispatch_queue_t)q { }
+- (void)setCompletionQueue:(dispatch_queue_t)q { }
+- (void)setGPUPriority:(NSUInteger)p { }
+- (void)setBackgroundGPUPriority:(NSUInteger)p { }
 - (void)dealloc { smtl_queue_release(_q); }
 @end
 
@@ -609,6 +718,33 @@ SMError(NSString *what)
 - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)n
 {
 	return [self newCommandQueue];
+}
+
+static struct smtl_stencil_desc
+stencilDesc(MTLStencilDescriptor *s)
+{
+	return (struct smtl_stencil_desc){
+		(uint32_t)s.stencilCompareFunction, (uint32_t)s.stencilFailureOperation,
+		(uint32_t)s.depthFailureOperation, (uint32_t)s.depthStencilPassOperation,
+		s.readMask, s.writeMask,
+	};
+}
+
+- (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d
+{
+	struct smtl_stencil_desc front = stencilDesc(d.frontFaceStencil);
+	struct smtl_stencil_desc back = stencilDesc(d.backFaceStencil);
+	smtl_depth_stencil_state *st = smtl_device_new_depth_stencil_state(_d,
+	    (uint32_t)d.depthCompareFunction, d.depthWriteEnabled, &front, &back);
+	if (st == NULL) {
+		SMError(@"newDepthStencilStateWithDescriptor:");
+		return nil;
+	}
+	SweetMetalDepthStencilState *state = [SweetMetalDepthStencilState new];
+	state->_s = st;
+	state->_device = self;
+	state->_label = d.label;
+	return state;
 }
 
 static SweetMetalBuffer *

@@ -12,14 +12,17 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
+use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
+use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
+use metal2vulkan::metal::{CompareFunction, PixelFormat, PrimitiveType, StencilOperation, TextureUsage};
 use metal2vulkan::pipeline::{
     ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor,
     VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use metal2vulkan_runtime::{
     BlitCommandEncoder, BlitOption, Buffer, ClearColor, CommandBuffer, CommandBufferStatus,
-    CommandQueue, ComputeCommandEncoder, ComputePipelineState, Device, DeviceOptions, Function,
+    CommandQueue, ComputeCommandEncoder, ComputePipelineState, DepthStencilState, Device,
+    DeviceOptions, Function,
     HostMemory, IoSurfacePlane, Library, LoadAction, Origin, PipelineOptions, RenderCommandEncoder,
     RenderPassDescriptor, RenderPipelineState, ResourceOptions, Size, StoreAction, Texture,
     TextureDescriptor,
@@ -322,6 +325,83 @@ pub unsafe extern "C" fn smtl_library_new_function(
     boxed("newFunctionWithName:", l.new_function_with_name(&name))
 }
 release!(smtl_function_release, Function);
+
+/// Packed byte size of a function constant of MTLDataType `raw` (scalars and vectors), 0 for
+/// another type.
+fn constant_size(raw: u32) -> usize {
+    let (first, scalar) = match raw {
+        3..=6 => (3, 4),        // float
+        16..=19 => (16, 2),     // half
+        29..=32 => (29, 4),     // int
+        33..=36 => (33, 4),     // uint
+        37..=40 => (37, 2),     // short
+        41..=44 => (41, 2),     // ushort
+        45..=48 => (45, 1),     // char
+        49..=52 => (49, 1),     // uchar
+        53..=56 => (53, 1),     // bool
+        81..=84 => (81, 8),     // long
+        85..=88 => (85, 8),     // ulong
+        121..=124 => (121, 2),  // bfloat
+        _ => return 0,
+    };
+    (raw - first + 1) as usize * scalar
+}
+
+/// Asked for the value of each constant a function declares: write `len` bytes to `out` and
+/// answer 1, or answer 0 for a constant without a value.
+pub type SmtlConstantLookup = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    name: *const c_char,
+    index: u32,
+    data_type: u32,
+    out: *mut c_void,
+    len: u32,
+) -> i32;
+
+/// `newFunctionWithName:constantValues:error:` (and the descriptor form): the function `name`,
+/// specialized with the values `lookup` gives for the constants it declares. Metal's
+/// MTLFunctionConstantValues has no public getter, so the caller answers per constant.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_library_new_function_with_constants(
+    l: *mut Library,
+    name: *const c_char,
+    lookup: SmtlConstantLookup,
+    ctx: *mut c_void,
+) -> *mut Function {
+    let l = handle!(l, std::ptr::null_mut());
+    if name.is_null() {
+        set_error("newFunctionWithName:constantValues: NULL name".into());
+        return std::ptr::null_mut();
+    }
+    let name = CStr::from_ptr(name).to_string_lossy();
+    let declared = match l
+        .new_function_with_name(&name)
+        .and_then(|f| f.function_constants_dictionary())
+    {
+        Ok(d) => d,
+        Err(e) => {
+            set_error(format!("newFunctionWithName:constantValues: {e:?}"));
+            return std::ptr::null_mut();
+        }
+    };
+    let mut values = FunctionConstantValues::defaults();
+    for c in declared.values() {
+        let ty = c.data_type();
+        let size = constant_size(ty.as_raw());
+        if size == 0 {
+            continue;
+        }
+        let mut bytes = vec![0u8; size];
+        let cname = CString::new(c.name()).unwrap_or_default();
+        if lookup(ctx, cname.as_ptr(), c.index(), ty.as_raw(), bytes.as_mut_ptr().cast(), size as u32) == 1 {
+            values = values.with_index(c.index(), FunctionConstantValue::new(ty, bytes));
+        }
+    }
+    boxed(
+        "newFunctionWithName:constantValues:error:",
+        l.new_function_with_name_constant_values(&name, &values),
+    )
+}
 
 /// `functionType`: the MTLFunctionType raw value, 0 when it cannot be told.
 #[no_mangle]
@@ -741,6 +821,80 @@ pub unsafe extern "C" fn smtl_render_set_pipeline(
     status("setRenderPipelineState:", enc.set_render_pipeline_state(p))
 }
 
+/// MTLStencilDescriptor, raw Metal values.
+#[repr(C)]
+pub struct SmtlStencilDesc {
+    compare: u32,
+    stencil_failure: u32,
+    depth_failure: u32,
+    depth_stencil_pass: u32,
+    read_mask: u32,
+    write_mask: u32,
+}
+
+fn stencil(s: &SmtlStencilDesc) -> Result<StencilDescriptor, String> {
+    let mut d = StencilDescriptor::default();
+    d.stencil_compare_function = raw("MTLCompareFunction", s.compare)?;
+    d.stencil_failure_operation = raw::<StencilOperation>("MTLStencilOperation", s.stencil_failure)?;
+    d.depth_failure_operation = raw("MTLStencilOperation", s.depth_failure)?;
+    d.depth_stencil_pass_operation = raw("MTLStencilOperation", s.depth_stencil_pass)?;
+    d.read_mask = s.read_mask;
+    d.write_mask = s.write_mask;
+    Ok(d)
+}
+
+/// `newDepthStencilStateWithDescriptor:`
+#[no_mangle]
+pub unsafe extern "C" fn smtl_device_new_depth_stencil_state(
+    d: *mut SmtlDevice,
+    depth_compare: u32,
+    depth_write: i32,
+    front: *const SmtlStencilDesc,
+    back: *const SmtlStencilDesc,
+) -> *mut DepthStencilState {
+    let d = handle!(d, std::ptr::null_mut());
+    let (Some(front), Some(back)) = (front.as_ref(), back.as_ref()) else {
+        set_error("newDepthStencilStateWithDescriptor: NULL stencil".into());
+        return std::ptr::null_mut();
+    };
+    let desc = (|| -> Result<DepthStencilDescriptor, String> {
+        let mut desc = DepthStencilDescriptor::default();
+        desc.depth_compare_function = raw::<CompareFunction>("MTLCompareFunction", depth_compare)?;
+        desc.depth_write_enabled = depth_write != 0;
+        desc.front_face_stencil = stencil(front)?;
+        desc.back_face_stencil = stencil(back)?;
+        Ok(desc)
+    })();
+    match desc {
+        Ok(desc) => boxed("newDepthStencilStateWithDescriptor:", d.device.new_depth_stencil_state(&desc)),
+        Err(e) => {
+            set_error(e);
+            std::ptr::null_mut()
+        }
+    }
+}
+release!(smtl_depth_stencil_state_release, DepthStencilState);
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_render_set_depth_stencil_state(
+    e: *mut SmtlRenderEncoder,
+    s: *mut DepthStencilState,
+) -> i32 {
+    let enc = encoder!(e, "setDepthStencilState:");
+    status("setDepthStencilState:", enc.set_depth_stencil_state(s.as_ref()))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_render_set_stencil_reference(
+    e: *mut SmtlRenderEncoder,
+    front: u32,
+    back: u32,
+) -> i32 {
+    let enc = encoder!(e, "setStencilReferenceValue:");
+    enc.set_stencil_reference_values(front, back);
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn smtl_render_set_vertex_buffer(
     e: *mut SmtlRenderEncoder,
@@ -881,6 +1035,52 @@ pub unsafe extern "C" fn smtl_blit_copy_texture_to_buffer(
             BlitOption::None,
         ),
     )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_blit_copy_texture(
+    e: *mut SmtlBlitEncoder,
+    src: *mut Texture,
+    src_slice: u64,
+    src_level: u64,
+    src_origin: *const u64,         // x, y, z
+    size: *const u64,               // width, height, depth
+    dst: *mut Texture,
+    dst_slice: u64,
+    dst_level: u64,
+    dst_origin: *const u64,
+) -> i32 {
+    let enc = encoder!(e, "copyFromTexture:toTexture:");
+    let src = handle!(src, -1);
+    let dst = handle!(dst, -1);
+    if src_origin.is_null() || size.is_null() || dst_origin.is_null() {
+        set_error("copyFromTexture:toTexture: NULL origin or size".into());
+        return -1;
+    }
+    let so = std::slice::from_raw_parts(src_origin, 3);
+    let sz = std::slice::from_raw_parts(size, 3);
+    let dor = std::slice::from_raw_parts(dst_origin, 3);
+    status(
+        "copyFromTexture:...toTexture:",
+        enc.copy_from_texture_to_texture(
+            src,
+            src_slice,
+            src_level,
+            Origin::new(so[0], so[1], so[2]),
+            Size::new(sz[0], sz[1], sz[2]),
+            dst,
+            dst_slice,
+            dst_level,
+            Origin::new(dor[0], dor[1], dor[2]),
+        ),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_blit_generate_mipmaps(e: *mut SmtlBlitEncoder, t: *mut Texture) -> i32 {
+    let enc = encoder!(e, "generateMipmapsForTexture:");
+    let t = handle!(t, -1);
+    status("generateMipmapsForTexture:", enc.generate_mipmaps(t))
 }
 
 #[no_mangle]
