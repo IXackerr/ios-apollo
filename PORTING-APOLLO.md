@@ -240,6 +240,11 @@ Results on the phone (kernel and bare-metal shim agree):
   mtltest): its device class passes Metal's checks (a `_MTLDevice`
   subclass conforming to `MTLDeviceSPI`), and compute, rendering and
   QuartzCore's library work through Metal's own descriptor objects.
+- IOSurfaces: SweetMetal renders into an IOSurface's own memory (a no-copy
+  buffer over the surface's mapping, SweetAdreno IMPORT_USER, turnip's
+  VK_EXT_external_memory_host). The GPU does not snoop the CPU caches, so
+  the import cleans and invalidates the pages first; without that some
+  3000 of 65536 pixels came back as stale lines.
 - GPU clock: the GMU sets the levels from the HFI perf table (305 to
   587 MHz on this speed bin); 587 MHz measured 1.93x the compute
   throughput of 305 MHz. The driver raises the level on submission and
