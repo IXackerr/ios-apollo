@@ -301,6 +301,36 @@ smstats(void)
 }
 @end
 
+/*
+ * A surface's pages as an image of the GPU (smtl_surface_image), shared by
+ * the textures CoreAnimation makes over the surface.
+ *
+ * Sampling it is sampling a linear image, which costs the Adreno about
+ * three times what an optimal (tiled) one does. So a surface whose
+ * contents stay as they are from one use to the next is also copied into
+ * an optimal texture, which its draws sample until the contents change:
+ * the surface's seed (bumped as a client unlocks it after writing) or a
+ * GPU write of this process (gen, bumped as a command buffer that renders
+ * into it is encoded and committed). A command buffer that renders into
+ * the surface itself samples the linear image, and no copy is made while
+ * one that does is not committed.
+ */
+@interface SweetSurfaceImage : NSObject {
+@public
+	smtl_surface_image *_s;
+	smtl_texture *_linear;          /* the image's texture, the copies' source */
+	IOSurfaceRef _surface;          /* retained */
+	MTLPixelFormat _format;
+	NSUInteger _width, _height;
+	uint64_t _gen;
+	smtl_texture *_tiled;           /* the optimal copy, or NULL */
+	uint32_t _tiledSeed, _lastSeed;
+	uint64_t _tiledGen, _lastGen;
+	BOOL _seen;
+	int _writers;                   /* command buffers rendering into it, not committed */
+}
+@end
+
 @interface SweetMetalTexture : SMBase <MTLTexture> {
 @public
 	smtl_texture *_t;
@@ -390,6 +420,8 @@ regionBytes(MTLRegion r, NSUInteger bpr, NSUInteger bpi)
 		    bytesPerRow:bpr toTexture:YES]) {
 			SMError(@"replaceRegion: (surface)");
 		}
+		/* new contents: an optimal copy of the old ones is stale */
+		__atomic_fetch_add(&((SweetSurfaceImage *)_image)->_gen, 1, __ATOMIC_RELEASE);
 		return;
 	}
 	const uint64_t reg[6] = { r.origin.x, r.origin.y, r.origin.z, r.size.width, r.size.height,
@@ -669,9 +701,13 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 	unsigned _surfaceCount;
 	uint32_t _reads[32];            /* IOSurfaces its commands read */
 	unsigned _readCount;
+	NSMutableArray<SweetSurfaceImage *> *_written;  /* surface images it renders into */
+	smtl_queue *_rawQueue;
 }
 @property (copy, atomic) NSString *label;
 - (void)readsTexture:(id<MTLTexture>)t;
+- (smtl_texture *)sampled:(id<MTLTexture>)t;
+- (void)writesImage:(SweetSurfaceImage *)image;
 @end
 
 @interface SweetMetalRenderEncoder : SMBase <MTLRenderCommandEncoder> {
@@ -716,7 +752,7 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 }
 - (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i
 {
-	SMCHECK(smtl_render_set_vertex_texture(_e, t ? ((SweetMetalTexture *)t)->_t : NULL, (uint32_t)i));
+	SMCHECK(smtl_render_set_vertex_texture(_e, [_cb sampled:t], (uint32_t)i));
 	[_cb readsTexture:t];
 }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i
@@ -802,7 +838,7 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 }
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i
 {
-	SMCHECK(smtl_render_set_fragment_texture(_e, t ? ((SweetMetalTexture *)t)->_t : NULL, (uint32_t)i));
+	SMCHECK(smtl_render_set_fragment_texture(_e, [_cb sampled:t], (uint32_t)i));
 	[_cb readsTexture:t];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)p vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n
@@ -859,6 +895,9 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 	}
 	[_cb readsTexture:src];
 	[_cb readsTexture:dst];
+	if (((SweetMetalTexture *)dst)->_image != nil) {
+		[_cb writesImage:((SweetMetalTexture *)dst)->_image];
+	}
 }
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t
 {
@@ -920,6 +959,103 @@ runHandler(void *ctx)
 - (id<MTLCommandQueue>)commandQueue { return _queue; }
 - (id<MTLDevice>)device { return _queue.device; }
 - (MTLCommandBufferStatus)status { return (MTLCommandBufferStatus)smtl_cmdbuf_status(_c); }
+- (void)writesImage:(SweetSurfaceImage *)image
+{
+	if (_written == nil) {
+		_written = [NSMutableArray new];
+	}
+	if (![_written containsObject:image]) {
+		[_written addObject:image];
+		__atomic_fetch_add(&image->_writers, 1, __ATOMIC_ACQ_REL);
+		__atomic_fetch_add(&image->_gen, 1, __ATOMIC_RELEASE);
+	}
+}
+
+static BOOL smLinearOnly;       /* SWEETMETAL_LINEAR_SURFACES: no optimal copies */
+
+static void
+smCopyDone(void *ctx)
+{
+	sgpu_surface_use(smGpu, (uint32_t)(uintptr_t)ctx, -1);
+}
+
+/* The texture a draw samples for t: an IOSurface's optimal copy where it holds the contents. */
+- (smtl_texture *)sampled:(id<MTLTexture>)texture
+{
+	SweetMetalTexture *t = (SweetMetalTexture *)texture;
+	if (t == nil) {
+		return NULL;
+	}
+	[self readsTexture:t];
+	SweetSurfaceImage *im = t->_image;
+	if (im == nil || smLinearOnly || im->_linear == NULL || _rawQueue == NULL ||
+	    [_written containsObject:im]) {
+		return t->_t;
+	}
+	uint32_t seed = IOSurfaceGetSeed(im->_surface);
+	uint64_t gen = __atomic_load_n(&im->_gen, __ATOMIC_ACQUIRE);
+	@synchronized (im) {
+		if (im->_tiled != NULL && seed == im->_tiledSeed && gen == im->_tiledGen) {
+			return im->_tiled;
+		}
+		if (__atomic_load_n(&im->_writers, __ATOMIC_ACQUIRE) != 0) {
+			return t->_t;
+		}
+		/* contents that change from one use to the next are sampled where they lie */
+		if (!im->_seen || seed != im->_lastSeed || gen != im->_lastGen) {
+			im->_seen = YES;
+			im->_lastSeed = seed;
+			im->_lastGen = gen;
+			return t->_t;
+		}
+		if (im->_tiled == NULL) {
+			struct smtl_texture_desc d = {
+				.texture_type = MTLTextureType2D,
+				.pixel_format = (uint32_t)im->_format,
+				.width = im->_width, .height = im->_height, .depth = 1,
+				.mipmap_level_count = 1, .sample_count = 1, .array_length = 1,
+				.usage = MTLTextureUsageShaderRead,
+				.swizzle = { MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
+					MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha },
+				.resource_options = MTLResourceStorageModePrivate,
+			};
+			im->_tiled = smtl_device_new_texture(smDev, &d);
+			if (im->_tiled == NULL) {
+				return t->_t;
+			}
+		}
+		/*
+		 * The copy goes in a command buffer of this queue committed now,
+		 * which runs before this one, and after every earlier one that
+		 * wrote the surface or sampled the old copy.
+		 */
+		smtl_cmdbuf *c = smtl_queue_command_buffer(_rawQueue);
+		smtl_blit_encoder *e = c ? smtl_cmdbuf_blit_encoder(c) : NULL;
+		const uint64_t zero[3] = { 0, 0, 0 }, size[3] = { im->_width, im->_height, 1 };
+		BOOL ok = e != NULL && smtl_blit_copy_texture(e, im->_linear, 0, 0, zero, size,
+		    im->_tiled, 0, 0, zero) == 0;
+		if (e != NULL) {
+			ok = smtl_blit_end(e) == 0 && ok;
+		}
+		uint32_t sid = IOSurfaceGetID(im->_surface);
+		if (ok && smGpu != NULL && sgpu_surface_use(smGpu, sid, 1) == 0 &&
+		    smtl_cmdbuf_add_handler(c, 0, smCopyDone, (void *)(uintptr_t)sid) != 0) {
+			sgpu_surface_use(smGpu, sid, -1);
+		}
+		ok = ok && smtl_cmdbuf_commit(c) == 0;
+		if (c != NULL) {
+			smtl_cmdbuf_release(c);
+		}
+		if (!ok) {
+			SMError(@"surface copy");
+			return t->_t;
+		}
+		im->_tiledSeed = seed;
+		im->_tiledGen = gen;
+		return im->_tiled;
+	}
+}
+
 /* an IOSurface its commands read: held in use until it completes */
 - (void)readsTexture:(id<MTLTexture>)texture
 {
@@ -974,6 +1110,9 @@ smAttachment(struct smtl_attachment *to, MTLRenderPassAttachmentDescriptor *a)
 		pass.colors[i].clear[2] = a.clearColor.blue;
 		pass.colors[i].clear[3] = a.clearColor.alpha;
 		SweetMetalTexture *t = (SweetMetalTexture *)a.texture;
+		if (t->_image != nil) {
+			[self writesImage:t->_image];
+		}
 		if (t->_image != nil && t->_iosurface != NULL) {
 			uint32_t sid = IOSurfaceGetID(t->_iosurface);
 			unsigned k = 0;
@@ -1100,6 +1239,8 @@ countCompleted(void *ctx)
 {
 	/* every buffer reports its completion: smstats, its queue slot, and
 	 * what waits for it to be done (smSeqDone) */
+	NSArray<SweetSurfaceImage *> *written = _written;
+	_written = nil;
 	struct smDone *d = calloc(1, sizeof(*d));
 	d->slot = _slot ? (__bridge_retained void *)_slot : NULL;
 	d->seq = _seq;
@@ -1128,7 +1269,13 @@ countCompleted(void *ctx)
 			}
 		}
 	}
-	if (smtl_cmdbuf_commit(_c) != 0) {
+	int refused = smtl_cmdbuf_commit(_c);
+	/* its writes are queued now: copies of these surfaces may follow them */
+	for (SweetSurfaceImage *im in written) {
+		__atomic_fetch_add(&im->_gen, 1, __ATOMIC_RELEASE);
+		__atomic_fetch_sub(&im->_writers, 1, __ATOMIC_ACQ_REL);
+	}
+	if (refused != 0) {
 		/* a refused commit runs no handler (which keeps d, unused) */
 		if (d != NULL) {
 			smGiveBack(d);
@@ -1190,6 +1337,9 @@ countCompleted(void *ctx)
 		dispatch_semaphore_signal(_slot);
 	}
 	smtl_cmdbuf_release(_c);
+	for (SweetSurfaceImage *im in _written) {
+		__atomic_fetch_sub(&im->_writers, 1, __ATOMIC_ACQ_REL);
+	}
 	if (_seq != 0) {
 		smSeqDone(_seq);
 	}
@@ -1238,6 +1388,7 @@ countCompleted(void *ctx)
 	cb->_queue = self;
 	cb->_slot = slot ? _slots : nil;
 	cb->_seq = smSeqTake();
+	cb->_rawQueue = _q;
 	return cb;
 }
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
@@ -1259,15 +1410,18 @@ countCompleted(void *ctx)
  * destroyed, when the last of them and the device's cache let go: command
  * buffers that used it may still run (smRetire).
  */
-@interface SweetSurfaceImage : NSObject {
-@public
-	smtl_surface_image *_s;
-}
-@end
-
 @implementation SweetSurfaceImage
 - (void)dealloc
 {
+	if (_tiled != NULL) {
+		smtl_texture_release(_tiled);
+	}
+	if (_linear != NULL) {
+		smtl_texture_release(_linear);
+	}
+	if (_surface != NULL) {
+		CFRelease(_surface);
+	}
 	smRetire(_s);
 }
 @end
@@ -1402,6 +1556,7 @@ processAllowed(void)
 		smDev = _d;
 	}
 	_noSurfaceImages = getenv("SWEETMETAL_COPY_SURFACES") != NULL;
+	smLinearOnly = getenv("SWEETMETAL_LINEAR_SURFACES") != NULL;
 	SMLOG(@"device %@ ready in %s", _name, getprogname());
 	return self;
 }
@@ -1639,6 +1794,11 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 		}
 		image = [SweetSurfaceImage new];
 		image->_s = s;
+		image->_linear = smtl_surface_image_texture(s);
+		image->_surface = (IOSurfaceRef)CFRetain(surface);
+		image->_format = desc.pixelFormat;
+		image->_width = desc.width;
+		image->_height = desc.height;
 		[self keepSurface:image key:key];
 	}
 	smtl_texture *t = smtl_surface_image_texture(image->_s);
