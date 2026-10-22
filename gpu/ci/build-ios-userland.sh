@@ -23,7 +23,9 @@ if [ ! -d "$WORK/mesa" ]; then
   git clone --depth 1 --branch "$MESA_REV" https://github.com/chaotic-cx/mesa-mirror.git "$WORK/mesa"
   git -C "$WORK/mesa" apply "$ROOT/mesa/0001-turnip-sweet-kernel-backend.patch"
 fi
-pip3 install --user -q meson mako pyyaml packaging
+python3 -m venv "$WORK/venv"
+. "$WORK/venv/bin/activate"
+pip install -q meson ninja mako pyyaml packaging
 command -v glslangValidator >/dev/null || brew install glslang
 meson setup "$WORK/mesa-build" "$WORK/mesa" --cross-file "$ROOT/mesa/ios-arm64.ini" \
   --buildtype=release -Db_ndebug=true \
