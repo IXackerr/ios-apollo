@@ -1,0 +1,36 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -242,9 +242,17 @@
+ 			}
+ 		}
+ 		if (step == 6) {
+-			/* LCD: the panel is black, now the backlight */
+-			sweet_backlight_power(false);
+-			sweet_wled_power(false);
++			/*
++			 * LCD: the panel is black, now the backlight. Decide under the
++			 * lock that RequestPowerChange holds while it turns the
++			 * backlight on, so a display-on arriving meanwhile wins.
++			 */
++			IOLockLock(fb->fLock);
++			if (fb->fPowerOff && fb->fFadeStep == 7) {
++				sweet_backlight_power(false);
++				sweet_wled_power(false);
++			}
++			IOLockUnlock(fb->fLock);
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+@@ -548,11 +556,11 @@
+ 				fFB->fFadeStep = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+-			IOLockUnlock(fFB->fLock);
+ 			if (!off) {
+ 				sweet_wled_power(true);
+ 				sweet_backlight_power(true);
+ 			}
++			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
