@@ -22,6 +22,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
+#include <sys/errno.h>
 
 extern "C" {
 #include "../../../bsd/dev/sweet_gpu.h"

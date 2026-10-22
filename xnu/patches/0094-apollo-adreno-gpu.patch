@@ -5433,7 +5433,7 @@
 +#endif /* SWEET */
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdrenoDMA.cpp
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,102 @@
 +/*
 + * sweet_gpu_os_dma.cpp - physically contiguous DMA memory for the SWEET
 + * Adreno driver, built on IOBufferMemoryDescriptor.
@@ -5458,6 +5458,7 @@
 +#include <IOKit/IOBufferMemoryDescriptor.h>
 +#include <IOKit/IOMemoryDescriptor.h>
 +#include <IOKit/IOLib.h>
++#include <sys/errno.h>
 +
 +extern "C" {
 +#include "../../../bsd/dev/sweet_gpu.h"
