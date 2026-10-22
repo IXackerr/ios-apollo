@@ -6,7 +6,13 @@ address comes from the sweet live FDT. Usage:
 
   mkadt.py OUT.adt [--dump] [--qemu] [--highmem]                  # sweet
   mkadt.py OUT.adt --board apollo --phys-base HEX --mem-size HEX  # Mi 10T (Pro)
-           [--touch-fw novatek_nt36675_j3s_fw01.bin]
+           [--touch-fw novatek_nt36675_j3s_fw01.bin] [--gpu-fw DIR]
+
+--gpu-fw DIR adds /sweet-gpu with the phone's own a650_sqe.fw, a650_gmu.bin
+and a650_zap (.mbn, or .mdt + .bNN which are joined like tools/mkzap.py)
+for SweetAdreno (patch 0094). The blobs are Qualcomm/Xiaomi proprietary:
+copy them from the phone's /vendor/firmware and keep them outside git; the
+ADT is a local build product.
 
 For apollo the RAM window has no default on purpose: take it from the
 phone's live FDT with tools/fdtmem.py (see PORTING-APOLLO.md). The touch
@@ -114,8 +120,44 @@ def node(name, props=(), children=()):
     return n
 
 
+def gpu_node(fwdir, ph):
+    """/sweet-gpu for bsd/dev/sweet_gpu_core.c (load_firmware_refs)."""
+    def blob(*names):
+        for n in names:
+            p = os.path.join(fwdir, n)
+            if os.path.exists(p):
+                return open(p, 'rb').read()
+        return None
+    sqe = blob('a650_sqe.fw')
+    gmu = blob('a650_gmu.bin')
+    if sqe is None or gmu is None:
+        raise SystemExit(f'--gpu-fw {fwdir}: need a650_sqe.fw and a650_gmu.bin')
+    zap = blob('a650_zap.mbn', 'a650_zap.elf')
+    if zap is None and os.path.exists(os.path.join(fwdir, 'a650_zap.mdt')):
+        import mkzap  # tools/mkzap.py
+        zap = mkzap.join(os.path.join(fwdir, 'a650_zap.mdt'))
+    props = [
+        ph(),
+        ('compatible', cstr('qcom,adreno-650.2')),
+        ('chip-id', u32(0x06050002)),
+        ('sqe-firmware', sqe),
+        ('gmu-firmware', gmu),
+        # pil_gpu_region from the stock DT (sm8250 gpu_mem): TZ authenticates
+        # the zap image there (PAS id 13)
+        ('zap-region', u64(0x8681a000, 0x2000)),
+    ]
+    if zap is not None:
+        props.append(('zap-firmware', zap))
+    else:
+        print('mkadt: no a650_zap in --gpu-fw: secure mode can only be left on an '
+              'unlocked TZ (RBBM_SECVID_TRUST_CNTL)', file=sys.stderr)
+    print(f'mkadt: /sweet-gpu sqe {len(sqe)} gmu {len(gmu)} zap {len(zap) if zap else 0} bytes',
+          file=sys.stderr)
+    return node('sweet-gpu', props)
+
+
 def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, mem_size=None,
-          touch_fw=None):
+          touch_fw=None, gpu_fw=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     b = BOARDS[board]
     if phys_base is None or mem_size is None:
@@ -284,6 +326,10 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
             ('reg', b''.join(u64(base, 0x1000) for base, _ in b['cpufreq'])),
             ('target-mhz', b''.join(u32(mhz) for _, mhz in b['cpufreq'])),
         ]))
+    if gpu_fw:
+        if board != 'apollo':
+            raise SystemExit('--gpu-fw: only the apollo (SM8250 / Adreno 650) board')
+        extra.append(gpu_node(gpu_fw, ph))
     if b['touch']:
         extra.append(node('sweet-touch', [
             ph(),
@@ -324,7 +370,8 @@ if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, board=board,
                  phys_base=_opt('--phys-base', lambda x: int(x, 0)),
                  mem_size=_opt('--mem-size', lambda x: int(x, 0)),
-                 touch_fw=_opt('--touch-fw', lambda f: open(f, 'rb').read()))
+                 touch_fw=_opt('--touch-fw', lambda f: open(f, 'rb').read()),
+                 gpu_fw=_opt('--gpu-fw'))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

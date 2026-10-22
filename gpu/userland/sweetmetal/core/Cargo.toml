@@ -1,0 +1,20 @@
+[package]
+name = "sweetmetal-core"
+version = "0.1.0"
+edition = "2021"
+description = "C ABI over metal2vulkan-runtime for the SweetMetal iOS Metal driver plugin"
+# metal2vulkan is GPL-2.0-or-later OR LGPL-3.0-or-later; ship this as its own dylib
+# (libsweetmetal_core.dylib) so SweetMetal.bundle only links it dynamically (LGPL).
+license = "LGPL-3.0-or-later"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+# Pinned to the revision tested on 2026-10-21 (Linux, turnip over the SoC model).
+# metal2vulkan asks for Rust 1.98; 1.97 builds it with `cargo build --ignore-rust-version`.
+metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan", rev = "a2c440b8bcdcf20d34aa1694b61ae22c2a7ea68b" }
+metal2vulkan-runtime = { git = "https://github.com/steelbrain/metal2vulkan", rev = "a2c440b8bcdcf20d34aa1694b61ae22c2a7ea68b" }
+
+[profile.release]
+panic = "abort"

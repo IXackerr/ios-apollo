@@ -1,0 +1,632 @@
+/*
+ * SweetMetal.bundle - the Metal driver plugin of the SWEET iOS port.
+ *
+ *   Metal.framework --(MetalPluginName/MetalPluginClassName on the
+ *   SweetAdreno service, -initWithAcceleratorPort:)--> SweetMetalDevice
+ *   --> libsweetmetal_core (C ABI over metal2vulkan-runtime)
+ *   --> Vulkan (Mesa turnip, sweet backend) --> SweetAdreno (XNU)
+ *
+ * STATUS: skeleton, not compiled yet (needs the iOS 16 SDK; build notes in
+ * docs/METAL.md). The Objective-C side is deliberately thin: each class
+ * holds one smtl_* handle and forwards. The open questions that decide its
+ * final shape are RE items in docs/METAL.md section 4 (does iOS 16 load the
+ * plugin through -initWithAcceleratorPort:, must the device subclass
+ * MTLIOAccelDevice, which selectors QuartzCore sends).
+ *
+ * Bring-up aid: every class answers unknown selectors with a log line
+ * ("SweetMetal: -[SweetMetalDevice fooBar:] not implemented") and nil/0
+ * instead of raising, so running backboardd with sweetmetal=1 produces the
+ * exact list of methods still to implement.
+ *
+ * Licence: this file is ours; libsweetmetal_core is LGPL-3.0-or-later
+ * (metal2vulkan) and is linked dynamically.
+ */
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#import <IOSurface/IOSurfaceRef.h>
+#import <objc/runtime.h>
+#import <os/log.h>
+#include "sweetmetal.h"
+#include "sweetgpu.h"
+
+#define SMLOG(fmt, ...) os_log(OS_LOG_DEFAULT, "SweetMetal: " fmt, ##__VA_ARGS__)
+
+static NSError *
+SMError(NSString *what)
+{
+	NSString *why = [NSString stringWithFormat:@"%@: %s", what, smtl_last_error()];
+	SMLOG("%{public}@", why);
+	return [NSError errorWithDomain:@"SweetMetal" code:-1
+	    userInfo:@{ NSLocalizedDescriptionKey: why }];
+}
+
+/* ---------------------------------------------------------------- */
+/* Unknown-selector logging (shared by every class)                 */
+/* ---------------------------------------------------------------- */
+
+@interface SMBase : NSObject
+@end
+
+@implementation SMBase
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
+{
+	NSMethodSignature *sig = [super methodSignatureForSelector:sel];
+	if (sig == nil) {
+		/* answer as "returns id, takes nothing": the invocation is swallowed */
+		sig = [NSMethodSignature signatureWithObjCTypes:"@@:"];
+	}
+	return sig;
+}
+
+- (void)forwardInvocation:(NSInvocation *)inv
+{
+	SMLOG("-[%{public}s %{public}s] not implemented", class_getName([self class]),
+	    sel_getName(inv.selector));
+	id nilResult = nil;
+	if (inv.methodSignature.methodReturnLength == sizeof(id)) {
+		[inv setReturnValue:&nilResult];
+	}
+}
+@end
+
+/* ---------------------------------------------------------------- */
+/* Resources                                                        */
+/* ---------------------------------------------------------------- */
+
+@interface SweetMetalBuffer : SMBase <MTLBuffer> {
+@public
+	smtl_buffer *_b;
+	id<MTLDevice> _device;
+	MTLResourceOptions _options;
+}
+@property (copy, atomic) NSString *label;
+@end
+
+@implementation SweetMetalBuffer
+- (void *)contents { return smtl_buffer_contents(_b); }
+- (NSUInteger)length { return (NSUInteger)smtl_buffer_length(_b); }
+- (uint64_t)gpuAddress { return smtl_buffer_gpu_address(_b); }
+- (id<MTLDevice>)device { return _device; }
+- (MTLResourceOptions)resourceOptions { return _options; }
+- (MTLStorageMode)storageMode { return (MTLStorageMode)((_options >> 4) & 0xf); }
+- (MTLCPUCacheMode)cpuCacheMode { return (MTLCPUCacheMode)(_options & 0xf); }
+- (void)didModifyRange:(NSRange)range { /* unified memory: nothing to do */ }
+- (void)dealloc { smtl_buffer_release(_b); }
+@end
+
+@interface SweetMetalTexture : SMBase <MTLTexture> {
+@public
+	smtl_texture *_t;
+	id<MTLDevice> _device;
+	MTLPixelFormat _format;
+	NSUInteger _width, _height;
+	MTLTextureUsage _usage;
+	IOSurfaceRef _iosurface;        /* retained, for -iosurface */
+	NSUInteger _plane;
+	SweetMetalBuffer *_backing;     /* buffer standing for the surface */
+}
+@property (copy, atomic) NSString *label;
+@end
+
+@implementation SweetMetalTexture
+- (id<MTLDevice>)device { return _device; }
+- (MTLPixelFormat)pixelFormat { return _format; }
+- (NSUInteger)width { return _width; }
+- (NSUInteger)height { return _height; }
+- (NSUInteger)depth { return 1; }
+- (NSUInteger)mipmapLevelCount { return 1; }
+- (NSUInteger)arrayLength { return 1; }
+- (NSUInteger)sampleCount { return 1; }
+- (MTLTextureType)textureType { return MTLTextureType2D; }
+- (MTLTextureUsage)usage { return _usage; }
+- (IOSurfaceRef)iosurface { return _iosurface; }
+- (NSUInteger)iosurfacePlane { return _plane; }
+- (BOOL)isFramebufferOnly { return NO; }
+- (void)dealloc
+{
+	smtl_texture_release(_t);
+	if (_iosurface) {
+		CFRelease(_iosurface);
+	}
+}
+@end
+
+/* ---------------------------------------------------------------- */
+/* Shaders and pipelines                                            */
+/* ---------------------------------------------------------------- */
+
+@interface SweetMetalFunction : SMBase <MTLFunction> {
+@public
+	smtl_function *_f;
+	id<MTLDevice> _device;
+	NSString *_name;
+}
+@property (copy, atomic) NSString *label;
+@end
+
+@implementation SweetMetalFunction
+- (NSString *)name { return _name; }
+- (id<MTLDevice>)device { return _device; }
+- (void)dealloc { smtl_function_release(_f); }
+@end
+
+@interface SweetMetalLibrary : SMBase <MTLLibrary> {
+@public
+	smtl_library *_l;
+	id<MTLDevice> _device;
+}
+@property (copy, atomic) NSString *label;
+@end
+
+@implementation SweetMetalLibrary
+- (id<MTLDevice>)device { return _device; }
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name
+{
+	smtl_function *f = smtl_library_new_function(_l, name.UTF8String);
+	if (f == NULL) {
+		SMError([NSString stringWithFormat:@"newFunctionWithName:%@", name]);
+		return nil;
+	}
+	SweetMetalFunction *fn = [SweetMetalFunction new];
+	fn->_f = f;
+	fn->_device = _device;
+	fn->_name = [name copy];
+	return fn;
+}
+- (void)dealloc { smtl_library_release(_l); }
+@end
+
+@interface SweetMetalComputePipelineState : SMBase <MTLComputePipelineState> {
+@public
+	smtl_compute_pipeline *_p;
+	id<MTLDevice> _device;
+}
+@end
+
+@implementation SweetMetalComputePipelineState
+- (id<MTLDevice>)device { return _device; }
+- (NSUInteger)maxTotalThreadsPerThreadgroup { return (NSUInteger)smtl_compute_pipeline_max_threads(_p); }
+- (NSUInteger)threadExecutionWidth { return (NSUInteger)smtl_compute_pipeline_execution_width(_p); }
+- (void)dealloc { smtl_compute_pipeline_release(_p); }
+@end
+
+@interface SweetMetalRenderPipelineState : SMBase <MTLRenderPipelineState> {
+@public
+	smtl_render_pipeline *_p;
+	id<MTLDevice> _device;
+}
+@end
+
+@implementation SweetMetalRenderPipelineState
+- (id<MTLDevice>)device { return _device; }
+- (void)dealloc { smtl_render_pipeline_release(_p); }
+@end
+
+/* ---------------------------------------------------------------- */
+/* Command submission                                               */
+/* ---------------------------------------------------------------- */
+
+@interface SweetMetalCommandBuffer : SMBase <MTLCommandBuffer> {
+@public
+	smtl_cmdbuf *_c;
+	id<MTLCommandQueue> _queue;
+	NSMutableArray<MTLCommandBufferHandler> *_completed;
+}
+@property (copy, atomic) NSString *label;
+@end
+
+@interface SweetMetalRenderEncoder : SMBase <MTLRenderCommandEncoder> {
+@public
+	smtl_render_encoder *_e;
+	SweetMetalCommandBuffer *_cb;
+}
+@property (copy, atomic) NSString *label;
+@end
+
+@implementation SweetMetalRenderEncoder
+- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)s
+{
+	smtl_render_set_pipeline(_e, ((SweetMetalRenderPipelineState *)s)->_p);
+}
+- (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i
+{
+	smtl_render_set_vertex_buffer(_e, b ? ((SweetMetalBuffer *)b)->_b : NULL, o, (uint32_t)i);
+}
+- (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i
+{
+	smtl_render_set_fragment_buffer(_e, b ? ((SweetMetalBuffer *)b)->_b : NULL, o, (uint32_t)i);
+}
+- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i
+{
+	smtl_render_set_fragment_texture(_e, t ? ((SweetMetalTexture *)t)->_t : NULL, (uint32_t)i);
+}
+- (void)drawPrimitives:(MTLPrimitiveType)p vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n
+{
+	smtl_render_draw_primitives(_e, (uint32_t)p, s, n, 1, 0);
+}
+- (void)drawPrimitives:(MTLPrimitiveType)p vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n
+    instanceCount:(NSUInteger)ic
+{
+	smtl_render_draw_primitives(_e, (uint32_t)p, s, n, ic, 0);
+}
+- (void)endEncoding
+{
+	if (smtl_render_end(_e) != 0) {
+		SMError(@"render endEncoding");
+	}
+	_e = NULL;
+}
+@end
+
+@interface SweetMetalBlitEncoder : SMBase <MTLBlitCommandEncoder> {
+@public
+	smtl_blit_encoder *_e;
+}
+@property (copy, atomic) NSString *label;
+@end
+
+@implementation SweetMetalBlitEncoder
+- (void)copyFromBuffer:(id<MTLBuffer>)src sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)dst
+    destinationOffset:(NSUInteger)dof size:(NSUInteger)size
+{
+	smtl_blit_copy_buffer(_e, ((SweetMetalBuffer *)src)->_b, so, ((SweetMetalBuffer *)dst)->_b,
+	    dof, size);
+}
+- (void)endEncoding
+{
+	smtl_blit_end(_e);
+	_e = NULL;
+}
+@end
+
+@implementation SweetMetalCommandBuffer
+- (id<MTLCommandQueue>)commandQueue { return _queue; }
+- (id<MTLDevice>)device { return _queue.device; }
+- (MTLCommandBufferStatus)status { return (MTLCommandBufferStatus)smtl_cmdbuf_status(_c); }
+- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d
+{
+	struct smtl_color_attachment ca[8];
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < 8; i++) {
+		MTLRenderPassColorAttachmentDescriptor *a = d.colorAttachments[i];
+		if (a.texture == nil) {
+			continue;
+		}
+		n = i + 1;
+		ca[i] = (struct smtl_color_attachment){
+			.texture = ((SweetMetalTexture *)a.texture)->_t,
+			.load_action = (uint32_t)a.loadAction,
+			.store_action = (uint32_t)a.storeAction,
+			.clear = { a.clearColor.red, a.clearColor.green, a.clearColor.blue, a.clearColor.alpha },
+		};
+	}
+	smtl_render_encoder *e = smtl_cmdbuf_render_encoder(_c, ca, n);
+	if (e == NULL) {
+		SMError(@"renderCommandEncoderWithDescriptor:");
+		return nil;
+	}
+	SweetMetalRenderEncoder *enc = [SweetMetalRenderEncoder new];
+	enc->_e = e;
+	enc->_cb = self;
+	return enc;
+}
+- (id<MTLBlitCommandEncoder>)blitCommandEncoder
+{
+	smtl_blit_encoder *e = smtl_cmdbuf_blit_encoder(_c);
+	if (e == NULL) {
+		SMError(@"blitCommandEncoder");
+		return nil;
+	}
+	SweetMetalBlitEncoder *enc = [SweetMetalBlitEncoder new];
+	enc->_e = e;
+	return enc;
+}
+- (void)addCompletedHandler:(MTLCommandBufferHandler)h
+{
+	if (_completed == nil) {
+		_completed = [NSMutableArray new];
+	}
+	[_completed addObject:[h copy]];
+}
+- (void)commit
+{
+	if (smtl_cmdbuf_commit(_c) != 0) {
+		SMError(@"commit");
+		return;
+	}
+	if (_completed.count) {
+		/* completion handlers run off the committing thread, as Metal's do */
+		NSArray *handlers = [_completed copy];
+		dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+			smtl_cmdbuf_wait(self->_c, 60000);
+			for (MTLCommandBufferHandler h in handlers) {
+				h(self);
+			}
+		});
+	}
+}
+- (void)waitUntilCompleted
+{
+	smtl_cmdbuf_wait(_c, UINT32_MAX);
+}
+- (void)presentDrawable:(id<MTLDrawable>)drawable
+{
+	/* CAMetalLayer drawables are IOSurfaces; presenting is QuartzCore's job
+	 * once the command buffer completes (docs/METAL.md, drawables) */
+	[self addCompletedHandler:^(id<MTLCommandBuffer> cb) { [drawable present]; }];
+}
+- (void)dealloc { smtl_cmdbuf_release(_c); }
+@end
+
+@interface SweetMetalCommandQueue : SMBase <MTLCommandQueue> {
+@public
+	smtl_queue *_q;
+	id<MTLDevice> _device;
+}
+@property (copy, atomic) NSString *label;
+@end
+
+@implementation SweetMetalCommandQueue
+- (id<MTLDevice>)device { return _device; }
+- (id<MTLCommandBuffer>)commandBuffer
+{
+	smtl_cmdbuf *c = smtl_queue_command_buffer(_q);
+	if (c == NULL) {
+		SMError(@"commandBuffer");
+		return nil;
+	}
+	SweetMetalCommandBuffer *cb = [SweetMetalCommandBuffer new];
+	cb->_c = c;
+	cb->_queue = self;
+	return cb;
+}
+- (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
+- (void)dealloc { smtl_queue_release(_q); }
+@end
+
+/* ---------------------------------------------------------------- */
+/* The device                                                       */
+/* ---------------------------------------------------------------- */
+
+@interface SweetMetalDevice : SMBase <MTLDevice> {
+@public
+	smtl_device *_d;
+	sgpu_dev *_gpu;
+	mach_port_t _acceleratorPort;
+	NSString *_name;
+}
+@end
+
+@implementation SweetMetalDevice
+
+/*
+ * Plugin entry point (macOS: Metal.framework calls this on the
+ * MetalPluginClassName class; to verify for iOS 16, docs/METAL.md RE-1).
+ * We do NOT call -[MTLIOAccelDevice initWithAcceleratorPort:]: that would
+ * need the IOAccelerator kernel ABI, which our XNU does not have.
+ */
+- (instancetype)initWithAcceleratorPort:(mach_port_t)port
+{
+	if ((self = [super init]) == nil) {
+		return nil;
+	}
+	_acceleratorPort = port;
+	NSString *bundle = [NSBundle bundleForClass:[self class]].bundlePath;
+	NSString *vk = [bundle stringByAppendingPathComponent:@"libsweetvk.dylib"];
+	NSString *cache = [NSTemporaryDirectory() stringByAppendingPathComponent:@"SweetMetalCache"];
+	_d = smtl_device_create(vk.fileSystemRepresentation, cache.fileSystemRepresentation);
+	if (_d == NULL) {
+		SMError(@"device");
+		return nil;
+	}
+	_name = [NSString stringWithUTF8String:smtl_device_name(_d)];
+	sgpu_open(&_gpu);       /* for IOSurface import (IMPORT_SURFACE) */
+	SMLOG("device %{public}@ ready in %{public}s", _name, getprogname());
+	return self;
+}
+
+- (instancetype)init { return [self initWithAcceleratorPort:MACH_PORT_NULL]; }
+
+- (NSString *)name { return _name; }
+- (uint64_t)registryID { return smtl_device_registry_id(_d); }
+- (BOOL)isLowPower { return NO; }
+- (BOOL)isHeadless { return NO; }
+- (BOOL)isRemovable { return NO; }
+- (BOOL)hasUnifiedMemory { return YES; }
+- (MTLSize)maxThreadsPerThreadgroup { return MTLSizeMake(1024, 1024, 1024); }
+- (NSUInteger)maxBufferLength { return 1ull << 30; }
+- (BOOL)supportsFamily:(MTLGPUFamily)family
+{
+	/* start honest and small; raise as features land (docs/METAL.md) */
+	switch (family) {
+	case MTLGPUFamilyApple1:
+	case MTLGPUFamilyApple2:
+	case MTLGPUFamilyApple3:
+	case MTLGPUFamilyCommon1:
+	case MTLGPUFamilyCommon2:
+		return YES;
+	default:
+		return NO;
+	}
+}
+
+- (id<MTLCommandQueue>)newCommandQueue
+{
+	smtl_queue *q = smtl_device_new_command_queue(_d);
+	if (q == NULL) {
+		SMError(@"newCommandQueue");
+		return nil;
+	}
+	SweetMetalCommandQueue *queue = [SweetMetalCommandQueue new];
+	queue->_q = q;
+	queue->_device = self;
+	return queue;
+}
+- (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)n
+{
+	return [self newCommandQueue];
+}
+
+static SweetMetalBuffer *
+wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
+{
+	if (b == NULL) {
+		SMError(@"newBuffer");
+		return nil;
+	}
+	SweetMetalBuffer *buf = [SweetMetalBuffer new];
+	buf->_b = b;
+	buf->_device = d;
+	buf->_options = o;
+	return buf;
+}
+
+- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)o
+{
+	return wrapBuffer(self, smtl_device_new_buffer(_d, len, o), o);
+}
+- (id<MTLBuffer>)newBufferWithBytes:(const void *)p length:(NSUInteger)len options:(MTLResourceOptions)o
+{
+	return wrapBuffer(self, smtl_device_new_buffer_with_bytes(_d, p, len, o), o);
+}
+
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)desc
+{
+	smtl_texture *t = smtl_device_new_texture_2d(_d, (uint32_t)desc.pixelFormat, desc.width,
+	    desc.height, desc.mipmapLevelCount > 1, (uint32_t)desc.usage, desc.resourceOptions);
+	if (t == NULL) {
+		SMError(@"newTextureWithDescriptor:");
+		return nil;
+	}
+	SweetMetalTexture *tex = [SweetMetalTexture new];
+	tex->_t = t;
+	tex->_device = self;
+	tex->_format = desc.pixelFormat;
+	tex->_width = desc.width;
+	tex->_height = desc.height;
+	tex->_usage = desc.usage;
+	return tex;
+}
+
+/*
+ * CoreAnimation's path: render into the IOSurface of a layer. The surface's
+ * pages are imported into the GPU by SweetAdreno (IMPORT_SURFACE, the
+ * SweetSurface id = IOSurfaceGetID) and stand behind a buffer; the texture
+ * is plane `plane` of that buffer. TODO(next): the buffer must come from
+ * turnip's import of that kernel object (sweet backend bo_init_dmabuf with
+ * the surface id) and metal2vulkan's Device::new_buffer_with_vk_buffer;
+ * until then this allocates a staging buffer and logs.
+ */
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)desc
+    iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
+{
+	size_t bpr = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
+	size_t size = IOSurfaceGetAllocSize(surface);
+	size_t planes = IOSurfaceGetPlaneCount(surface);
+	uint64_t offset = planes ? (uint64_t)((uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface, plane) -
+	    (uint8_t *)IOSurfaceGetBaseAddress(surface)) : 0;
+	SMLOG("iosurface %u %zux%zu plane %lu bpr %zu (import path pending, docs/METAL.md)",
+	    IOSurfaceGetID(surface), IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
+	    (unsigned long)plane, bpr);
+	SweetMetalBuffer *backing = wrapBuffer(self, smtl_device_new_buffer(_d, size, 0), 0);
+	if (backing == nil) {
+		return nil;
+	}
+	smtl_texture *t = smtl_buffer_new_iosurface_texture(backing->_b, (uint32_t)desc.pixelFormat,
+	    desc.width, desc.height, (uint32_t)desc.usage, offset, bpr, planes > 0);
+	if (t == NULL) {
+		SMError(@"newTextureWithDescriptor:iosurface:plane:");
+		return nil;
+	}
+	SweetMetalTexture *tex = [SweetMetalTexture new];
+	tex->_t = t;
+	tex->_device = self;
+	tex->_format = desc.pixelFormat;
+	tex->_width = desc.width;
+	tex->_height = desc.height;
+	tex->_usage = desc.usage;
+	tex->_iosurface = (IOSurfaceRef)CFRetain(surface);
+	tex->_plane = plane;
+	tex->_backing = backing;
+	return tex;
+}
+
+- (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error
+{
+	const void *bytes = NULL;
+	size_t len = 0;
+	dispatch_data_t flat = dispatch_data_create_map(data, &bytes, &len);
+	smtl_library *l = smtl_device_new_library_with_data(_d, bytes, len);
+	(void)flat;
+	if (l == NULL) {
+		if (error) {
+			*error = SMError(@"newLibraryWithData:");
+		}
+		return nil;
+	}
+	SweetMetalLibrary *lib = [SweetMetalLibrary new];
+	lib->_l = l;
+	lib->_device = self;
+	return lib;
+}
+
+- (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error
+{
+	NSData *d = [NSData dataWithContentsOfURL:url options:NSDataReadingMappedIfSafe error:error];
+	if (d == nil) {
+		return nil;
+	}
+	dispatch_data_t dd = dispatch_data_create(d.bytes, d.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+	return [self newLibraryWithData:dd error:error];
+}
+
+- (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)fn
+    error:(NSError **)error
+{
+	smtl_compute_pipeline *p = smtl_device_new_compute_pipeline(_d, ((SweetMetalFunction *)fn)->_f);
+	if (p == NULL) {
+		if (error) {
+			*error = SMError(@"newComputePipelineStateWithFunction:");
+		}
+		return nil;
+	}
+	SweetMetalComputePipelineState *s = [SweetMetalComputePipelineState new];
+	s->_p = p;
+	s->_device = self;
+	return s;
+}
+
+- (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d
+    error:(NSError **)error
+{
+	uint32_t formats[8] = { 0 };
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < 8; i++) {
+		MTLPixelFormat f = d.colorAttachments[i].pixelFormat;
+		if (f != MTLPixelFormatInvalid) {
+			formats[i] = (uint32_t)f;
+			n = i + 1;
+		}
+	}
+	/* TODO: blending, vertex descriptor, depth/stencil formats, sample count */
+	smtl_render_pipeline *p = smtl_device_new_render_pipeline(_d,
+	    ((SweetMetalFunction *)d.vertexFunction)->_f,
+	    d.fragmentFunction ? ((SweetMetalFunction *)d.fragmentFunction)->_f : NULL, formats, n);
+	if (p == NULL) {
+		if (error) {
+			*error = SMError(@"newRenderPipelineStateWithDescriptor:");
+		}
+		return nil;
+	}
+	SweetMetalRenderPipelineState *s = [SweetMetalRenderPipelineState new];
+	s->_p = p;
+	s->_device = self;
+	return s;
+}
+
+- (void)dealloc
+{
+	smtl_device_release(_d);
+	sgpu_close(_gpu);
+}
+@end

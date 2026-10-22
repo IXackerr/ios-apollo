@@ -1,0 +1,18 @@
+#!/bin/sh
+# llvm-as wrapper: down-level LLVM 21 text, then assemble with llvm-as-18.
+# metal2vulkan calls it as: llvm-as [-o out] in.ll  (or reads stdin)
+set -e
+tmp=$(mktemp --suffix=.ll)
+args=""
+in=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) args="$args -o $2"; shift 2;;
+    -) in="-"; shift;;
+    -*) args="$args $1"; shift;;
+    *) in="$1"; shift;;
+  esac
+done
+if [ -z "$in" ] || [ "$in" = "-" ]; then cat > "$tmp.in"; in="$tmp.in"; fi
+python3 "$(dirname "$0")/ll21to18.py" "$in" "$tmp"
+exec llvm-as-18 $args "$tmp"

@@ -1,0 +1,9 @@
+hosttest/sgpu_hosttest
+hosttest/libsgpu_host.so
+hosttest/vktest
+build-ios/
+userland/sweetmetal/core/target/
+# GPU / zap firmware is Qualcomm/Xiaomi proprietary: never commit it
+*.fw
+a650_gmu.bin
+a650_zap.*

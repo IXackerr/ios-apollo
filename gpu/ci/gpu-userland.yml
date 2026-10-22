@@ -1,0 +1,37 @@
+# Copy to .github/workflows/gpu-userland.yml. Builds the iOS GPU userland
+# (turnip + sweet backend, libsweetgpu, gputest, sweetmetal-core,
+# SweetMetal.bundle) on the same macOS runner type as the kernel, and runs the
+# Linux host tests first. Written for the handoff, not yet run.
+name: gpu-userland
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "gpu/**"
+      - ".github/workflows/gpu-userland.yml"
+jobs:
+  hosttest:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kernel driver host test (register model)
+        run: make -C gpu/hosttest check
+      - name: arm64 compile of the driver C (inline asm, no XNU headers needed)
+        run: |
+          sudo apt-get install -y -q gcc-aarch64-linux-gnu
+          for f in gpu/kernel/sweet_gpu_*.c; do
+            case $f in *os_xnu.c) continue;; esac
+            aarch64-linux-gnu-gcc -std=gnu11 -O2 -Wall -Werror -Wno-unused-parameter \
+              -ffreestanding -mgeneral-regs-only -DARM64_BOARD_CONFIG_SWEET -c "$f" -o /dev/null
+          done
+  ios:
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: gpu/ci/build-ios-userland.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-userland-ios
+          path: gpu/build-ios/out

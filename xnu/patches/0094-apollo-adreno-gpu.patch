@@ -1,0 +1,5551 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,15 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_wled.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_gpu_clk.c			standard
++bsd/dev/sweet_gpu_cmddb.c			standard
++bsd/dev/sweet_gpu_core.c			standard
++bsd/dev/sweet_gpu_cp.c			standard
++bsd/dev/sweet_gpu_gmu.c			standard
++bsd/dev/sweet_gpu_mem.c			standard
++bsd/dev/sweet_gpu_scm.c			standard
++bsd/dev/sweet_gpu_smmu.c			standard
++bsd/dev/sweet_gpu_os_xnu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -56,6 +56,10 @@
+ # The compat header must come after the kernel's -D options, hence _CFLAGS_ADD.
+ SWEET_HFS_ROOT = $(SRCROOT)/bsd/sweet_hfs
+ SWEET_HFS_OBJS = BTree.o BTreeAllocate.o BTreeMiscOps.o BTreeNodeOps.o BTreeNodeReserve.o BTreeScanner.o BTreeTreeOps.o BTreeWrapper.o CatalogUtilities.o FileExtentMapping.o FileIDsServices.o MacOSStubs.o UnicodeWrappers.o VolumeAllocation.o hfs_attrlist.o hfs_btreeio.o hfs_catalog.o hfs_chash.o hfs_cnode.o hfs_cprotect.o hfs_endian.o hfs_extents.o hfs_fsinfo.o hfs_hotfiles.o hfs_journal.o hfs_link.o hfs_lookup.o hfs_notification.o hfs_quota.o hfs_readwrite.o hfs_resize.o hfs_search.o hfs_vfsops.o hfs_vfsutils.o hfs_vnops.o hfs_xattr.o rangelist.o hfs_encodinghint.o hfs_encodings.o sweet_hfs_iokit.o
++# SweetAdreno GPU driver (patch 0094): MMIO/DMA buffers are raw pointers;
++# newer clangs extend -Wunsafe-buffer-usage (part of -Weverything) to C.
++SWEET_GPU_OBJS = sweet_gpu_clk.o sweet_gpu_cmddb.o sweet_gpu_core.o sweet_gpu_cp.o sweet_gpu_gmu.o sweet_gpu_mem.o sweet_gpu_scm.o sweet_gpu_smmu.o sweet_gpu_os_xnu.o
++$(foreach o,$(SWEET_GPU_OBJS),$(eval $(o)_CWARNFLAGS_ADD += -Wno-unsafe-buffer-usage))
+ $(foreach o,$(SWEET_HFS_OBJS),$(eval $(o)_CFLAGS_ADD += -include $(SWEET_HFS_ROOT)/sweet_hfs_compat.h -I$(SWEET_HFS_ROOT) -I$(SWEET_HFS_ROOT)/core))
+ # HFSEncodings is a separate kext on Apple with its own allocation counter.
+ hfs_encodings.o_CFLAGS_ADD += -Dhfs_allocated=hfs_encodings_allocated
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_clk.c
+@@ -0,0 +1,231 @@
++/*
++ * sweet_gpu_clk.c - GPU clocks and the CX power domain on SM8250.
++ *
++ * No clock framework here: the registers are programmed directly, in the
++ * order Linux's a6xx_gmu_resume() ends up producing through gcc-sm8250.c,
++ * gpucc-sm8250.c, clk-rcg2.c, clk-branch.c and gdsc.c. Full derivation with
++ * file:line references: docs/specs/clocks-scm-zap-a650.md.
++ *
++ * What the CPU owns (and this file does):
++ *   GCC:    GPLL0 vote, GPLL0(+div) votes towards GPU_CC, GPU config AHB,
++ *           memnoc/axi/snoc-dvm branches
++ *   GPU_CC: GMU RCG at 200 MHz from GPLL0 even (no PLL needed), the
++ *           AHB / CX_GMU / CXO branches, the CX GDSC
++ * What the GMU firmware owns: the GX GDSC and the GX rail (gfx.lvl).
++ * GPU_CC_PLL1 (500 MHz GMU option) is not used.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SGPU_HOST)
++#include "sweet_gpu.h"
++
++/* GCC (base 0x00100000), offsets */
++#define GCC_GPLL0_MODE                  0x00000
++#define GCC_GPLL0_L_VAL                 0x00004
++#define GCC_APCS_GPLL_VOTE              0x52018         /* bit0 = GPLL0 */
++#define GCC_APCS_CLOCK_VOTE             0x52000
++#define   GCC_VOTE_GPU_GPLL0            (1u << 15)
++#define   GCC_VOTE_GPU_GPLL0_DIV        (1u << 16)
++#define GCC_GPU_CFG_AHB_CBCR            0x71004
++#define GCC_GPU_MEMNOC_GFX_CBCR         0x7100c
++#define GCC_GPU_SNOC_DVM_GFX_CBCR       0x71018
++#define GCC_GPU_MISC                    0x71028         /* [1:0] = 3 at Linux GCC probe */
++#define GCC_DDRSS_GPU_AXI_CBCR          0x71154
++
++/* GPU_CC (base 0x03d90000), offsets */
++#define GPUCC_GX_GDSCR                  0x100c
++#define GPUCC_GX_CFG_GDSCR              0x1010
++#define GPUCC_CX_GDSCR                  0x106c
++#define GPUCC_AHB_CBCR                  0x1078
++#define GPUCC_CX_GMU_CBCR               0x1098
++#define GPUCC_CXO_CBCR                  0x109c
++#define GPUCC_GMU_CMD_RCGR              0x1120
++#define GPUCC_GMU_CFG_RCGR              0x1124
++#define GPUCC_GX_CLAMP_IO               0x1508
++#define GPUCC_CX_GDS_HW_CTRL            0x1540
++
++/* clock register fields */
++#define PLL_ACTIVE_FLAG                 (1u << 30)
++#define CBCR_CLK_ENABLE                 (1u << 0)
++#define CBCR_CLK_OFF                    (1u << 31)
++#define CBCR_FSM_SHIFT                  28
++#define RCG_CMD_UPDATE                  (1u << 0)
++#define RCG_CMD_ROOT_OFF                (1u << 31)
++#define RCG_CFG_SRC_DIV_MASK            0x1fu
++#define RCG_CFG_SRC_SEL_MASK            (7u << 8)
++#define RCG_CFG_MODE_MASK               (3u << 12)
++#define RCG_CFG_HW_CLK_CTRL             (1u << 20)
++#define GMU_SRC_GPLL0_DIV               6u      /* parent map: gcc_gpu_gpll0_div_clk_src */
++#define GMU_DIV_200MHZ                  2u      /* 300 MHz / 1.5 -> pre_div 2*1.5-1 */
++#define GDSC_SW_COLLAPSE                (1u << 0)
++#define GDSC_INIT_MASK                  0x00fff006u     /* HW_CTRL|SW_OVERRIDE|waits */
++#define GDSC_INIT_VAL                   0x00282000u     /* EN_REST 2, EN_FEW 8, CLK_DIS 2 */
++#define GDS_HW_CTRL_PWR_ON              (1u << 31)
++#define GX_CFG_POWER_DOWN_COMPLETE      (1u << 15)
++
++static bool
++branch_is_on(uint32_t cbcr)
++{
++	return !(cbcr & CBCR_CLK_OFF) || ((cbcr >> CBCR_FSM_SHIFT) & 7u) == 2u;
++}
++
++/* Enable a branch clock; poll = false for HALT_DELAY branches. */
++static int
++branch_enable(struct sgpu *g, volatile uint8_t *base, uint32_t off, bool poll, const char *name)
++{
++	sgpu_rmw(base, off, 0, CBCR_CLK_ENABLE);
++	sgpu_wmb();
++	if (!poll) {
++		sgpu_udelay(10);
++		return 0;
++	}
++	for (int i = 0; i < 200; i++) {
++		if (branch_is_on(sgpu_rd(base, off))) {
++			return 0;
++		}
++		sgpu_udelay(1);
++	}
++	return sgpu_fail(g, -16, "clock %s stuck off, CBCR %#x", name, sgpu_rd(base, off));
++}
++
++int
++sgpu_clk_probe(struct sgpu *g)
++{
++	sgpu_log("gcc: GPLL0 mode %#x L %u (%u MHz), vote %#x/%#x misc %#x",
++	    sgpu_rd(g->gcc, GCC_GPLL0_MODE), sgpu_rd(g->gcc, GCC_GPLL0_L_VAL) & 0xffff,
++	    (sgpu_rd(g->gcc, GCC_GPLL0_L_VAL) & 0xffff) * 192 / 10,
++	    sgpu_rd(g->gcc, GCC_APCS_GPLL_VOTE), sgpu_rd(g->gcc, GCC_APCS_CLOCK_VOTE),
++	    sgpu_rd(g->gcc, GCC_GPU_MISC));
++	sgpu_log("gcc: cfg-ahb %#x memnoc %#x snoc-dvm %#x axi %#x",
++	    sgpu_rd(g->gcc, GCC_GPU_CFG_AHB_CBCR), sgpu_rd(g->gcc, GCC_GPU_MEMNOC_GFX_CBCR),
++	    sgpu_rd(g->gcc, GCC_GPU_SNOC_DVM_GFX_CBCR), sgpu_rd(g->gcc, GCC_DDRSS_GPU_AXI_CBCR));
++	/*
++	 * GPU_CC sits behind GCC_GPU_CFG_AHB_CLK. Reading it with that clock
++	 * off can hang the bus, so only report it when the clock is on.
++	 */
++	if (branch_is_on(sgpu_rd(g->gcc, GCC_GPU_CFG_AHB_CBCR))) {
++		sgpu_log("gpucc: cx-gdscr %#x hw %#x gx-gdscr %#x clamp %#x gmu-rcg %#x/%#x",
++		    sgpu_rd(g->gpucc, GPUCC_CX_GDSCR), sgpu_rd(g->gpucc, GPUCC_CX_GDS_HW_CTRL),
++		    sgpu_rd(g->gpucc, GPUCC_GX_GDSCR), sgpu_rd(g->gpucc, GPUCC_GX_CLAMP_IO),
++		    sgpu_rd(g->gpucc, GPUCC_GMU_CMD_RCGR), sgpu_rd(g->gpucc, GPUCC_GMU_CFG_RCGR));
++	} else {
++		sgpu_log("gpucc: config AHB clock off, not read");
++	}
++	return 0;
++}
++
++static int
++gmu_rcg_200mhz(struct sgpu *g)
++{
++	uint32_t cfg = sgpu_rd(g->gpucc, GPUCC_GMU_CFG_RCGR);
++
++	cfg &= ~(RCG_CFG_SRC_DIV_MASK | RCG_CFG_SRC_SEL_MASK | RCG_CFG_MODE_MASK |
++	    RCG_CFG_HW_CLK_CTRL);
++	cfg |= (GMU_SRC_GPLL0_DIV << 8) | GMU_DIV_200MHZ;
++	sgpu_wr(g->gpucc, GPUCC_GMU_CFG_RCGR, cfg);
++	sgpu_rmw(g->gpucc, GPUCC_GMU_CMD_RCGR, 0, RCG_CMD_UPDATE);
++	if (sgpu_poll(g->gpucc, GPUCC_GMU_CMD_RCGR, RCG_CMD_UPDATE, 0, 500)) {
++		return sgpu_fail(g, -16, "GMU RCG update stuck, cmd %#x cfg %#x",
++		           sgpu_rd(g->gpucc, GPUCC_GMU_CMD_RCGR), sgpu_rd(g->gpucc, GPUCC_GMU_CFG_RCGR));
++	}
++	return 0;
++}
++
++static int
++cx_gdsc_on(struct sgpu *g)
++{
++	sgpu_rmw(g->gpucc, GPUCC_CX_GDSCR, GDSC_INIT_MASK, GDSC_INIT_VAL);
++	sgpu_rmw(g->gpucc, GPUCC_CX_GDSCR, GDSC_SW_COLLAPSE, 0);    /* our vote: on */
++	sgpu_wmb();
++	sgpu_udelay(1);
++	if (sgpu_poll(g->gpucc, GPUCC_CX_GDS_HW_CTRL, GDS_HW_CTRL_PWR_ON,
++	    GDS_HW_CTRL_PWR_ON, 2000)) {
++		return sgpu_fail(g, -60, "CX GDSC did not power on, gdscr %#x hw %#x",
++		           sgpu_rd(g->gpucc, GPUCC_CX_GDSCR), sgpu_rd(g->gpucc, GPUCC_CX_GDS_HW_CTRL));
++	}
++	sgpu_udelay(1);
++	return 0;
++}
++
++int
++sgpu_clk_enable(struct sgpu *g)
++{
++	int err;
++
++	/* GCC one-time setup, as Linux's GCC probe does */
++	sgpu_rmw(g->gcc, GCC_GPU_MISC, 0, 3u);
++	err = branch_enable(g, g->gcc, GCC_GPU_CFG_AHB_CBCR, true, "gpu-cfg-ahb");
++	if (err) {
++		return err;
++	}
++
++	/* GPLL0 (shared, normally already running) and its two GPU taps */
++	sgpu_rmw(g->gcc, GCC_APCS_GPLL_VOTE, 0, 1u);
++	if (sgpu_poll(g->gcc, GCC_GPLL0_MODE, PLL_ACTIVE_FLAG, PLL_ACTIVE_FLAG, 1500)) {
++		return sgpu_fail(g, -60, "GPLL0 not active, mode %#x", sgpu_rd(g->gcc, GCC_GPLL0_MODE));
++	}
++	sgpu_rmw(g->gcc, GCC_APCS_CLOCK_VOTE, 0, GCC_VOTE_GPU_GPLL0 | GCC_VOTE_GPU_GPLL0_DIV);
++	sgpu_wmb();
++	sgpu_udelay(10);
++
++	/* GPU_CC one-time setup (gpucc probe): CX_GMU wake/sleep, GX GDSC waits */
++	sgpu_rmw(g->gpucc, GPUCC_CX_GMU_CBCR, 0xff0u, 0xff0u);
++	sgpu_rmw(g->gpucc, GPUCC_GX_GDSCR, GDSC_INIT_MASK, GDSC_INIT_VAL);
++
++	/* Power-up order of a6xx_gmu_resume(): CX GDSC, GMU rate, clocks */
++	err = cx_gdsc_on(g);
++	if (!err) {
++		err = gmu_rcg_200mhz(g);
++	}
++	if (!err) {
++		err = branch_enable(g, g->gpucc, GPUCC_AHB_CBCR, false, "gpucc-ahb");
++	}
++	if (!err) {
++		err = branch_enable(g, g->gpucc, GPUCC_CX_GMU_CBCR, true, "cx-gmu");
++	}
++	if (!err) {
++		err = branch_enable(g, g->gpucc, GPUCC_CXO_CBCR, true, "cxo");
++	}
++	if (!err) {
++		err = branch_enable(g, g->gcc, GCC_DDRSS_GPU_AXI_CBCR, true, "ddrss-gpu-axi");
++	}
++	if (!err) {
++		err = branch_enable(g, g->gcc, GCC_GPU_MEMNOC_GFX_CBCR, true, "memnoc-gfx");
++	}
++	if (!err) {
++		/* SMMU "iface" clock */
++		err = branch_enable(g, g->gcc, GCC_GPU_SNOC_DVM_GFX_CBCR, true, "snoc-dvm-gfx");
++	}
++	if (err) {
++		return err;
++	}
++	sgpu_log("clocks on: gmu rcg %#x/%#x (root %s), cx gdsc hw %#x",
++	    sgpu_rd(g->gpucc, GPUCC_GMU_CMD_RCGR), sgpu_rd(g->gpucc, GPUCC_GMU_CFG_RCGR),
++	    (sgpu_rd(g->gpucc, GPUCC_GMU_CMD_RCGR) & RCG_CMD_ROOT_OFF) ? "OFF" : "on",
++	    sgpu_rd(g->gpucc, GPUCC_CX_GDS_HW_CTRL));
++	return 0;
++}
++
++/*
++ * Reverse of the above. The GMU must already have dropped GX; this then
++ * forces GX off (as Linux's a6xx_gmu_stop does through the gx genpd) and
++ * releases the CPU's CX vote.
++ */
++void
++sgpu_clk_disable(struct sgpu *g)
++{
++	sgpu_rmw(g->gpucc, GPUCC_GX_GDSCR, 0, GDSC_SW_COLLAPSE);
++	if (sgpu_poll(g->gpucc, GPUCC_GX_CFG_GDSCR, GX_CFG_POWER_DOWN_COMPLETE,
++	    GX_CFG_POWER_DOWN_COMPLETE, 2000)) {
++		sgpu_log("GX GDSC did not report power down (cfg %#x)",
++		    sgpu_rd(g->gpucc, GPUCC_GX_CFG_GDSCR));
++	}
++	sgpu_rmw(g->gpucc, GPUCC_GX_CLAMP_IO, 0, 1u);
++	sgpu_rmw(g->gcc, GCC_GPU_SNOC_DVM_GFX_CBCR, CBCR_CLK_ENABLE, 0);
++	sgpu_rmw(g->gcc, GCC_GPU_MEMNOC_GFX_CBCR, CBCR_CLK_ENABLE, 0);
++	sgpu_rmw(g->gcc, GCC_DDRSS_GPU_AXI_CBCR, CBCR_CLK_ENABLE, 0);
++	sgpu_rmw(g->gpucc, GPUCC_CXO_CBCR, CBCR_CLK_ENABLE, 0);
++	sgpu_rmw(g->gpucc, GPUCC_CX_GMU_CBCR, CBCR_CLK_ENABLE, 0);
++	sgpu_rmw(g->gpucc, GPUCC_AHB_CBCR, CBCR_CLK_ENABLE, 0);
++	sgpu_rmw(g->gpucc, GPUCC_CX_GDSCR, 0, GDSC_SW_COLLAPSE);
++	sgpu_udelay(500);
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_cmddb.c
+@@ -0,0 +1,141 @@
++/*
++ * sweet_gpu_cmddb.c - read-only RPMh command DB lookups for the GMU.
++ *
++ * The GMU votes for the GX/CX/MX rails itself (through its own RSC, see
++ * sweet_gpu_gmu.c), but the vote words it is handed in the HFI perf table
++ * are built from the ARC "hlvl -> vlvl" tables that only the command DB
++ * knows. Same data structure as Linux drivers/soc/qcom/cmd-db.c:
++ *
++ *   header (144 bytes): u32 version, u8 magic[4] = {0xdb,0x30,0x03,0x0c},
++ *     rsc_hdr[8] (16 bytes: u16 slv_id, header_offset, data_offset, cnt,
++ *     version, reserved[3]), u32 checksum, u32 reserved
++ *   entry (24 bytes): u8 id[8], u32 priority[2], u32 addr, u16 len, u16 offset
++ *   entry i of slave s: 144 + hdr.header_offset + 24*i
++ *   aux data of entry:  144 + hdr.data_offset + entry.offset, entry.len bytes
++ *   slave ids: 3 ARC, 4 VRM, 5 BCM
++ *
++ * SM8250 places the DB directly in reserved memory (stock DT:
++ * reserved-memory@80860000 "qcom,cmd-db", 0x20000). (sweet_rpmh.c on
++ * SM7150 reads a locator at 0x0c3f000c instead; do not reuse that here.)
++ * Mapped as Device memory, so only aligned 32-bit loads.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SGPU_HOST)
++#include "sweet_gpu.h"
++
++#define CMDDB_PA        0x80860000ull
++#define CMDDB_SIZE      0x20000u
++#define CMDDB_HEADER    144u
++#define CMDDB_ENTRY     24u
++#define CMDDB_MAGIC     0x0c0330dbu     /* bytes db 30 03 0c, little endian */
++#define CMDDB_SLV_ARC   3u
++
++static volatile uint8_t *db;
++
++static uint32_t
++db32(uint32_t off)
++{
++	return sgpu_rd(db, off & ~3u);
++}
++
++static uint16_t
++db16(uint32_t off)
++{
++	return (uint16_t)(db32(off) >> (8u * (off & 2u)));
++}
++
++static int
++db_map(void)
++{
++	if (db) {
++		return 0;
++	}
++	db = sgpu_ioremap(CMDDB_PA, CMDDB_SIZE);
++	if (!db) {
++		return -12;
++	}
++	if (db32(4) != CMDDB_MAGIC) {
++		sgpu_log("cmd-db: bad magic %#x at %#llx", db32(4), (unsigned long long)CMDDB_PA);
++		db = NULL;
++		return -22;
++	}
++	return 0;
++}
++
++/* Find entry by name: returns entry offset and its slave header offset. */
++static int
++db_find(const char *res, uint32_t *entry, uint32_t *hdr)
++{
++	uint32_t key[2] = { 0, 0 };
++	int err = db_map();
++
++	if (err) {
++		return err;
++	}
++	for (unsigned i = 0; i < 8 && res[i]; i++) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	for (unsigned s = 0; s < 8; s++) {
++		uint32_t h = 8u + 16u * s;
++		uint16_t slv = db16(h), cnt = db16(h + 6);
++		if (slv == 0) {
++			continue;
++		}
++		uint32_t base = CMDDB_HEADER + db16(h + 2);
++		if (base + (uint32_t)cnt * CMDDB_ENTRY > CMDDB_SIZE) {
++			return -22;
++		}
++		for (unsigned j = 0; j < cnt; j++) {
++			uint32_t e = base + CMDDB_ENTRY * j;
++			if (db32(e) == key[0] && db32(e + 4) == key[1]) {
++				*entry = e;
++				*hdr = h;
++				return 0;
++			}
++		}
++	}
++	return -2;
++}
++
++int
++sgpu_cmddb_addr(const char *res, uint32_t *addr)
++{
++	uint32_t e, h;
++	int err = db_find(res, &e, &h);
++
++	if (!err) {
++		*addr = db32(e + 16);
++	}
++	return err;
++}
++
++int
++sgpu_cmddb_arc(const char *res, struct sgpu_arc *out)
++{
++	uint32_t e, h;
++	int err = db_find(res, &e, &h);
++
++	if (err) {
++		sgpu_log("cmd-db: %s not found (%d)", res, err);
++		return err;
++	}
++	if (db16(h) != CMDDB_SLV_ARC) {
++		return -22;
++	}
++	uint32_t len = db16(e + 20);
++	uint32_t aux = CMDDB_HEADER + db16(h + 4) + db16(e + 22);
++	if (len == 0 || (len & 1) || aux + len > CMDDB_SIZE) {
++		return -22;
++	}
++	out->addr = db32(e + 16);
++	out->count = len / 2;
++	if (out->count > SGPU_ARC_MAX_LEVELS) {
++		out->count = SGPU_ARC_MAX_LEVELS;
++	}
++	for (uint32_t i = 0; i < out->count; i++) {
++		out->level[i] = db16(aux + 2 * i);
++	}
++	sgpu_log("cmd-db: %s addr %#x, %u levels, first %u last %u", res, out->addr,
++	    out->count, out->level[0], out->level[out->count - 1]);
++	return 0;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_core.c
+@@ -0,0 +1,206 @@
++/*
++ * sweet_gpu_core.c - staged bring-up of the Adreno 650 on SM8250 (apollo).
++ *
++ * boot-arg sweetgpu=N stops after stage N (sweet_gpu.h enum sgpu_stage).
++ * Every stage logs what it did and what it read back, so a phone photo of
++ * the console (or the persistent log, patch 0047) shows exactly how far
++ * the hardware got. Default 0: the driver maps nothing and touches no
++ * register, so a kernel with this patch behaves like one without it.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SGPU_HOST)
++#include <stdarg.h>
++#include "sweet_gpu.h"
++
++#if defined(SGPU_HOST)
++#include <stdio.h>
++#define sgpu_vsnprintf vsnprintf
++#else
++extern int vsnprintf(char *, size_t, const char *, va_list);
++#define sgpu_vsnprintf vsnprintf
++#endif
++
++static const char *const stage_names[] = {
++	"off", "probe", "clocks", "smmu", "gmu", "gx", "cp", "selftest", "user",
++};
++
++int
++sgpu_poll(volatile uint8_t *base, uint32_t off, uint32_t mask, uint32_t want,
++    uint32_t timeout_us)
++{
++	uint64_t start = sgpu_now_us();
++
++	for (;;) {
++		if ((sgpu_rd(base, off) & mask) == want) {
++			return 0;
++		}
++		if (sgpu_now_us() - start > timeout_us) {
++			return -60;     /* ETIMEDOUT */
++		}
++		sgpu_udelay(1);
++	}
++}
++
++int
++sgpu_fail(struct sgpu *g, int err, const char *fmt, ...)
++{
++	va_list ap;
++
++	va_start(ap, fmt);
++	sgpu_vsnprintf(g->message, sizeof(g->message), fmt, ap);
++	va_end(ap);
++	g->last_error = err;
++	sgpu_log("FAILED at stage %u (%s): %s (err %d)", g->stage_reached + 1,
++	    g->stage_reached + 1 <= SGPU_STAGE_MAX ? stage_names[g->stage_reached + 1] : "?",
++	    g->message, err);
++	return err;
++}
++
++static int
++map_mmio(struct sgpu *g)
++{
++	/* Physical layout from sm8250.dtsi and the stock kona DT (qcom,kgsl-3d0, qcom,gmu). */
++	g->gpu    = sgpu_ioremap(0x03d00000, 0x40000);
++	g->cx_dbgc = sgpu_ioremap(0x03d61000, 0x800);
++	g->gmu     = sgpu_ioremap(0x03d6a000, 0x30000);
++	g->gpucc   = sgpu_ioremap(0x03d90000, 0x9000);
++	g->smmu    = sgpu_ioremap(0x03da0000, 0x10000);
++	g->rscc    = sgpu_ioremap(0x03de0000, 0x10000);
++	g->pdc     = sgpu_ioremap(0x0b290000, 0x10000);
++	g->pdc_seq = sgpu_ioremap(0x0b490000, 0x10000);
++	g->gcc     = sgpu_ioremap(0x00100000, 0x1f0000);
++	if (!g->gpu || !g->cx_dbgc || !g->gmu || !g->gpucc || !g->smmu ||
++	    !g->rscc || !g->pdc || !g->pdc_seq || !g->gcc) {
++		return sgpu_fail(g, -12, "MMIO mapping failed");
++	}
++	return 0;
++}
++
++static int
++load_firmware_refs(struct sgpu *g)
++{
++	const void *p;
++	uint32_t len;
++
++	if (sgpu_dt_prop("sqe-firmware", &p, &len)) {
++		g->sqe_fw = p;
++		g->sqe_fw_len = len;
++	}
++	if (sgpu_dt_prop("gmu-firmware", &p, &len)) {
++		g->gmu_fw = p;
++		g->gmu_fw_len = len;
++	}
++	if (sgpu_dt_prop("zap-firmware", &p, &len)) {
++		g->zap_fw = p;
++		g->zap_fw_len = len;
++	}
++	if (sgpu_dt_prop("zap-region", &p, &len) && len == 16) {
++		const uint64_t *r = p;
++		g->zap_pa = r[0];
++		g->zap_size = (uint32_t)r[1];
++	}
++	if (sgpu_dt_prop("chip-id", &p, &len) && len == 4) {
++		g->chip_id = *(const uint32_t *)p;
++	} else {
++		g->chip_id = 0x06050002;
++	}
++	if (sgpu_dt_prop("speed-bin", &p, &len) && len == 4) {
++		g->speed_bin = *(const uint32_t *)p;
++	}
++	sgpu_log("firmware: sqe %u bytes, gmu %u bytes, zap %u bytes, zap region %#llx+%#x, chip %#x",
++	    g->sqe_fw_len, g->gmu_fw_len, g->zap_fw_len,
++	    (unsigned long long)g->zap_pa, g->zap_size, g->chip_id);
++	return 0;
++}
++
++static int
++run_stage(struct sgpu *g, uint32_t s)
++{
++	switch (s) {
++	case SGPU_STAGE_PROBE: {
++		int err = map_mmio(g);
++		if (!err) {
++			err = load_firmware_refs(g);
++		}
++		if (!err) {
++			err = sgpu_va_init(g);
++		}
++		if (!err) {
++			err = sgpu_clk_probe(g);
++		}
++		if (!err) {
++			err = sgpu_scm_probe(g);
++		}
++		return err;
++	}
++	case SGPU_STAGE_CLOCKS:
++		return sgpu_clk_enable(g);
++	case SGPU_STAGE_SMMU:
++		return sgpu_smmu_init(g);
++	case SGPU_STAGE_GMU:
++		if (!g->gmu_fw) {
++			return sgpu_fail(g, -2, "no gmu-firmware in /sweet-gpu (mkadt --gpu-fw)");
++		}
++		return sgpu_gmu_init(g);
++	case SGPU_STAGE_GX:
++		return sgpu_gmu_gx_on(g);
++	case SGPU_STAGE_CP:
++		if (!g->sqe_fw) {
++			return sgpu_fail(g, -2, "no sqe-firmware in /sweet-gpu");
++		}
++		return sgpu_cp_init(g);
++	case SGPU_STAGE_SELFTEST:
++		return sgpu_cp_selftest(g);
++	case SGPU_STAGE_USER:
++		return 0;       /* SweetAdreno.cpp publishes the service */
++	default:
++		return -22;
++	}
++}
++
++int
++sgpu_bringup(struct sgpu *g, uint32_t stage)
++{
++	if (stage > SGPU_STAGE_MAX) {
++		stage = SGPU_STAGE_MAX;
++	}
++	g->stage_requested = stage;
++	sgpu_log("bring-up to stage %u (%s)", stage, stage_names[stage]);
++	while (g->stage_reached < stage) {
++		uint32_t s = g->stage_reached + 1;
++		uint64_t t0 = sgpu_now_us();
++		int err = run_stage(g, s);
++		if (err) {
++			if (!g->last_error) {
++				sgpu_fail(g, err, "stage %s returned an error", stage_names[s]);
++			}
++			return err;
++		}
++		g->stage_reached = s;
++		sgpu_log("stage %u (%s) OK in %llu us", s, stage_names[s],
++		    (unsigned long long)(sgpu_now_us() - t0));
++	}
++	return 0;
++}
++
++void
++sgpu_fill_info(struct sgpu *g, struct sgpu_info *info)
++{
++	*info = (struct sgpu_info){
++		.uapi_version      = SGPU_UAPI_VERSION,
++		.gpu_id            = 650,
++		.chip_id           = g->chip_id,
++		.gmem_size         = SGPU_A650_GMEM_SIZE,
++		.gmem_base         = 0,            /* a650 family: GMEM not in UCHE range */
++		.uche_trap_base    = SGPU_UCHE_TRAP_BASE,
++		.va_start          = SGPU_VA_USER_BASE,
++		.va_size           = SGPU_VA_USER_SIZE,
++		.highest_bank_bit  = 16,
++		.ubwc_mode         = 4,
++		.min_access_length = 32,
++		.timer_freq_hz     = 19200000,
++		.max_freq_hz       = sgpu_gmu_max_freq_hz(g),
++		.max_contexts      = SGPU_MAX_CTX,
++		.flags             = g->io_coherent ? SGPU_INFO_IO_COHERENT : 0,
++	};
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_cp.c
+@@ -0,0 +1,934 @@
++/*
++ * sweet_gpu_cp.c - Adreno 650 command processor: hw_init, SQE microcode,
++ * ringbuffer, submission, timestamps, self-test, hang recovery.
++ *
++ * Spec: specs/cp-hwinit-a650.md (every register below carries the step
++ * number of the spec's section 1.1 table, so the sequence can be diffed
++ * against Linux a6xx_hw_init line by line).
++ *
++ * How work reaches the GPU
++ * ------------------------
++ * The SQE (a650_sqe.fw) is the CP's microcode; it fetches PM4 packets from
++ * the kernel ringbuffer (privileged, CP_APRIV_CNTL) and from user indirect
++ * buffers (unprivileged). Userspace (turnip) builds complete command
++ * streams in its own GPU buffers; the kernel only appends, per submit:
++ *
++ *   CP_REG_TO_MEM x2          CP cycles / always-on counter at start (stats)
++ *   CP_EVENT_WRITE x2         invalidate CCU depth/color
++ *   CP_INDIRECT_BUFFER x N    the user's command streams
++ *   CP_REG_TO_MEM x2          counters at the end
++ *   PKT4 CP_SCRATCH_REG(2)    seqno (debug: last parsed submit)
++ *   CP_EVENT_WRITE ts         CACHE_FLUSH_TS -> context timestamp slot
++ *   CP_EVENT_WRITE ts|IRQ     CACHE_FLUSH_TS -> ring fence (memptrs+4)
++ *
++ * CACHE_FLUSH_TS writes its value only after all preceding work has
++ * drained and UCHE is flushed, so "slot >= ts" means "everything up to ts
++ * is done and visible in memory" - the KGSL timestamp model the UAPI
++ * exposes. Completion is always read from memory (Linux does the same; the
++ * IRQ is only a wake-up), which is why the driver works without the GPU
++ * interrupt wired up.
++ *
++ * Address space: single shared GPU VA space (SMMU CB0, TTBR0 only), so no
++ * CP_SMMU_TABLE_UPDATE, no SCM aperture call and no protected-mode dance.
++ * Kernel buffers are mapped privileged (PTE AP[1] = 0): user IBs execute
++ * unprivileged and fault on them, which protects the ring and memptrs.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SGPU_HOST)
++#include "sweet_gpu.h"
++
++#define R(dw)   ((uint32_t)(dw) * 4u)   /* dword offset -> byte offset */
++
++/* ---- GPU registers (dword offsets, a6xx.xml) ---- */
++#define RBBM_GBIF_CLIENT_QOS_CNTL       0x00011
++#define RBBM_GBIF_HALT                  0x00016
++#define RBBM_GBIF_HALT_ACK              0x00017
++#define RBBM_INTERFACE_HANG_INT_CNTL    0x0001f
++#define RBBM_INT_CLEAR_CMD              0x00037
++#define RBBM_INT_0_MASK                 0x00038
++#define RBBM_SW_RESET_CMD               0x00043
++#define RBBM_CLOCK_CNTL                 0x000ae
++#define RBBM_INT_0_STATUS               0x00201
++#define RBBM_STATUS                     0x00210
++#define RBBM_STATUS3                    0x00213
++#define RBBM_PERFCTR_CP_0               0x00400
++#define RBBM_PERFCTR_CNTL               0x00500
++#define RBBM_PERFCTR_GPU_BUSY_MASKED    0x0050b
++#define RBBM_NC_MODE_CNTL               0x00534
++#define CP_RB_BASE                      0x00800
++#define CP_RB_CNTL                      0x00802
++#define CP_RB_RPTR_ADDR                 0x00804
++#define CP_RB_RPTR                      0x00806
++#define CP_RB_WPTR                      0x00807
++#define CP_SQE_CNTL                     0x00808
++#define CP_HW_FAULT                     0x00821
++#define CP_INTERRUPT_STATUS             0x00823
++#define CP_PROTECT_STATUS               0x00824
++#define CP_SQE_INSTR_BASE               0x00830
++#define CP_ADDR_MODE_CNTL               0x00842
++#define CP_APRIV_CNTL                   0x00844
++#define CP_PROTECT_CNTL                 0x0084f
++#define CP_PROTECT(n)                   (0x00850 + (n))
++#define CP_SCRATCH_REG(n)               (0x00883 + (n))
++#define CP_ROQ_THRESHOLDS_1             0x008c1
++#define CP_ROQ_THRESHOLDS_2             0x008c2
++#define CP_MEM_POOL_SIZE                0x008c3
++#define CP_PERFCTR_CP_SEL_0             0x008d0
++#define CP_SQE_STAT_ADDR                0x00908
++#define CP_SQE_STAT_DATA                0x00909
++#define CP_IB1_BASE                     0x00928
++#define CP_IB1_REM_SIZE                 0x0092a
++#define CP_IB2_BASE                     0x0092b
++#define CP_IB2_REM_SIZE                 0x0092d
++#define CP_ALWAYS_ON_COUNTER            0x00980
++#define CP_AHB_CNTL                     0x0098d
++#define VSC_ADDR_MODE_CNTL              0x00c01
++#define UCHE_ADDR_MODE_CNTL             0x00e00
++#define UCHE_MODE_CNTL                  0x00e01
++#define UCHE_WRITE_RANGE_MAX            0x00e05
++#define UCHE_WRITE_THRU_BASE            0x00e07
++#define UCHE_TRAP_BASE                  0x00e09
++#define UCHE_CACHE_WAYS                 0x00e17
++#define UCHE_FILTER_CNTL                0x00e18
++#define UCHE_CLIENT_PF                  0x00e19
++#define GBIF_QSB_SIDE(n)                (0x03c03 + (n))
++#define GBIF_HALT                       0x03c45
++#define GBIF_HALT_ACK                   0x03c46
++#define GRAS_ADDR_MODE_CNTL             0x08601
++#define RB_ADDR_MODE_CNTL               0x08e05
++#define RB_NC_MODE_CNTL                 0x08e08
++#define VPC_ADDR_MODE_CNTL              0x09601
++#define PC_DBG_ECO_CNTL                 0x09e00
++#define PC_ADDR_MODE_CNTL               0x09e01
++#define VFD_ADDR_MODE_CNTL              0x0a601
++#define SP_ADDR_MODE_CNTL               0x0ae01
++#define SP_NC_MODE_CNTL                 0x0ae02
++#define TPL1_ADDR_MODE_CNTL             0x0b601
++#define TPL1_NC_MODE_CNTL               0x0b604
++#define TPL1_BICUBIC_WEIGHTS_TABLE(n)   (0x0b608 + (n))
++#define HLSQ_ADDR_MODE_CNTL             0x0be05
++#define RBBM_SECVID_TRUST_CNTL          0x0f400
++#define RBBM_SECVID_TSB_TRUSTED_BASE    0x0f800
++#define RBBM_SECVID_TSB_TRUSTED_SIZE    0x0f802
++#define RBBM_SECVID_TSB_CNTL            0x0f803
++#define RBBM_SECVID_TSB_ADDR_MODE_CNTL  0x0f810
++
++/* ---- GMU registers touched by hw_init (byte offsets from 0x03d6a000) ---- */
++#define GMU_GX_SPTPRAC_CLOCK_CONTROL    0x00200
++#define GMU_POWER_COUNTER_ENABLE        0x14100
++#define GMU_POWER_COUNTER_SELECT_0      0x14104
++#define GMU_CGC_MODE_CNTL               0x24c24
++#define GMU_CGC_DELAY_CNTL              0x24c28
++#define GMU_CGC_HYST_CNTL               0x24c2c
++#define GMU_CX_BUSY_STATUS              0x24c30
++#define GMU_CX_BUSY_MASK                0x24c38
++
++/* ---- PM4 ---- */
++#define CP_NOP                  0x10
++#define CP_WAIT_REG_MEM         0x3c
++#define CP_MEM_WRITE            0x3d
++#define CP_REG_TO_MEM           0x3e
++#define CP_INDIRECT_BUFFER      0x3f
++#define CP_EVENT_WRITE          0x46
++#define CP_ME_INIT              0x48
++#define CP_SET_SECURE_MODE      0x66
++#define EV_CACHE_FLUSH_TS       4
++#define EV_PC_CCU_INVAL_DEPTH   24
++#define EV_PC_CCU_INVAL_COLOR   25
++#define EV_IRQ                  (1u << 31)
++
++#define A6XX_INT_MASK           0x03d0e242u
++#define INT_CP_HW_ERROR         (1u << 9)
++#define INT_CP_CACHE_FLUSH_TS   (1u << 20)
++#define INT_RBBM_HANG_DETECT    (1u << 23)
++
++/* ---- kernel buffers ---- */
++#define RB_BYTES                0x8000u         /* 32 KiB = 8192 dwords */
++#define RB_CNTL_VALUE           0x0000020cu     /* BUFSZ 12, BLKSZ 2; no NO_UPDATE (APRIV) */
++#define MEMPTRS_BYTES           0x4000u
++#define MP_RPTR_SHADOW          0x000           /* CP_RB_RPTR_ADDR target */
++#define MP_FENCE                0x004           /* ring fence (CACHE_FLUSH_TS) */
++#define MP_STATS                0x010           /* 64 x { cp start, cp end, ao start, ao end } */
++#define MP_CTX                  0x1000          /* per-context slots, 16 bytes each */
++#define MP_CTX_EOP(i)           (MP_CTX + 16u * (i))
++#define KERNEL_CTX              0               /* slot 0: kernel self-test */
++
++static inline uint32_t gpu_rd(struct sgpu *g, uint32_t dw) { return sgpu_rd(g->gpu, R(dw)); }
++static inline void gpu_wr(struct sgpu *g, uint32_t dw, uint32_t v) { sgpu_wr(g->gpu, R(dw), v); }
++static inline void gpu_wr64(struct sgpu *g, uint32_t dw, uint64_t v)
++{
++	gpu_wr(g, dw, (uint32_t)v);
++	gpu_wr(g, dw + 1, (uint32_t)(v >> 32));
++}
++
++static inline uint32_t
++pm4_parity(uint32_t v)
++{
++	return (0x9669u >> (0xf & (v ^ v >> 4 ^ v >> 8 ^ v >> 12 ^ v >> 16 ^ v >> 20 ^
++	       v >> 24 ^ v >> 28))) & 1u;
++}
++
++static inline uint32_t
++pkt7(uint32_t op, uint32_t cnt)
++{
++	return 0x70000000u | (cnt & 0x7fff) | pm4_parity(cnt) << 15 | (op & 0x7f) << 16 |
++	       pm4_parity(op) << 23;
++}
++
++static inline uint32_t
++pkt4(uint32_t reg, uint32_t cnt)
++{
++	return 0x40000000u | (cnt & 0x7f) | pm4_parity(cnt) << 7 | (reg & 0x3ffff) << 8 |
++	       pm4_parity(reg) << 27;
++}
++
++/* ------------------------------------------------------------------ */
++/* static tables (spec 1.2 / 1.3)                                     */
++/* ------------------------------------------------------------------ */
++
++static const uint32_t a650_hwcg[][2] = {
++	{ 0x000b0, 0x02222222 }, { 0x000b4, 0x02222220 }, { 0x000b8, 0x00000080 },
++	{ 0x000bc, 0x0000f3cf }, { 0x000c0, 0x02222222 }, { 0x000c4, 0x22222222 },
++	{ 0x000c8, 0x22222222 }, { 0x000cc, 0x00022222 }, { 0x000d0, 0x11111111 },
++	{ 0x000d4, 0x11111111 }, { 0x000d8, 0x11111111 }, { 0x000dc, 0x00011111 },
++	{ 0x000e0, 0x77777777 }, { 0x000e4, 0x77777777 }, { 0x000e8, 0x77777777 },
++	{ 0x000ec, 0x00077777 }, { 0x000f0, 0x22222222 }, { 0x000f4, 0x01002222 },
++	{ 0x000f8, 0x00002220 }, { 0x00100, 0x00040f00 }, { 0x00104, 0x25222022 },
++	{ 0x00105, 0x00005555 }, { 0x00106, 0x00000011 }, { 0x00107, 0x00445044 },
++	{ 0x00108, 0x04222222 }, { 0x00111, 0x00002222 }, { 0x00114, 0x00222222 },
++	{ 0x00117, 0x00000002 }, { 0x0011b, 0x00002222 }, { 0x00109, 0x00004000 },
++	{ 0x00112, 0x00002222 }, { 0x00115, 0x00000200 }, { 0x0011c, 0x00000000 },
++	{ 0x0010a, 0x00000000 }, { 0x00113, 0x00000000 }, { 0x00116, 0x04104004 },
++	{ 0x0011d, 0x00000000 }, { 0x00120, 0x00000222 }, { 0x00121, 0x00000111 },
++	{ 0x00122, 0x00000777 }, { 0x0010b, 0x22222222 }, { 0x00110, 0x00000004 },
++	{ 0x0010f, 0x00000002 }, { 0x00533, 0x00000182 }, { 0x00044, 0x00000000 },
++	{ 0x00042, 0x00000000 }, { 0x00118, 0x00000222 }, { 0x00119, 0x00000111 },
++	{ 0x0011a, 0x00000555 },
++};
++#define RBBM_CLOCK_CNTL_ON      0x8aa8aa82u
++
++/* entries 0..37 -> CP_PROTECT(i); the last one -> CP_PROTECT(47) (infinite span) */
++static const uint32_t a650_protect[] = {
++	0x13fc0000, 0x00140501, 0x0bd0050b, 0x8000050e, 0x80000510, 0x80000534,
++	0x82080800, 0x802008a0, 0x809008ab, 0x02b808de, 0x81340900, 0x89c8098d,
++	0x80040e00, 0x80300e03, 0x830c3c00, 0x7ffc3cc4, 0x873c8630, 0x80008e00,
++	0x80008e08, 0x807c8e50, 0x89fc8e80, 0x876c9624, 0x80449e60, 0x861c9e78,
++	0x873ca630, 0x8000ae02, 0x8cbcae50, 0x8000b604, 0x801cb608, 0x8004be02,
++	0xdf7cbe20, 0xaffcf000, 0x7ffcfc00, 0xfffd8400, 0xfffda800, 0x910df400,
++	0x01edf844, 0x806df887,
++	0x8001f8c0,
++};
++
++/* ------------------------------------------------------------------ */
++/* ring                                                               */
++/* ------------------------------------------------------------------ */
++
++static volatile uint8_t *mp(struct sgpu *g) { return (volatile uint8_t *)g->memptrs.dma.va; }
++
++static uint32_t
++rptr(struct sgpu *g)
++{
++	return sgpu_mem_rd32(mp(g) + MP_RPTR_SHADOW) % g->rb_dwords;
++}
++
++static uint32_t
++ring_free(struct sgpu *g)
++{
++	return (rptr(g) + g->rb_dwords - 1 - g->rb_wptr) % g->rb_dwords;
++}
++
++static int
++ring_reserve(struct sgpu *g, uint32_t dwords)
++{
++	uint64_t start = sgpu_now_us();
++	while (ring_free(g) < dwords) {
++		if (sgpu_now_us() - start > 1000000) {
++			return sgpu_fail(g, -16, "cp: ring full (rptr %u wptr %u, %u needed)",
++			           rptr(g), g->rb_wptr, dwords);
++		}
++		sgpu_udelay(10);
++	}
++	return 0;
++}
++
++static inline void
++emit(struct sgpu *g, uint32_t v)
++{
++	volatile uint32_t *rb = (volatile uint32_t *)g->rb.dma.va;
++	rb[g->rb_wptr] = v;
++	g->rb_wptr = (g->rb_wptr + 1) % g->rb_dwords;
++}
++
++static inline void
++emit64(struct sgpu *g, uint64_t v)
++{
++	emit(g, (uint32_t)v);
++	emit(g, (uint32_t)(v >> 32));
++}
++
++static void
++ring_flush(struct sgpu *g)
++{
++	sgpu_wmb();                     /* ring contents before the doorbell */
++	gpu_wr(g, CP_RB_WPTR, g->rb_wptr);
++}
++
++static void
++dump_state(struct sgpu *g, const char *why)
++{
++	uint32_t cpint = gpu_rd(g, CP_INTERRUPT_STATUS);
++
++	gpu_wr(g, CP_SQE_STAT_ADDR, 1);
++	sgpu_log("cp: %s: RBBM_STATUS %#x STATUS3 %#x INT_0 %#x CX_BUSY %#x rptr %u (reg %u) "
++	    "wptr %u fence %u/%u", why, gpu_rd(g, RBBM_STATUS), gpu_rd(g, RBBM_STATUS3),
++	    gpu_rd(g, RBBM_INT_0_STATUS), sgpu_rd(g->gmu, GMU_CX_BUSY_STATUS), rptr(g),
++	    gpu_rd(g, CP_RB_RPTR), g->rb_wptr, sgpu_cp_ring_fence_retired(g), g->fence_seqno);
++	sgpu_log("cp:   CP_INTERRUPT_STATUS %#x HW_FAULT %#x PROTECT_STATUS %#x SQE_STAT %#x "
++	    "IB1 %#x%08x rem %u IB2 %#x%08x rem %u SCRATCH2 %u", cpint, gpu_rd(g, CP_HW_FAULT),
++	    gpu_rd(g, CP_PROTECT_STATUS), gpu_rd(g, CP_SQE_STAT_DATA),
++	    gpu_rd(g, CP_IB1_BASE + 1), gpu_rd(g, CP_IB1_BASE), gpu_rd(g, CP_IB1_REM_SIZE),
++	    gpu_rd(g, CP_IB2_BASE + 1), gpu_rd(g, CP_IB2_BASE), gpu_rd(g, CP_IB2_REM_SIZE),
++	    gpu_rd(g, CP_SCRATCH_REG(2)));
++	sgpu_smmu_check_faults(g);
++	sgpu_gmu_irq(g);
++}
++
++/* a6xx_idle: ring drained, then GPU and CX not busy, no hang detect */
++static int
++cp_idle(struct sgpu *g, const char *what)
++{
++	uint64_t start = sgpu_now_us();
++
++	while (rptr(g) != g->rb_wptr) {
++		if (sgpu_now_us() - start > 1000000) {
++			dump_state(g, what);
++			return sgpu_fail(g, -60, "cp: %s: ring did not drain", what);
++		}
++		sgpu_udelay(10);
++	}
++	for (;;) {
++		bool busy = (sgpu_rd(g->gmu, GMU_CX_BUSY_STATUS) & (1u << 23)) ||
++		    (gpu_rd(g, RBBM_STATUS) & ~1u);
++		if (gpu_rd(g, RBBM_INT_0_STATUS) & INT_RBBM_HANG_DETECT) {
++			dump_state(g, what);
++			return sgpu_fail(g, -5, "cp: %s: hang detect", what);
++		}
++		if (!busy) {
++			return 0;
++		}
++		if (sgpu_now_us() - start > 1000000) {
++			dump_state(g, what);
++			return sgpu_fail(g, -60, "cp: %s: GPU stays busy", what);
++		}
++		sgpu_udelay(10);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* one-time buffers                                                   */
++/* ------------------------------------------------------------------ */
++
++static int
++cp_buffers(struct sgpu *g)
++{
++	int err;
++
++	if (g->rb.dma.va != NULL) {
++		return 0;
++	}
++	if (g->sqe_fw_len < 8 || (g->sqe_fw_len & 3)) {
++		return sgpu_fail(g, -22, "cp: sqe firmware is %u bytes", g->sqe_fw_len);
++	}
++	/* SQE: the file minus its first dword; GPU read-only, NOT privileged
++	 * (CP_APRIV_CNTL.ICACHE is off on A650) */
++	uint32_t sqe_len = g->sqe_fw_len - 4;
++	uint32_t ver = (uint32_t)g->sqe_fw[4] | (uint32_t)g->sqe_fw[5] << 8 |
++	    (uint32_t)g->sqe_fw[6] << 16 | (uint32_t)g->sqe_fw[7] << 24;
++	if ((ver & 0xfff) < 0x095) {
++		return sgpu_fail(g, -1, "cp: a650_sqe.fw version %#x is older than 0.95 "
++		           "(security fixes required)", ver & 0xfff);
++	}
++	if ((err = sgpu_bo_alloc(g, sqe_len, SGPU_PROT_READ, &g->sqe)) != 0) {
++		return sgpu_fail(g, err, "cp: no memory for the SQE microcode");
++	}
++	volatile uint8_t *dst = g->sqe.dma.va;
++	for (uint32_t i = 0; i < sqe_len; i++) {
++		dst[i] = g->sqe_fw[4 + i];
++	}
++	if ((err = sgpu_bo_alloc(g, RB_BYTES, SGPU_PROT_READ | SGPU_PROT_PRIV, &g->rb)) != 0) {
++		return sgpu_fail(g, err, "cp: no memory for the ringbuffer");
++	}
++	if ((err = sgpu_bo_alloc(g, MEMPTRS_BYTES,
++	    SGPU_PROT_READ | SGPU_PROT_WRITE | SGPU_PROT_PRIV, &g->memptrs)) != 0) {
++		return sgpu_fail(g, err, "cp: no memory for memptrs");
++	}
++	g->rb_dwords = RB_BYTES / 4;
++	sgpu_wmb();
++	sgpu_smmu_tlb_sync(g, SGPU_DOM_GPU);
++	sgpu_log("cp: SQE version %#x, %u bytes at %#llx; ring %#llx; memptrs %#llx", ver,
++	    sqe_len, (unsigned long long)g->sqe.iova, (unsigned long long)g->rb.iova,
++	    (unsigned long long)g->memptrs.iova);
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* hw_init (spec 1.1 steps 4..69; 1..3 = OOB GPU_SET, done at GX stage) */
++/* ------------------------------------------------------------------ */
++
++static void
++set_hwcg(struct sgpu *g)
++{
++	sgpu_wr(g->gmu, GMU_CGC_MODE_CNTL, 0x00020202);
++	sgpu_wr(g->gmu, GMU_CGC_DELAY_CNTL, 0x00010111);
++	sgpu_wr(g->gmu, GMU_CGC_HYST_CNTL, 0x00005555);
++	if (gpu_rd(g, RBBM_CLOCK_CNTL) == RBBM_CLOCK_CNTL_ON) {
++		return;
++	}
++	sgpu_rmw(g->gmu, GMU_GX_SPTPRAC_CLOCK_CONTROL, 1, 0);
++	for (uint32_t i = 0; i < sizeof(a650_hwcg) / sizeof(a650_hwcg[0]); i++) {
++		gpu_wr(g, a650_hwcg[i][0], a650_hwcg[i][1]);
++	}
++	sgpu_rmw(g->gmu, GMU_GX_SPTPRAC_CLOCK_CONTROL, 0, 1);
++	gpu_wr(g, RBBM_CLOCK_CNTL, RBBM_CLOCK_CNTL_ON);
++}
++
++static void
++set_cp_protect(struct sgpu *g)
++{
++	const uint32_t n = sizeof(a650_protect) / sizeof(a650_protect[0]);
++
++	gpu_wr(g, CP_PROTECT_CNTL, 0x0000000b);         /* EN | FAULT_ON_VIOL | LAST_SPAN_INF */
++	for (uint32_t i = 0; i + 1 < n; i++) {
++		gpu_wr(g, CP_PROTECT(i), a650_protect[i]);
++	}
++	gpu_wr(g, CP_PROTECT(47), a650_protect[n - 1]);
++}
++
++static void
++hw_init_regs(struct sgpu *g)
++{
++	/* 4-7: release GBIF halt (posting reads) */
++	gpu_wr(g, GBIF_HALT, 0);
++	(void)gpu_rd(g, GBIF_HALT);
++	gpu_wr(g, RBBM_GBIF_HALT, 0);
++	(void)gpu_rd(g, RBBM_GBIF_HALT);
++	/* 8-10: no trusted (secure) buffer */
++	gpu_wr(g, RBBM_SECVID_TSB_CNTL, 0);
++	gpu_wr64(g, RBBM_SECVID_TSB_TRUSTED_BASE, 0);
++	gpu_wr(g, RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
++	/* 11-22: 64-bit addressing everywhere */
++	gpu_wr(g, CP_ADDR_MODE_CNTL, 1);
++	gpu_wr(g, VSC_ADDR_MODE_CNTL, 1);
++	gpu_wr(g, GRAS_ADDR_MODE_CNTL, 1);
++	gpu_wr(g, RB_ADDR_MODE_CNTL, 1);
++	gpu_wr(g, PC_ADDR_MODE_CNTL, 1);
++	gpu_wr(g, HLSQ_ADDR_MODE_CNTL, 1);
++	gpu_wr(g, VFD_ADDR_MODE_CNTL, 1);
++	gpu_wr(g, VPC_ADDR_MODE_CNTL, 1);
++	gpu_wr(g, UCHE_ADDR_MODE_CNTL, 1);
++	gpu_wr(g, SP_ADDR_MODE_CNTL, 1);
++	gpu_wr(g, TPL1_ADDR_MODE_CNTL, 1);
++	gpu_wr(g, RBBM_SECVID_TSB_ADDR_MODE_CNTL, 1);
++	/* 23: hardware clock gating */
++	set_hwcg(g);
++	/* 24-28: GBIF QoS */
++	for (int i = 0; i < 4; i++) {
++		gpu_wr(g, GBIF_QSB_SIDE(i), 0x00071620);
++	}
++	gpu_wr(g, RBBM_GBIF_CLIENT_QOS_CNTL, 0x3);
++	/* 29 */
++	gpu_wr(g, RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
++	/* 30-32: UCHE trap / write-through window (our unmapped top page) */
++	gpu_wr64(g, UCHE_WRITE_RANGE_MAX, SGPU_UCHE_TRAP_BASE + 0xfc0);
++	gpu_wr64(g, UCHE_TRAP_BASE, SGPU_UCHE_TRAP_BASE);
++	gpu_wr64(g, UCHE_WRITE_THRU_BASE, SGPU_UCHE_TRAP_BASE);
++	/* (UCHE_GMEM_RANGE_* not written on the a650 family) */
++	/* 33-38 */
++	gpu_wr(g, UCHE_FILTER_CNTL, 0x804);
++	gpu_wr(g, UCHE_CACHE_WAYS, 0x4);
++	gpu_wr(g, CP_ROQ_THRESHOLDS_2, 0x02000140);
++	gpu_wr(g, CP_ROQ_THRESHOLDS_1, 0x8040362c);
++	gpu_wr(g, CP_MEM_POOL_SIZE, 128);
++	gpu_wr(g, PC_DBG_ECO_CNTL, 0x00300200);
++	/* 39-41 */
++	gpu_wr(g, CP_AHB_CNTL, 0x1);
++	gpu_wr(g, RBBM_PERFCTR_CNTL, 0x1);
++	gpu_wr(g, CP_PERFCTR_CP_SEL_0, 0);              /* PERF_CP_ALWAYS_COUNT */
++	/* 42-46: UBWC 4.0, highest bank bit 16, swizzle 6, macrotile */
++	gpu_wr(g, RB_NC_MODE_CNTL, 0x00000816);
++	gpu_wr(g, TPL1_NC_MODE_CNTL, 0x00000006);
++	gpu_wr(g, SP_NC_MODE_CNTL, 0x00000026);
++	gpu_wr(g, UCHE_MODE_CNTL, 0x00600000);
++	gpu_wr(g, RBBM_NC_MODE_CNTL, 1);
++	/* 47-53 */
++	gpu_wr(g, RBBM_INTERFACE_HANG_INT_CNTL, (1u << 30) | 0x1fffff);
++	gpu_wr(g, UCHE_CLIENT_PF, 0x81);
++	gpu_wr(g, TPL1_BICUBIC_WEIGHTS_TABLE(0), 0);
++	gpu_wr(g, TPL1_BICUBIC_WEIGHTS_TABLE(1), 0x3fe05ff4);
++	gpu_wr(g, TPL1_BICUBIC_WEIGHTS_TABLE(2), 0x3fa0ebee);
++	gpu_wr(g, TPL1_BICUBIC_WEIGHTS_TABLE(3), 0x3f5193ed);
++	gpu_wr(g, TPL1_BICUBIC_WEIGHTS_TABLE(4), 0x3f0243f0);
++	/* 54-56: GMU busy/power counters */
++	sgpu_wr(g->gmu, GMU_CX_BUSY_MASK, 0xff000000);
++	sgpu_rmw(g->gmu, GMU_POWER_COUNTER_SELECT_0, 0xff, 0x20);
++	sgpu_wr(g->gmu, GMU_POWER_COUNTER_ENABLE, 1);
++	/* 57 */
++	set_cp_protect(g);
++	/* 58: privileged ring fetch, rptr writeback, ring packet memory accesses */
++	gpu_wr(g, CP_APRIV_CNTL, 0x0000006e);
++	/* 59 */
++	gpu_wr(g, RBBM_INT_0_MASK, A6XX_INT_MASK);
++	/* 60: adreno_hw_init. The SCM CP-SMMU-aperture call is only needed
++	 * for CP_SMMU_TABLE_UPDATE, which this driver does not use. */
++	sgpu_mem_wr32(mp(g) + MP_RPTR_SHADOW, 0);
++	/* 61-64 */
++	gpu_wr64(g, CP_SQE_INSTR_BASE, g->sqe.iova);
++	gpu_wr64(g, CP_RB_BASE, g->rb.iova);
++	gpu_wr(g, CP_RB_CNTL, RB_CNTL_VALUE);
++	gpu_wr64(g, CP_RB_RPTR_ADDR, g->memptrs.iova + MP_RPTR_SHADOW);
++	sgpu_mem_wr32(mp(g) + MP_RPTR_SHADOW, 0);
++	g->rb_wptr = 0;
++	sgpu_wmb();
++	/* 66: start the SQE */
++	gpu_wr(g, CP_SQE_CNTL, 1);
++}
++
++static int
++cp_me_init(struct sgpu *g)
++{
++	emit(g, pkt7(CP_ME_INIT, 8));
++	emit(g, 0x0000002f);            /* fields present: multi-ctx, err detect, hdr dump, reset, wa */
++	emit(g, 0x00000003);            /* multiple hardware contexts */
++	emit(g, 0x20000000);            /* error detection */
++	emit(g, 0);                     /* no header dump */
++	emit(g, 0);
++	emit(g, 0);                     /* no ucode workarounds */
++	emit(g, 0);
++	emit(g, 0);
++	ring_flush(g);
++	return cp_idle(g, "CP_ME_INIT");
++}
++
++static int
++secure_exit(struct sgpu *g)
++{
++	/*
++	 * The GPU comes out of reset in secure mode. With a zap shader
++	 * loaded (TrustZone PAS id 13) the CP leaves it itself; production
++	 * TrustZone usually blocks the CPU from writing SECVID_TRUST_CNTL.
++	 */
++	int zerr = g->zap_fw ? sgpu_zap_load(g) : -2;
++	if (zerr == 0) {
++		emit(g, pkt7(CP_SET_SECURE_MODE, 1));
++		emit(g, 0);
++		ring_flush(g);
++		return cp_idle(g, "CP_SET_SECURE_MODE");
++	}
++	g->last_error = 0;              /* zap failure is not fatal by itself */
++	sgpu_log("cp: no zap shader (%d): writing RBBM_SECVID_TRUST_CNTL = 0 directly; "
++	    "if TrustZone protects it, an XPU violation follows", zerr);
++	gpu_wr(g, RBBM_SECVID_TRUST_CNTL, 0);
++	return 0;
++}
++
++static int
++hw_init(struct sgpu *g)
++{
++	int err;
++
++	hw_init_regs(g);
++	if ((err = cp_me_init(g)) != 0) {
++		return err;
++	}
++	if ((err = secure_exit(g)) != 0) {
++		return err;
++	}
++	return 0;
++}
++
++int
++sgpu_cp_init(struct sgpu *g)
++{
++	int err;
++
++	if ((err = cp_buffers(g)) != 0) {
++		sgpu_gmu_oob_clear(g, SGPU_OOB_GPU_SET);
++		return err;
++	}
++	err = hw_init(g);
++	/* step 69: release the GPU_SET OOB taken at stage GX */
++	sgpu_gmu_oob_clear(g, SGPU_OOB_GPU_SET);
++	if (err) {
++		return err;
++	}
++	sgpu_log("cp: running: RBBM_STATUS %#x, rptr %u, CLOCK_CNTL %#x, SECVID_TRUST %#x",
++	    gpu_rd(g, RBBM_STATUS), rptr(g), gpu_rd(g, RBBM_CLOCK_CNTL),
++	    gpu_rd(g, RBBM_SECVID_TRUST_CNTL));
++	g->ctx[KERNEL_CTX].used = true;
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* contexts and submission                                            */
++/* ------------------------------------------------------------------ */
++
++static uint64_t
++ctx_eop_iova(struct sgpu *g, uint32_t c)
++{
++	return g->memptrs.iova + MP_CTX_EOP(c);
++}
++
++int
++sgpu_cp_ctx_alloc(struct sgpu *g, uint32_t *ctx_id)
++{
++	for (uint32_t i = 1; i < SGPU_MAX_CTX; i++) {
++		if (!g->ctx[i].used) {
++			/* start the timeline where the slot already is, so a stale
++			 * CACHE_FLUSH_TS from a previous owner can never complete
++			 * a new timestamp early */
++			g->ctx[i].used = true;
++			g->ctx[i].queued = sgpu_mem_rd32(mp(g) + MP_CTX_EOP(i));
++			*ctx_id = i;
++			return 0;
++		}
++	}
++	return -28;
++}
++
++void
++sgpu_cp_ctx_free(struct sgpu *g, uint32_t ctx_id)
++{
++	if (ctx_id > 0 && ctx_id < SGPU_MAX_CTX) {
++		g->ctx[ctx_id].used = false;
++	}
++}
++
++uint32_t
++sgpu_cp_retired(struct sgpu *g, uint32_t ctx_id)
++{
++	if (ctx_id >= SGPU_MAX_CTX || g->memptrs.dma.va == NULL) {
++		return 0;
++	}
++	return sgpu_mem_rd32(mp(g) + MP_CTX_EOP(ctx_id));
++}
++
++uint32_t
++sgpu_cp_queued(struct sgpu *g, uint32_t ctx_id)
++{
++	return ctx_id < SGPU_MAX_CTX ? g->ctx[ctx_id].queued : 0;
++}
++
++uint32_t
++sgpu_cp_ring_fence_submitted(struct sgpu *g)
++{
++	return g->fence_seqno;
++}
++
++uint32_t
++sgpu_cp_ring_fence_retired(struct sgpu *g)
++{
++	return g->memptrs.dma.va ? sgpu_mem_rd32(mp(g) + MP_FENCE) : g->fence_seqno;
++}
++
++static void
++emit_stats(struct sgpu *g, uint32_t idx, bool end)
++{
++	uint64_t base = g->memptrs.iova + MP_STATS + 32u * idx + (end ? 8 : 0);
++
++	emit(g, pkt7(CP_REG_TO_MEM, 3));
++	emit(g, RBBM_PERFCTR_CP_0 | (2u << 18) | (1u << 30));
++	emit64(g, base);
++	emit(g, pkt7(CP_REG_TO_MEM, 3));
++	emit(g, CP_ALWAYS_ON_COUNTER | (2u << 18) | (1u << 30));
++	emit64(g, base + 16);
++}
++
++static void
++emit_timestamp(struct sgpu *g, uint64_t iova, uint32_t value, bool irq)
++{
++	emit(g, pkt7(CP_EVENT_WRITE, 4));
++	emit(g, EV_CACHE_FLUSH_TS | (irq ? EV_IRQ : 0));
++	emit64(g, iova);
++	emit(g, value);
++}
++
++int
++sgpu_cp_submit(struct sgpu *g, uint32_t ctx_id, const struct sgpu_ib *ibs,
++    uint32_t n, uint32_t flags, uint32_t *ts_out)
++{
++	int err;
++
++	(void)flags;
++	if (g->stage_reached < SGPU_STAGE_CP || g->rb.dma.va == NULL) {
++		return -19;
++	}
++	if (ctx_id >= SGPU_MAX_CTX || !g->ctx[ctx_id].used || n > SGPU_MAX_IBS) {
++		return -22;
++	}
++	if ((err = ring_reserve(g, 27 + 4 * n + 7)) != 0) {
++		return err;
++	}
++	uint32_t seqno = ++g->fence_seqno;
++	uint32_t ts = ++g->ctx[ctx_id].queued;
++	uint32_t idx = seqno % 64;
++
++	emit_stats(g, idx, false);
++	emit(g, pkt7(CP_EVENT_WRITE, 1));
++	emit(g, EV_PC_CCU_INVAL_DEPTH);
++	emit(g, pkt7(CP_EVENT_WRITE, 1));
++	emit(g, EV_PC_CCU_INVAL_COLOR);
++	for (uint32_t i = 0; i < n; i++) {
++		emit(g, pkt7(CP_INDIRECT_BUFFER, 3));
++		emit64(g, ibs[i].gpuaddr);
++		emit(g, ibs[i].size_dwords & 0xfffff);
++	}
++	emit_stats(g, idx, true);
++	emit(g, pkt4(CP_SCRATCH_REG(2), 1));
++	emit(g, seqno);
++	emit_timestamp(g, ctx_eop_iova(g, ctx_id), ts, false);
++	emit_timestamp(g, g->memptrs.iova + MP_FENCE, seqno, true);
++	ring_flush(g);
++	*ts_out = ts;
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* self-test (stage 7)                                                */
++/* ------------------------------------------------------------------ */
++
++int
++sgpu_cp_selftest(struct sgpu *g)
++{
++	const uint32_t magic_ring = 0x5eed0650, magic_ib = 0xc0de0650;
++	struct sgpu_ib ib;
++	uint32_t ts;
++	int err;
++
++	/* scratch: [0] ring write target, [1] IB write target, [64..] the IB.
++	 * Unprivileged and writable, like a user buffer, so this also proves
++	 * that user IBs can be fetched and can write through the SMMU. */
++	if (g->scratch.dma.va == NULL &&
++	    (err = sgpu_bo_alloc(g, 0x4000, SGPU_PROT_READ | SGPU_PROT_WRITE, &g->scratch)) != 0) {
++		return sgpu_fail(g, err, "selftest: no scratch buffer");
++	}
++	volatile uint32_t *s = g->scratch.dma.va;
++	s[0] = 0xdeaddead;
++	s[1] = 0xdeaddead;
++	volatile uint32_t *ibp = s + 64;
++	ibp[0] = pkt7(CP_MEM_WRITE, 3);
++	ibp[1] = (uint32_t)(g->scratch.iova + 4);
++	ibp[2] = (uint32_t)((g->scratch.iova + 4) >> 32);
++	ibp[3] = magic_ib;
++	ibp[4] = pkt7(CP_NOP, 0);
++	sgpu_wmb();
++
++	/* 1: a CP_MEM_WRITE from the ring itself */
++	if ((err = ring_reserve(g, 8)) != 0) {
++		return err;
++	}
++	emit(g, pkt7(CP_MEM_WRITE, 3));
++	emit64(g, g->scratch.iova);
++	emit(g, magic_ring);
++	ring_flush(g);
++
++	/* 2: a normal submission with one IB, timestamp on the kernel context */
++	uint64_t t0 = sgpu_cp_always_on(g);
++	ib.gpuaddr = g->scratch.iova + 64 * 4;
++	ib.size_dwords = 5;
++	ib.flags = 0;
++	if ((err = sgpu_cp_submit(g, KERNEL_CTX, &ib, 1, 0, &ts)) != 0) {
++		return sgpu_fail(g, err, "selftest: submit failed");
++	}
++	uint64_t start = sgpu_now_us();
++	while (!sgpu_ts_ge(sgpu_cp_retired(g, KERNEL_CTX), ts)) {
++		if (sgpu_now_us() - start > 1000000) {
++			dump_state(g, "selftest");
++			return sgpu_fail(g, -60, "selftest: timestamp %u never retired "
++			           "(slot %u, ring write %#x, IB write %#x)", ts,
++			           sgpu_cp_retired(g, KERNEL_CTX), sgpu_mem_rd32(&s[0]),
++			           sgpu_mem_rd32(&s[1]));
++		}
++		sgpu_udelay(10);
++	}
++	uint64_t us = sgpu_now_us() - start;
++	uint64_t t1 = sgpu_cp_always_on(g);
++	uint32_t r0 = sgpu_mem_rd32(&s[0]), r1 = sgpu_mem_rd32(&s[1]);
++	if (r0 != magic_ring || r1 != magic_ib) {
++		return sgpu_fail(g, -5, "selftest: ring write %#x (want %#x), IB write %#x "
++		           "(want %#x)", r0, magic_ring, r1, magic_ib);
++	}
++	sgpu_log("selftest: OK - ring and IB writes landed, ts %u retired in %llu us, "
++	    "fence %u, always-on %llu -> %llu", ts, (unsigned long long)us,
++	    sgpu_cp_ring_fence_retired(g), (unsigned long long)t0, (unsigned long long)t1);
++	return sgpu_smmu_check_faults(g) ? sgpu_fail(g, -5, "selftest: SMMU faults seen") : 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* time, status, interrupts, hangs                                    */
++/* ------------------------------------------------------------------ */
++
++uint64_t
++sgpu_cp_always_on(struct sgpu *g)
++{
++	if (g->stage_reached < SGPU_STAGE_GX) {
++		return 0;
++	}
++	/* keep GX up while reading (OOB PERFCOUNTER); LO read latches HI */
++	bool oob = sgpu_gmu_oob_set(g, SGPU_OOB_PERFCOUNTER) == 0;
++	uint32_t lo = gpu_rd(g, CP_ALWAYS_ON_COUNTER);
++	uint32_t hi = gpu_rd(g, CP_ALWAYS_ON_COUNTER + 1);
++	if (oob) {
++		sgpu_gmu_oob_clear(g, SGPU_OOB_PERFCOUNTER);
++	}
++	return ((uint64_t)hi << 32) | lo;
++}
++
++void
++sgpu_cp_status(struct sgpu *g, struct sgpu_status *st)
++{
++	uint32_t i;
++
++	/* no GPU/SMMU interrupt is wired yet: collect pending faults here */
++	sgpu_cp_irq(g);
++	sgpu_smmu_check_faults(g);
++	sgpu_gmu_irq(g);
++	st->stage_reached = g->stage_reached;
++	st->stage_requested = g->stage_requested;
++	st->last_error = g->last_error;
++	st->faults = g->faults;
++	st->hangs = g->hangs;
++	st->gmu_state = sgpu_gmu_state(g);
++	if (g->stage_reached >= SGPU_STAGE_CP) {
++		st->rbbm_status = gpu_rd(g, RBBM_STATUS);
++		st->cp_rb_rptr = rptr(g);
++		st->cp_rb_wptr = g->rb_wptr;
++	}
++	for (i = 0; i + 1 < sizeof(st->message) && g->message[i]; i++) {
++		st->message[i] = g->message[i];
++	}
++	st->message[i] = 0;
++}
++
++uint32_t
++sgpu_cp_irq(struct sgpu *g)
++{
++	if (g->stage_reached < SGPU_STAGE_CP) {
++		return 0;
++	}
++	uint32_t status = gpu_rd(g, RBBM_INT_0_STATUS);
++	if (status == 0) {
++		return 0;
++	}
++	gpu_wr(g, RBBM_INT_CLEAR_CMD, status);          /* ack first, then dispatch */
++	if (status & INT_CP_HW_ERROR) {
++		uint32_t s = gpu_rd(g, CP_INTERRUPT_STATUS);
++		if (s & 1) {
++			gpu_wr(g, CP_SQE_STAT_ADDR, 1);
++			sgpu_log("cp: opcode error, SQE_STAT %#x", gpu_rd(g, CP_SQE_STAT_DATA));
++		}
++		if (s & 2) {
++			sgpu_log("cp: ucode error");
++		}
++		if (s & 4) {
++			sgpu_log("cp: hw fault %#x", gpu_rd(g, CP_HW_FAULT));
++		}
++		if (s & 0x10) {
++			uint32_t p = gpu_rd(g, CP_PROTECT_STATUS);
++			sgpu_log("cp: protected register %s at %#x", (p & (1u << 20)) ? "read" : "write",
++			    p & 0x3ffff);
++		}
++		if (s & 0x20) {
++			sgpu_log("cp: AHB error");
++		}
++		if (s & 0x40) {
++			sgpu_log("cp: VSD parity error");
++		}
++		if (s & 0x80) {
++			sgpu_log("cp: illegal instruction");
++		}
++		g->faults++;
++	}
++	if (status & ((1u << 1) | (1u << 6) | (1u << 22) | (1u << 24))) {
++		sgpu_log("cp: RBBM_INT_0 error bits %#x", status & ((1u << 1) | (1u << 6) |
++		    (1u << 22) | (1u << 24)));
++	}
++	if ((status & INT_RBBM_HANG_DETECT) && !(gpu_rd(g, RBBM_STATUS3) & (1u << 24))) {
++		sgpu_log("cp: hardware hang detect");
++	}
++	return status;
++}
++
++/*
++ * Recovery without power-collapsing CX (Linux collapses CX and replays):
++ * halt the SQE, drain the bus, abandon every pending submission (all
++ * timelines jump to their queued value, so waiters return), then rerun
++ * hw_init. If that fails the GPU stays dead until reboot and every
++ * submit returns -EIO (stage drops below CP).
++ */
++static void
++cp_recover(struct sgpu *g)
++{
++	g->hangs++;
++	dump_state(g, "hang");
++	gpu_wr(g, CP_SQE_CNTL, 3);
++	gpu_wr(g, GBIF_HALT, 1);
++	(void)sgpu_poll(g->gpu, R(GBIF_HALT_ACK), 1, 1, 100000);
++	gpu_wr(g, GBIF_HALT, 2);
++	(void)sgpu_poll(g->gpu, R(GBIF_HALT_ACK), 2, 2, 100000);
++	gpu_wr(g, GBIF_HALT, 0);
++
++	for (uint32_t i = 0; i < SGPU_MAX_CTX; i++) {
++		sgpu_mem_wr32(mp(g) + MP_CTX_EOP(i), g->ctx[i].queued);
++	}
++	sgpu_mem_wr32(mp(g) + MP_FENCE, g->fence_seqno);
++	sgpu_wmb();
++
++	int err = sgpu_gmu_oob_set(g, SGPU_OOB_GPU_SET);
++	if (!err) {
++		err = hw_init(g);
++		sgpu_gmu_oob_clear(g, SGPU_OOB_GPU_SET);
++	}
++	if (err) {
++		sgpu_log("cp: recovery failed (%d): GPU disabled until reboot", err);
++		g->stage_reached = SGPU_STAGE_GX;
++	} else {
++		sgpu_log("cp: recovered after hang #%u", g->hangs);
++	}
++}
++
++bool
++sgpu_cp_hang_check(struct sgpu *g)
++{
++	if (g->stage_reached < SGPU_STAGE_CP) {
++		return true;            /* nothing will ever retire */
++	}
++	sgpu_cp_irq(g);
++	sgpu_smmu_check_faults(g);
++	sgpu_gmu_irq(g);
++
++	uint32_t fence = sgpu_cp_ring_fence_retired(g);
++	uint64_t now = sgpu_now_us();
++	if (fence == g->fence_seqno || fence != g->hc_fence) {
++		g->hc_fence = fence;
++		g->hc_us = now;
++		g->hc_strikes = 0;
++		return false;
++	}
++	if (now - g->hc_us < 250000) {  /* Linux hangcheck period */
++		return false;
++	}
++	g->hc_us = now;
++	uint32_t ib1 = gpu_rd(g, CP_IB1_BASE), rem = gpu_rd(g, CP_IB1_REM_SIZE);
++	if (ib1 != g->hc_ib1 || rem != g->hc_rem) {
++		g->hc_ib1 = ib1;        /* CP still walking an IB: progress */
++		g->hc_rem = rem;
++		g->hc_strikes = 0;
++		return false;
++	}
++	if (++g->hc_strikes < 4) {
++		return false;
++	}
++	g->hc_strikes = 0;
++	cp_recover(g);
++	return g->stage_reached < SGPU_STAGE_CP;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_gmu.c
+@@ -0,0 +1,1025 @@
++/*
++ * sweet_gpu_gmu.c - Adreno 650 GMU (graphics management unit) on SM8250.
++ *
++ * Spec: specs/gmu-hfi-a650.md (register-level, with Linux file:line
++ * references; Linux a6xx_gmu.c/a6xx_hfi.c were documentation only).
++ *
++ * Why the GMU is unavoidable
++ * --------------------------
++ * On A6xx the CPU does not power the GPU core. The GX rail and the GX GDSC
++ * belong to the GMU, a Cortex-M3 inside the CX domain, which votes RPMh
++ * (via its own RSC) for GFX/MX/CX levels and DDR bandwidth and switches GX
++ * on and off. The host's job is:
++ *   1. program the GPU RSC and the PDC once (RPMh plumbing for the GMU),
++ *   2. load a650_gmu.bin into the M3's ITCM/DTCM and into the "icache"
++ *      region of GMU virtual memory (SMMU context bank, SID 5),
++ *   3. hand the firmware the HFI queue table, its log buffer and the chip
++ *      id, release it from reset and wait for INIT_RESULT,
++ *   4. speak HFI: PERF_TABLE (GPU OPPs + RPMh ARC votes from cmd-db),
++ *      BW_TABLE, CORE_FW_START, START, then GX_BW_PERF_VOTE,
++ *   5. use the OOB doorbell GPU_SET whenever the CPU must touch GX
++ *      registers (hw_init); the GMU acks once GX is powered.
++ *
++ * A650 = "non-legacy" GMU: HFI v2, new OOB bits, cold boot only, no IFPC
++ * (idle level ACTIVE), PDC sequencer owned by AOP (host only enables it).
++ *
++ * Memory model: every buffer the GMU reads or writes is SGPU_DMA_WC
++ * (Normal non-cacheable for the CPU, non-cacheable for the GMU), exactly
++ * like Linux's MSM_BO_WC GMU buffers, so HFI needs only barriers.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SGPU_HOST)
++#include "sweet_gpu.h"
++
++/* ---- GMU registers: byte offsets from 0x03d6a000 (dword offset * 4) ---- */
++#define GMU_GX_SPTPRAC_CLOCK_CONTROL    0x00200
++#define GMU_CM3_ITCM_START              0x03000         /* 16 KiB window */
++#define GMU_CM3_DTCM_START              0x07000         /* 16 KiB window */
++#define GMU_CORE_FW_VERSION             0x0afe0         /* DTCM byte 0x3fe0 */
++#define GMU_ICACHE_CONFIG               0x13000
++#define GMU_DCACHE_CONFIG               0x13004
++#define GMU_SYS_BUS_CONFIG              0x1303c
++#define GMU_CM3_SYSRESET                0x14000
++#define GMU_CM3_BOOT_CONFIG             0x14004
++#define GMU_CM3_FW_BUSY                 0x14068
++#define GMU_CM3_FW_INIT_RESULT          0x14070
++#define GMU_CM3_CFG                     0x140b4
++#define GMU_POWER_COUNTER_ENABLE        0x14100
++#define GMU_PWR_COL_INTER_FRAME_CTRL    0x14300
++#define GMU_PWR_COL_KEEPALIVE           0x1430c
++#define GMU_SPTPRAC_PWR_CLK_STATUS      0x14340
++#define  GX_HM_GDSC_POWER_OFF           (1u << 6)
++#define  GX_HM_CLK_OFF                  (1u << 7)
++#define GMU_RPMH_CTRL                   0x143a0
++#define GMU_RPMH_POWER_STATE            0x143b0
++#define GMU_CX_FAL_INTF                 0x143c0
++#define GMU_CX_FALNEXT_INTF             0x143c4
++#define GMU_PWR_COL_CP_MSG              0x14400
++#define GMU_PWR_COL_CP_RESP             0x14404
++#define GMU_HFI_CTRL_STATUS             0x14600
++#define GMU_HFI_VERSION_INFO            0x14604
++#define GMU_HFI_SFR_ADDR                0x14608         /* carries the chip id */
++#define GMU_HFI_QTBL_INFO               0x14610
++#define GMU_HFI_QTBL_ADDR               0x14614
++#define GMU_HFI_CTRL_INIT               0x14618
++#define GMU_GMU2HOST_INTR_CLR           0x14644
++#define GMU_GMU2HOST_INTR_INFO          0x14648
++#define  GMU2HOST_MSGQ                  (1u << 0)
++#define  GMU2HOST_CM3_FAULT             (1u << 23)
++#define GMU_GMU2HOST_INTR_MASK          0x1464c
++#define GMU_HOST2GMU_INTR_SET           0x14650
++#define GMU_GENERAL_7                   0x14730
++#define GMU_AO_HOST_INTERRUPT_CLR       0x24c10
++#define GMU_AO_HOST_INTERRUPT_STATUS    0x24c14
++#define GMU_AO_HOST_INTERRUPT_MASK      0x24c18
++#define GMU_RSCC_CONTROL_REQ            0x24c1c
++#define GMU_RSCC_CONTROL_ACK            0x24c20
++#define GMU_CX_BUSY_STATUS              0x24c30
++#define GMU_AO_AHB_FENCE_CTRL           0x24c40
++#define GMU_AHB_FENCE_RANGE_0           0x24c44
++#define GMU_AHB_FENCE_STATUS            0x24c4c
++#define GMU_AHB_FENCE_STATUS_CLR        0x24c50
++
++/* ---- RSCC (0x03de0000) ---- */
++#define RSCC_STATUS0_DRV0               0x0010
++#define RSCC_PDC_SEQ_START_ADDR         0x0020
++#define RSCC_PDC_MATCH_VALUE_LO         0x0024
++#define RSCC_PDC_MATCH_VALUE_HI         0x0028
++#define RSCC_PDC_SLAVE_ID_DRV0          0x002c
++#define RSCC_HIDDEN_TCS_CMD_ADDR(n)     (0x0034 + 8 * (n))
++#define RSCC_HIDDEN_TCS_CMD_DATA(n)     (0x0038 + 8 * (n))
++#define RSCC_OVERRIDE_START_ADDR        0x0400
++#define RSCC_SEQ_BUSY_DRV0              0x0404
++#define RSCC_SEQ_MEM_0_DRV0             0x0600
++static const uint32_t rscc_tcs_status[4] = { 0x0d18, 0x0fb8, 0x1258, 0x14f8 };
++
++/* ---- PDC (0x0b290000) ---- */
++#define PDC_GPU_ENABLE_PDC              0x4500
++#define PDC_GPU_SEQ_START_ADDR          0x4520
++
++/* ---- GMU virtual memory (A650, spec 2.2) ---- */
++#define GMU_ICACHE_IOVA                 0x00004000u
++#define GMU_ICACHE_SIZE                 0x00ffc000u     /* up to 16 MiB */
++#define GMU_ICACHE_CHUNK                0x00100000u
++#define GMU_ICACHE_CHUNKS               16
++#define GMU_DUMMY_IOVA                  0x60000000u
++#define GMU_LOG_IOVA                    0x60004000u
++#define GMU_HFI_IOVA                    0x60008000u
++#define GMU_BUF_SIZE                    0x4000u
++#define GMU_ITCM_BASE                   0x00000000u
++#define GMU_DTCM_BASE                   0x10004000u
++#define GMU_TCM_SIZE                    0x4000u
++
++/* ---- HFI ---- */
++#define HFI_QUEUE_DWORDS                1024
++#define HFI_H2F_PERF_TABLE              4
++#define HFI_H2F_BW_TABLE                3
++#define HFI_H2F_CORE_FW_START           14
++#define HFI_H2F_START                   10
++#define HFI_H2F_GX_BW_PERF_VOTE         30
++#define HFI_H2F_PREPARE_SLUMBER         33
++#define HFI_F2H_ERROR                   100
++#define HFI_MAX_LEVELS_GX               16
++#define HFI_MAX_LEVELS_CX               4
++
++/* queue table layout inside the hfi buffer (dword indices) */
++#define QT_VERSION      0
++#define QT_SIZE         1
++#define QT_QHDR0_OFF    2
++#define QT_QHDR_SIZE    3
++#define QT_NUM_QUEUES   4
++#define QT_ACTIVE       5
++#define QH(q)           (6 + 12 * (q))          /* queue header q */
++#define QH_STATUS       0
++#define QH_IOVA         1
++#define QH_TYPE         2
++#define QH_SIZE         3
++#define QH_MSG_SIZE     4
++#define QH_DROPPED      5
++#define QH_RX_WM        6
++#define QH_TX_WM        7
++#define QH_RX_REQ       8
++#define QH_TX_REQ       9
++#define QH_READ         10
++#define QH_WRITE        11
++#define Q_CMD           0
++#define Q_RSP           1
++
++struct sgpu_gmu {
++	struct sgpu_dma icache[GMU_ICACHE_CHUNKS];
++	uint32_t        n_icache;
++	struct sgpu_dma dummy, log, hfi;
++	bool            mem_ready, rpmh_ready, running;
++	uint32_t        seqnum;
++	uint32_t        fw_version;
++
++	uint32_t        nr_gpu_freqs, nr_gmu_freqs;
++	uint32_t        gpu_freq_khz[HFI_MAX_LEVELS_GX];
++	uint32_t        gx_votes[HFI_MAX_LEVELS_GX];
++	uint32_t        gmu_freq_khz[HFI_MAX_LEVELS_CX];
++	uint32_t        cx_votes[HFI_MAX_LEVELS_CX];
++	uint32_t        perf_index;
++};
++
++static struct sgpu_gmu gmu_storage;
++
++static inline uint32_t gmu_rd(struct sgpu *g, uint32_t o) { return sgpu_rd(g->gmu, o); }
++static inline void gmu_wr(struct sgpu *g, uint32_t o, uint32_t v) { sgpu_wr(g->gmu, o, v); }
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/* ------------------------------------------------------------------ */
++/* memory                                                             */
++/* ------------------------------------------------------------------ */
++
++static int
++gmu_buf(struct sgpu *g, struct sgpu_dma *d, uint32_t iova, uint32_t size, uint32_t prot,
++    const char *name)
++{
++	int err = sgpu_dma_alloc(size, 0x4000, SGPU_DMA_WC, d);
++	if (err) {
++		return sgpu_fail(g, -12, "gmu: cannot allocate %s (%u bytes)", name, size);
++	}
++	err = sgpu_smmu_map(g, SGPU_DOM_GMU, iova, d->pa, size, prot);
++	if (err) {
++		return sgpu_fail(g, err, "gmu: cannot map %s at %#x", name, iova);
++	}
++	return 0;
++}
++
++static int
++gmu_memory_init(struct sgpu *g, struct sgpu_gmu *m)
++{
++	const uint32_t rwx = SGPU_PROT_READ | SGPU_PROT_WRITE | SGPU_PROT_EXEC;
++	int err;
++
++	if (m->mem_ready) {
++		return 0;
++	}
++	/*
++	 * icache: 16 MiB - 16 KiB at GMU VA 0x4000, privileged (the M3
++	 * fetches code from it). Linux backs it with scattered pages; we use
++	 * 1 MiB contiguous chunks so no huge contiguous allocation is needed.
++	 */
++	for (uint32_t off = 0; off < GMU_ICACHE_SIZE; off += GMU_ICACHE_CHUNK) {
++		uint32_t len = GMU_ICACHE_SIZE - off < GMU_ICACHE_CHUNK ?
++		    GMU_ICACHE_SIZE - off : GMU_ICACHE_CHUNK;
++		err = gmu_buf(g, &m->icache[m->n_icache], GMU_ICACHE_IOVA + off, len,
++		    rwx | SGPU_PROT_PRIV, "icache");
++		if (err) {
++			return err;
++		}
++		m->n_icache++;
++	}
++	/* firmware "prealloc" block (type 7) at 0x60000000, 4 KiB; our granule is 16 KiB */
++	if ((err = gmu_buf(g, &m->dummy, GMU_DUMMY_IOVA, GMU_BUF_SIZE, rwx | SGPU_PROT_PRIV, "dummy")) ||
++	    (err = gmu_buf(g, &m->log, GMU_LOG_IOVA, GMU_BUF_SIZE, rwx, "log")) ||
++	    (err = gmu_buf(g, &m->hfi, GMU_HFI_IOVA, GMU_BUF_SIZE, rwx, "hfi"))) {
++		return err;
++	}
++	sgpu_smmu_tlb_sync(g, SGPU_DOM_GMU);
++	m->mem_ready = true;
++	sgpu_log("gmu: memory: icache %#x+%#x (%u chunks), dummy %#x, log %#x, hfi %#x",
++	    GMU_ICACHE_IOVA, GMU_ICACHE_SIZE, m->n_icache, GMU_DUMMY_IOVA, GMU_LOG_IOVA,
++	    GMU_HFI_IOVA);
++	return 0;
++}
++
++/* CPU pointer for a GMU VA inside icache/dummy, with the bytes left in that buffer */
++static volatile uint8_t *
++gmu_va_to_cpu(struct sgpu_gmu *m, uint32_t addr, uint32_t *room)
++{
++	if (addr >= GMU_ICACHE_IOVA && addr < GMU_ICACHE_IOVA + GMU_ICACHE_SIZE) {
++		uint32_t off = addr - GMU_ICACHE_IOVA;
++		uint32_t i = off / GMU_ICACHE_CHUNK;
++		if (i < m->n_icache) {
++			*room = (uint32_t)m->icache[i].size - off % GMU_ICACHE_CHUNK;
++			return (volatile uint8_t *)m->icache[i].va + off % GMU_ICACHE_CHUNK;
++		}
++	}
++	if (addr >= GMU_DUMMY_IOVA && addr < GMU_DUMMY_IOVA + GMU_BUF_SIZE) {
++		*room = GMU_DUMMY_IOVA + GMU_BUF_SIZE - addr;
++		return (volatile uint8_t *)m->dummy.va + (addr - GMU_DUMMY_IOVA);
++	}
++	return NULL;
++}
++
++/* ------------------------------------------------------------------ */
++/* firmware                                                           */
++/* ------------------------------------------------------------------ */
++
++static void
++tcm_write(struct sgpu *g, uint32_t win, uint32_t off, const uint8_t *src, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i += 4) {
++		uint8_t b[4] = { 0, 0, 0, 0 };
++		for (uint32_t k = 0; k < 4 && i + k < n; k++) {
++			b[k] = src[i + k];
++		}
++		gmu_wr(g, win + off + i, le32(b));
++	}
++}
++
++/*
++ * a650_gmu.bin: { u32 addr, size(bytes), type, value; u8 data[size] }...
++ * size 0 = descriptor (skipped; type 7 asks for the dummy prealloc).
++ * Unlike Linux we bound-check every block against the file and the target.
++ */
++static int
++gmu_fw_load(struct sgpu *g, struct sgpu_gmu *m)
++{
++	const uint8_t *fw = g->gmu_fw;
++	uint32_t len = g->gmu_fw_len, off = 0, blocks = 0, bytes = 0;
++
++	while (off + 16 <= len) {
++		uint32_t addr = le32(fw + off), size = le32(fw + off + 4);
++		const uint8_t *data = fw + off + 16;
++		if (size > len - off - 16) {
++			return sgpu_fail(g, -22, "gmu fw: block at %#x (addr %#x size %#x) "
++			           "runs past the file", off, addr, size);
++		}
++		off += 16 + size;
++		if (size == 0) {
++			continue;
++		}
++		if (addr < GMU_ITCM_BASE + GMU_TCM_SIZE) {
++			if (addr + size > GMU_TCM_SIZE) {
++				return sgpu_fail(g, -22, "gmu fw: ITCM block %#x+%#x too big", addr, size);
++			}
++			tcm_write(g, GMU_CM3_ITCM_START, addr - GMU_ITCM_BASE, data, size);
++		} else if (addr >= GMU_DTCM_BASE && addr < GMU_DTCM_BASE + GMU_TCM_SIZE) {
++			if (addr - GMU_DTCM_BASE + size > GMU_TCM_SIZE) {
++				return sgpu_fail(g, -22, "gmu fw: DTCM block %#x+%#x too big", addr, size);
++			}
++			tcm_write(g, GMU_CM3_DTCM_START, addr - GMU_DTCM_BASE, data, size);
++		} else {
++			uint32_t done = 0;
++			while (done < size) {
++				uint32_t room;
++				volatile uint8_t *dst = gmu_va_to_cpu(m, addr + done, &room);
++				if (dst == NULL) {
++					sgpu_log("gmu fw: block %#x+%#x outside every GMU buffer (skipped)",
++					    addr, size);
++					break;
++				}
++				uint32_t n = size - done < room ? size - done : room;
++				for (uint32_t i = 0; i < n; i++) {
++					dst[i] = data[done + i];
++				}
++				done += n;
++			}
++		}
++		blocks++;
++		bytes += size;
++	}
++	sgpu_wmb();
++	m->fw_version = gmu_rd(g, GMU_CORE_FW_VERSION);
++	sgpu_log("gmu fw: %u blocks, %u bytes, version %u.%u.%u (%#x)", blocks, bytes,
++	    m->fw_version >> 28, (m->fw_version >> 16) & 0xfff, m->fw_version & 0xffff,
++	    m->fw_version);
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* RSC / PDC (spec 1.2), once per boot, with CX + GMU clocks on       */
++/* ------------------------------------------------------------------ */
++
++static void
++rpmh_stop(struct sgpu *g)
++{
++	gmu_wr(g, GMU_RSCC_CONTROL_REQ, 1);
++	if (sgpu_poll(g->rscc, RSCC_STATUS0_DRV0, 1u << 16, 1u << 16, 10000)) {
++		sgpu_log("gmu: unable to power off the GPU RSC (STATUS0 %#x)",
++		    sgpu_rd(g->rscc, RSCC_STATUS0_DRV0));
++	}
++	gmu_wr(g, GMU_RSCC_CONTROL_REQ, 0);
++}
++
++static void
++rpmh_init(struct sgpu *g, struct sgpu_gmu *m)
++{
++	static const uint32_t seq[5] = {
++		0xeaaae5a0, 0xe1a1ebab, 0xa2e0a581, 0xecac82e2, 0x0020edad,     /* A650 family */
++	};
++
++	if (m->rpmh_ready) {
++		return;
++	}
++	sgpu_wr(g->rscc, RSCC_STATUS0_DRV0, 1u << 24);  /* disable SDE clock gating */
++	sgpu_wr(g->rscc, RSCC_PDC_SLAVE_ID_DRV0, 1);
++	sgpu_wr(g->rscc, RSCC_HIDDEN_TCS_CMD_DATA(0), 0);
++	sgpu_wr(g->rscc, RSCC_HIDDEN_TCS_CMD_ADDR(0), 0);
++	sgpu_wr(g->rscc, RSCC_HIDDEN_TCS_CMD_DATA(1), 0);
++	sgpu_wr(g->rscc, RSCC_HIDDEN_TCS_CMD_ADDR(1), 0);
++	sgpu_wr(g->rscc, RSCC_HIDDEN_TCS_CMD_DATA(2), 0x80000000);
++	sgpu_wr(g->rscc, RSCC_HIDDEN_TCS_CMD_ADDR(2), 0);
++	sgpu_wr(g->rscc, RSCC_OVERRIDE_START_ADDR, 0);
++	sgpu_wr(g->rscc, RSCC_PDC_SEQ_START_ADDR, PDC_GPU_SEQ_START_ADDR);
++	sgpu_wr(g->rscc, RSCC_PDC_MATCH_VALUE_LO, 0x4510);
++	sgpu_wr(g->rscc, RSCC_PDC_MATCH_VALUE_HI, 0x4514);
++	for (int i = 0; i < 5; i++) {
++		sgpu_wr(g->rscc, RSCC_SEQ_MEM_0_DRV0 + 4 * i, seq[i]);
++	}
++	/* PDC sequencer + TCS live in AOP on A650: only point and enable it */
++	sgpu_wr(g->pdc, PDC_GPU_SEQ_START_ADDR, 0);
++	sgpu_wr(g->pdc, PDC_GPU_ENABLE_PDC, 0x80000001);
++	sgpu_wmb();
++	rpmh_stop(g);
++	m->rpmh_ready = true;
++	sgpu_log("gmu: RSC/PDC programmed");
++}
++
++static int
++rpmh_start(struct sgpu *g)
++{
++	gmu_wr(g, GMU_RSCC_CONTROL_REQ, 1u << 1);
++	if (sgpu_poll(g->gmu, GMU_RSCC_CONTROL_ACK, 1u << 1, 1u << 1, 10000)) {
++		return sgpu_fail(g, -60, "gmu: unable to power on the GPU RSC (ACK %#x)",
++		           gmu_rd(g, GMU_RSCC_CONTROL_ACK));
++	}
++	if (sgpu_poll(g->rscc, RSCC_SEQ_BUSY_DRV0, 0xffffffffu, 0, 10000)) {
++		return sgpu_fail(g, -60, "gmu: GPU RSC sequence stuck (%#x)",
++		           sgpu_rd(g->rscc, RSCC_SEQ_BUSY_DRV0));
++	}
++	gmu_wr(g, GMU_RSCC_CONTROL_REQ, 0);
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* frequency tables and ARC votes (spec 3.5)                          */
++/* ------------------------------------------------------------------ */
++
++struct opp { uint32_t khz; uint16_t level; uint8_t bins; };
++/* bins: bit n = enabled for speed-bin fuse value n (sm8250 opp-supported-hw
++ * after the fuse->index map {0:0, 1:1, 2:3, 3:2}) */
++static const struct opp a650_opps[] = {
++	{ 305000,  64, 0xf },
++	{ 400000, 128, 0xf },
++	{ 441600, 144, 0xf },
++	{ 490000, 192, 0xf },
++	{ 525000, 224, 0xf },
++	{ 587000, 256, 0x7 },
++	{ 670000, 320, 0x6 },
++};
++
++static uint32_t
++read_speed_bin(void)
++{
++	const void *p;
++	uint32_t len;
++
++	if (sgpu_dt_prop("speed-bin", &p, &len) && len == 4) {
++		return *(const uint32_t *)p;
++	}
++	/* qfprom 0x784000 + 0x19b, bits [7:5] */
++	volatile uint8_t *q = sgpu_ioremap(0x00784000, 0x1000);
++	if (q == NULL) {
++		return 0;
++	}
++	uint32_t v = (sgpu_rd(q, 0x198) >> 24) & 0xff;
++	return (v >> 5) & 7;
++}
++
++static int
++arc_vote(const struct sgpu_arc *pri, const struct sgpu_arc *sec, uint32_t level,
++    uint32_t *vote)
++{
++	uint32_t p, s;
++
++	for (p = 0; p < pri->count && pri->level[p] < level; p++) {
++	}
++	if (p == pri->count) {
++		return -2;
++	}
++	for (s = 0; s < sec->count && sec->level[s] < level; s++) {
++	}
++	if (s == sec->count) {
++		for (s = sec->count; s > 0 && sec->level[s - 1] == 0; s--) {
++		}
++		s = s ? s - 1 : 0;
++	}
++	*vote = ((uint32_t)pri->level[p] << 16) | ((s & 0xff) << 8) | (p & 0xff);
++	return 0;
++}
++
++static int
++gmu_pwrlevels(struct sgpu *g, struct sgpu_gmu *m)
++{
++	struct sgpu_arc gfx, cx, mx;
++	uint32_t bin = read_speed_bin();
++
++	g->speed_bin = bin;
++	if (sgpu_cmddb_arc("gfx.lvl", &gfx) || sgpu_cmddb_arc("cx.lvl", &cx) ||
++	    (sgpu_cmddb_arc("gmxc.lvl", &mx) && sgpu_cmddb_arc("mx.lvl", &mx))) {
++		/* Linux ignores this; all-zero votes would vote the rails off */
++		return sgpu_fail(g, -2, "gmu: cmd-db has no gfx/cx/mx ARC levels");
++	}
++
++	m->nr_gpu_freqs = 1;
++	m->gpu_freq_khz[0] = 0;
++	if (arc_vote(&gfx, &mx, 0, &m->gx_votes[0])) {
++		return sgpu_fail(g, -2, "gmu: gfx.lvl has no off level");
++	}
++	for (uint32_t i = 0; i < sizeof(a650_opps) / sizeof(a650_opps[0]); i++) {
++		const struct opp *o = &a650_opps[i];
++		if (!(o->bins & (1u << (bin < 4 ? bin : 0)))) {
++			continue;
++		}
++		uint32_t n = m->nr_gpu_freqs;
++		if (arc_vote(&gfx, &mx, o->level, &m->gx_votes[n])) {
++			return sgpu_fail(g, -2, "gmu: RPMh level %u not in gfx.lvl", o->level);
++		}
++		m->gpu_freq_khz[n] = o->khz;
++		m->nr_gpu_freqs++;
++	}
++	m->nr_gmu_freqs = 2;
++	m->gmu_freq_khz[0] = 0;
++	m->gmu_freq_khz[1] = 200000;
++	if (arc_vote(&cx, &mx, 0, &m->cx_votes[0]) || arc_vote(&cx, &mx, 48, &m->cx_votes[1])) {
++		return sgpu_fail(g, -2, "gmu: RPMh level 48 not in cx.lvl");
++	}
++	sgpu_log("gmu: speed bin %u, %u GPU levels up to %u MHz", bin, m->nr_gpu_freqs - 1,
++	    m->gpu_freq_khz[m->nr_gpu_freqs - 1] / 1000);
++	for (uint32_t i = 0; i < m->nr_gpu_freqs; i++) {
++		sgpu_log("gmu:   level %u: %u kHz vote %#010x", i, m->gpu_freq_khz[i], m->gx_votes[i]);
++	}
++	sgpu_log("gmu:   GMU 200 MHz vote %#010x", m->cx_votes[1]);
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* HFI                                                                */
++/* ------------------------------------------------------------------ */
++
++static volatile uint32_t *
++hfi_tbl(struct sgpu_gmu *m)
++{
++	return (volatile uint32_t *)m->hfi.va;
++}
++
++static volatile uint32_t *
++hfi_ring(struct sgpu_gmu *m, int q)
++{
++	return (volatile uint32_t *)(void *)((uint8_t *)m->hfi.va + 0x1000 * (q + 1));
++}
++
++static void
++hfi_init(struct sgpu_gmu *m)
++{
++	volatile uint32_t *t = hfi_tbl(m);
++
++	sgpu_mem_wr32(&t[QT_VERSION], 0);
++	sgpu_mem_wr32(&t[QT_SIZE], 24 + 2 * 48);       /* bytes, as Linux does */
++	sgpu_mem_wr32(&t[QT_QHDR0_OFF], 6);
++	sgpu_mem_wr32(&t[QT_QHDR_SIZE], 12);
++	sgpu_mem_wr32(&t[QT_NUM_QUEUES], 2);
++	sgpu_mem_wr32(&t[QT_ACTIVE], 2);
++	for (int q = 0; q < 2; q++) {
++		volatile uint32_t *h = &t[QH(q)];
++		sgpu_mem_wr32(&h[QH_STATUS], 1);
++		sgpu_mem_wr32(&h[QH_IOVA], GMU_HFI_IOVA + 0x1000 * (uint32_t)(q + 1));
++		sgpu_mem_wr32(&h[QH_TYPE], (10u << 8) | (uint32_t)q);
++		sgpu_mem_wr32(&h[QH_SIZE], HFI_QUEUE_DWORDS);
++		sgpu_mem_wr32(&h[QH_MSG_SIZE], 0);
++		sgpu_mem_wr32(&h[QH_DROPPED], 0);
++		sgpu_mem_wr32(&h[QH_RX_WM], 1);
++		sgpu_mem_wr32(&h[QH_TX_WM], 1);
++		sgpu_mem_wr32(&h[QH_RX_REQ], 1);
++		sgpu_mem_wr32(&h[QH_TX_REQ], 0);
++		sgpu_mem_wr32(&h[QH_READ], 0);
++		sgpu_mem_wr32(&h[QH_WRITE], 0);
++	}
++	sgpu_wmb();
++}
++
++static void
++hfi_reset_queues(struct sgpu_gmu *m)
++{
++	volatile uint32_t *t = hfi_tbl(m);
++	for (int q = 0; q < 2; q++) {
++		sgpu_mem_wr32(&t[QH(q) + QH_READ], 0);
++		sgpu_mem_wr32(&t[QH(q) + QH_WRITE], 0);
++	}
++	sgpu_wmb();
++}
++
++static int
++hfi_queue_write(struct sgpu *g, struct sgpu_gmu *m, const uint32_t *msg, uint32_t n)
++{
++	volatile uint32_t *h = &hfi_tbl(m)[QH(Q_CMD)];
++	volatile uint32_t *ring = hfi_ring(m, Q_CMD);
++	uint32_t rd = sgpu_mem_rd32(&h[QH_READ]) % HFI_QUEUE_DWORDS;
++	uint32_t wr = sgpu_mem_rd32(&h[QH_WRITE]) % HFI_QUEUE_DWORDS;
++	uint32_t space = (rd - wr - 1) & (HFI_QUEUE_DWORDS - 1);
++
++	if (space < ((n + 3) & ~3u)) {
++		sgpu_mem_wr32(&h[QH_DROPPED], sgpu_mem_rd32(&h[QH_DROPPED]) + 1);
++		return sgpu_fail(g, -28, "hfi: command queue full (rd %u wr %u)", rd, wr);
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		sgpu_mem_wr32(&ring[wr], msg[i]);
++		wr = (wr + 1) % HFI_QUEUE_DWORDS;
++	}
++	while (wr & 3) {                        /* HFI v2: pad to 4 dwords */
++		sgpu_mem_wr32(&ring[wr], 0xfafafafa);
++		wr = (wr + 1) % HFI_QUEUE_DWORDS;
++	}
++	sgpu_wmb();
++	sgpu_mem_wr32(&h[QH_WRITE], wr);
++	sgpu_wmb();
++	gmu_wr(g, GMU_HOST2GMU_INTR_SET, 1);
++	return 0;
++}
++
++/* one message from the response queue; 0 = got one, 1 = empty */
++static int
++hfi_queue_read(struct sgpu *g, struct sgpu_gmu *m, uint32_t *msg, uint32_t max)
++{
++	volatile uint32_t *h = &hfi_tbl(m)[QH(Q_RSP)];
++	volatile uint32_t *ring = hfi_ring(m, Q_RSP);
++	uint32_t rd = sgpu_mem_rd32(&h[QH_READ]) % HFI_QUEUE_DWORDS;
++	uint32_t wr = sgpu_mem_rd32(&h[QH_WRITE]) % HFI_QUEUE_DWORDS;
++
++	if (rd == wr) {
++		sgpu_mem_wr32(&h[QH_RX_REQ], 1);
++		return 1;
++	}
++	uint32_t hdr = sgpu_mem_rd32(&ring[rd]);
++	uint32_t n = (hdr >> 8) & 0xff;
++	if (n == 0 || n > max) {
++		sgpu_log("hfi: bad response header %#x at %u, flushing the queue", hdr, rd);
++		sgpu_mem_wr32(&h[QH_READ], wr);
++		(void)g;
++		return 1;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		msg[i] = sgpu_mem_rd32(&ring[rd]);
++		rd = (rd + 1) % HFI_QUEUE_DWORDS;
++	}
++	rd = ((rd + 3) & ~3u) % HFI_QUEUE_DWORDS;
++	sgpu_mem_wr32(&h[QH_READ], rd);
++	sgpu_wmb();
++	return 0;
++}
++
++static int
++hfi_wait_ack(struct sgpu *g, struct sgpu_gmu *m, uint32_t id, uint32_t seq,
++    uint32_t *payload, uint32_t npayload)
++{
++	uint32_t rsp[19];
++	int empty_retries = 0;
++
++	for (;;) {
++		if (sgpu_poll(g->gmu, GMU_GMU2HOST_INTR_INFO, GMU2HOST_MSGQ, GMU2HOST_MSGQ, 1000000)) {
++			return sgpu_fail(g, -60, "hfi: timeout waiting for ack of msg %u seq %u "
++			           "(INFO %#x, fw init %#x)", id, seq,
++			           gmu_rd(g, GMU_GMU2HOST_INTR_INFO), gmu_rd(g, GMU_CM3_FW_INIT_RESULT));
++		}
++		gmu_wr(g, GMU_GMU2HOST_INTR_CLR, GMU2HOST_MSGQ);
++		for (;;) {
++			int r = hfi_queue_read(g, m, rsp, 19);
++			if (r == 1) {
++				if (++empty_retries > 1) {
++					return sgpu_fail(g, -5, "hfi: response queue empty for msg %u", id);
++				}
++				break;          /* wait for the next doorbell */
++			}
++			if ((rsp[0] & 0xff) == HFI_F2H_ERROR) {
++				sgpu_log("hfi: firmware error %u (%#x %#x)", rsp[1], rsp[2], rsp[3]);
++				continue;
++			}
++			if (((rsp[1] >> 20) & 0xfff) != seq) {
++				sgpu_log("hfi: unexpected ack seq %u (want %u) for msg %u",
++				    (rsp[1] >> 20) & 0xfff, seq, rsp[1] & 0xff);
++				continue;
++			}
++			if (rsp[2] != 0) {
++				return sgpu_fail(g, -22, "hfi: msg %u rejected, error %u", id, rsp[2]);
++			}
++			for (uint32_t i = 0; i < npayload && i < 16; i++) {
++				payload[i] = rsp[3 + i];
++			}
++			return 0;
++		}
++	}
++}
++
++static int
++hfi_send(struct sgpu *g, struct sgpu_gmu *m, uint32_t id, uint32_t *msg, uint32_t dwords)
++{
++	uint32_t seq = (++m->seqnum) % 0xfff;
++	int err;
++
++	msg[0] = (seq << 20) | (0u << 16) | (dwords << 8) | id;
++	if ((err = hfi_queue_write(g, m, msg, dwords)) != 0) {
++		return err;
++	}
++	return hfi_wait_ack(g, m, id, seq, NULL, 0);
++}
++
++static int
++hfi_send_perf_table(struct sgpu *g, struct sgpu_gmu *m)
++{
++	uint32_t msg[59] = { 0 };
++
++	msg[1] = m->nr_gpu_freqs;
++	msg[2] = m->nr_gmu_freqs;
++	for (uint32_t i = 0; i < m->nr_gpu_freqs; i++) {
++		msg[3 + 3 * i] = m->gx_votes[i];
++		msg[4 + 3 * i] = 0xffffffff;    /* no ACD */
++		msg[5 + 3 * i] = m->gpu_freq_khz[i];
++	}
++	for (uint32_t j = 0; j < m->nr_gmu_freqs; j++) {
++		msg[51 + 2 * j] = m->cx_votes[j];
++		msg[52 + 2 * j] = m->gmu_freq_khz[j];
++	}
++	return hfi_send(g, m, HFI_H2F_PERF_TABLE, msg, 59);
++}
++
++static int
++hfi_send_bw_table(struct sgpu *g, struct sgpu_gmu *m)
++{
++	uint32_t msg[160] = { 0 };
++
++	/* Linux a650_build_bw_table: one DDR level ("off" BCM votes), CNOC on/off */
++	msg[1] = 1;                     /* bw_level_num */
++	msg[2] = 1;                     /* cnoc_cmds_num */
++	msg[3] = 3;                     /* ddr_cmds_num */
++	msg[4] = 0x01;                  /* cnoc_wait_bitmask */
++	msg[5] = 0x01;                  /* ddr_wait_bitmask */
++	msg[6] = 0x500a4;               /* cnoc_cmds_addrs[0] */
++	msg[12 + 0 * 6 + 0] = 0x40000000;       /* cnoc_cmds_data[0][0] */
++	msg[12 + 1 * 6 + 0] = 0x60000001;       /* cnoc_cmds_data[1][0] */
++	msg[24] = 0x50000;              /* ddr_cmds_addrs */
++	msg[25] = 0x50004;
++	msg[26] = 0x5007c;
++	msg[32 + 0] = 0x40000000;       /* ddr_cmds_data[0][0..2] */
++	msg[32 + 1] = 0x40000000;
++	msg[32 + 2] = 0x40000000;
++	return hfi_send(g, m, HFI_H2F_BW_TABLE, msg, 160);
++}
++
++static int
++hfi_perf_vote(struct sgpu *g, struct sgpu_gmu *m, uint32_t index)
++{
++	uint32_t msg[4] = { 0, 1 /* blocking ack */, index, 0 /* bw index */ };
++	return hfi_send(g, m, HFI_H2F_GX_BW_PERF_VOTE, msg, 4);
++}
++
++static int
++hfi_start(struct sgpu *g, struct sgpu_gmu *m)
++{
++	uint32_t msg[2] = { 0, 0 };
++	int err;
++
++	if ((err = hfi_send_perf_table(g, m)) != 0 ||
++	    (err = hfi_send_bw_table(g, m)) != 0) {
++		return err;
++	}
++	if ((err = hfi_send(g, m, HFI_H2F_CORE_FW_START, msg, 2)) != 0) {
++		return err;
++	}
++	return hfi_send(g, m, HFI_H2F_START, msg, 1);
++}
++
++/* ------------------------------------------------------------------ */
++/* firmware start (spec 1.4)                                          */
++/* ------------------------------------------------------------------ */
++
++static uint32_t
++gmu_chipid(uint32_t chip)
++{
++	return (chip & 0xffff0000u) | ((chip << 4) & 0xf000u) | ((chip << 8) & 0x0f00u);
++}
++
++static int
++gmu_fw_start(struct sgpu *g, struct sgpu_gmu *m)
++{
++	int err;
++
++	gmu_wr(g, GMU_CX_FALNEXT_INTF, 1);      /* vote veto for FAL10 */
++	gmu_wr(g, GMU_CX_FAL_INTF, 1);
++	gmu_wr(g, GMU_GENERAL_7, 1);            /* TCM retention */
++	if ((err = rpmh_start(g)) != 0) {
++		return err;
++	}
++	/* hold the M3 in reset while its TCMs are rewritten (CX may not have
++	 * collapsed since a previous attempt) */
++	gmu_wr(g, GMU_CM3_SYSRESET, 1);
++	if ((err = gmu_fw_load(g, m)) != 0) {
++		return err;
++	}
++	gmu_wr(g, GMU_CM3_FW_INIT_RESULT, 0);
++	gmu_wr(g, GMU_CM3_BOOT_CONFIG, 2);
++	gmu_wr(g, GMU_HFI_QTBL_ADDR, GMU_HFI_IOVA);
++	gmu_wr(g, GMU_HFI_QTBL_INFO, 1);
++	gmu_wr(g, GMU_AHB_FENCE_RANGE_0, (1u << 31) | (0xau << 18) | 0xa0);     /* 0x802800a0 */
++	gmu_wr(g, GMU_CM3_CFG, 0x4052);
++	gmu_wr(g, GMU_HFI_SFR_ADDR, gmu_chipid(g->chip_id));
++	gmu_wr(g, GMU_PWR_COL_CP_MSG, GMU_LOG_IOVA | (GMU_BUF_SIZE / 0x1000 - 1));
++
++	/* power config */
++	gmu_wr(g, GMU_SYS_BUS_CONFIG, 1);
++	gmu_wr(g, GMU_ICACHE_CONFIG, 1);
++	gmu_wr(g, GMU_DCACHE_CONFIG, 1);
++	gmu_wr(g, GMU_PWR_COL_INTER_FRAME_CTRL, 0x09c40400);
++	/* RPMh interface + LLC/DDR/MX/CX/GFX vote enables */
++	sgpu_rmw(g->gmu, GMU_RPMH_CTRL, 0, 0x00000f11);
++
++	/* start the M3 */
++	uint32_t mask, want;
++	if (m->fw_version <= 0x20010004) {
++		mask = 0xffffffffu;
++		want = 0xbabeface;
++	} else {
++		mask = 0x1ff;
++		want = 0x100;
++	}
++	gmu_wr(g, GMU_CM3_SYSRESET, 1);
++	gmu_wr(g, GMU_PWR_COL_CP_RESP, 0);      /* log write index */
++	sgpu_wmb();
++	gmu_wr(g, GMU_CM3_SYSRESET, 0);
++	if (sgpu_poll(g->gmu, GMU_CM3_FW_INIT_RESULT, mask, want, 10000)) {
++		return sgpu_fail(g, -60, "gmu: firmware init timed out (INIT_RESULT %#x, "
++		           "FW_BUSY %#x, AO status %#x)", gmu_rd(g, GMU_CM3_FW_INIT_RESULT),
++		           gmu_rd(g, GMU_CM3_FW_BUSY), gmu_rd(g, GMU_AO_HOST_INTERRUPT_STATUS));
++	}
++	/* HFI queues */
++	gmu_wr(g, GMU_HFI_CTRL_INIT, 1);
++	if (sgpu_poll(g->gmu, GMU_HFI_CTRL_STATUS, 1, 1, 10000)) {
++		return sgpu_fail(g, -60, "gmu: unable to start the HFI queues (%#x)",
++		           gmu_rd(g, GMU_HFI_CTRL_STATUS));
++	}
++	sgpu_wmb();
++	sgpu_log("gmu: M3 running, INIT_RESULT %#x, HFI version %#x",
++	    gmu_rd(g, GMU_CM3_FW_INIT_RESULT), gmu_rd(g, GMU_HFI_VERSION_INFO));
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* public                                                             */
++/* ------------------------------------------------------------------ */
++
++int
++sgpu_gmu_init(struct sgpu *g)
++{
++	struct sgpu_gmu *m = &gmu_storage;
++	uint32_t want;
++	int err;
++
++	if (g->gmu_state == NULL) {         /* first init of this device */
++		for (size_t i = 0; i < sizeof(*m); i++) {
++			((uint8_t *)m)[i] = 0;
++		}
++		g->gmu_state = m;
++	}
++	if ((err = gmu_memory_init(g, m)) != 0) {
++		return err;
++	}
++	if (m->nr_gpu_freqs == 0 && (err = gmu_pwrlevels(g, m)) != 0) {
++		return err;
++	}
++	hfi_init(m);
++	rpmh_init(g, m);
++
++	/* AO interrupts: unmask WDOG_BITE, FENCE_ERR, HOST_AHB_BUS_ERROR */
++	gmu_wr(g, GMU_AO_HOST_INTERRUPT_CLR, 0xffffffffu);
++	gmu_wr(g, GMU_AO_HOST_INTERRUPT_MASK, ~((1u << 0) | (1u << 3) | (1u << 5)));
++
++	if ((err = gmu_fw_start(g, m)) != 0 || (err = hfi_start(g, m)) != 0) {
++		sgpu_gmu_irq(g);
++		rpmh_stop(g);
++		return err;
++	}
++	gmu_wr(g, GMU_GMU2HOST_INTR_CLR, 0xffffffffu);
++	gmu_wr(g, GMU_GMU2HOST_INTR_MASK, ~GMU2HOST_CM3_FAULT);
++
++	/*
++	 * Initial GX level. Linux votes the highest OPP; a first bring-up is
++	 * safer at the lowest (305 MHz, RPMh LOW_SVS). sweetgpu_freq=N picks
++	 * level N (1 = lowest).
++	 */
++	want = 1;
++	(void)sgpu_bootarg_u32("sweetgpu_freq", &want);
++	if (want == 0 || want >= m->nr_gpu_freqs) {
++		want = m->nr_gpu_freqs - 1;
++	}
++	m->perf_index = want;
++	if ((err = hfi_perf_vote(g, m, m->perf_index)) != 0) {
++		return err;
++	}
++	m->running = true;
++	sgpu_log("gmu: HFI started, GX level %u (%u MHz), RPMh power state %#x",
++	    m->perf_index, m->gpu_freq_khz[m->perf_index] / 1000,
++	    gmu_rd(g, GMU_RPMH_POWER_STATE));
++	return 0;
++}
++
++static void
++oob_bits(enum sgpu_oob oob, uint32_t *req, uint32_t *ack, uint32_t *clr)
++{
++	if (oob == SGPU_OOB_GPU_SET) {
++		*req = 30; *ack = 31; *clr = 31;
++	} else {
++		*req = 28; *ack = 30; *clr = 29;
++	}
++}
++
++int
++sgpu_gmu_oob_set(struct sgpu *g, enum sgpu_oob oob)
++{
++	uint32_t req, ack, clr;
++	int err;
++
++	oob_bits(oob, &req, &ack, &clr);
++	gmu_wr(g, GMU_HOST2GMU_INTR_SET, 1u << req);
++	err = sgpu_poll(g->gmu, GMU_GMU2HOST_INTR_INFO, 1u << ack, 1u << ack, 10000);
++	gmu_wr(g, GMU_GMU2HOST_INTR_CLR, 1u << ack);
++	if (err) {
++		sgpu_log("gmu: OOB %s timed out (INFO %#x)",
++		    oob == SGPU_OOB_GPU_SET ? "GPU_SET" : "PERFCOUNTER",
++		    gmu_rd(g, GMU_GMU2HOST_INTR_INFO));
++	}
++	return err;
++}
++
++void
++sgpu_gmu_oob_clear(struct sgpu *g, enum sgpu_oob oob)
++{
++	uint32_t req, ack, clr;
++
++	oob_bits(oob, &req, &ack, &clr);
++	gmu_wr(g, GMU_HOST2GMU_INTR_SET, 1u << clr);
++}
++
++int
++sgpu_gmu_gx_on(struct sgpu *g)
++{
++	/*
++	 * The OOB GPU_SET request is held from here until the end of CP
++	 * hw_init (sgpu_cp_init clears it), mirroring Linux, where hw_init
++	 * starts and ends with this handshake. With IFPC disabled the GMU
++	 * keeps GX up afterwards.
++	 */
++	if (sgpu_gmu_oob_set(g, SGPU_OOB_GPU_SET)) {
++		return sgpu_fail(g, -60, "gmu: GX power (OOB GPU_SET) not acknowledged");
++	}
++	uint32_t st = gmu_rd(g, GMU_SPTPRAC_PWR_CLK_STATUS);
++	if (st & (GX_HM_GDSC_POWER_OFF | GX_HM_CLK_OFF)) {
++		return sgpu_fail(g, -5, "gmu: GX still off after OOB ack (SPTPRAC status %#x, "
++		           "GX GDSCR %#x)", st, sgpu_rd(g->gpucc, 0x100c));
++	}
++	/* first GX register reads: RBBM_STATUS and the chip's version */
++	sgpu_log("gmu: GX on (SPTPRAC %#x, GX GDSCR %#x), RBBM_STATUS %#x",
++	    st, sgpu_rd(g->gpucc, 0x100c), sgpu_rd(g->gpu, 0x210 * 4));
++	return 0;
++}
++
++void
++sgpu_gmu_gx_off(struct sgpu *g)
++{
++	sgpu_gmu_oob_clear(g, SGPU_OOB_GPU_SET);
++}
++
++int
++sgpu_gmu_set_freq(struct sgpu *g, uint32_t index)
++{
++	struct sgpu_gmu *m = g->gmu_state;
++
++	if (m == NULL || !m->running || index == 0 || index >= m->nr_gpu_freqs) {
++		return -22;
++	}
++	if (index == m->perf_index) {
++		return 0;
++	}
++	int err = hfi_perf_vote(g, m, index);
++	if (!err) {
++		m->perf_index = index;
++	}
++	return err;
++}
++
++uint32_t
++sgpu_gmu_max_freq_hz(struct sgpu *g)
++{
++	struct sgpu_gmu *m = g->gmu_state;
++	if (m == NULL || m->nr_gpu_freqs == 0) {
++		return 0;
++	}
++	return m->gpu_freq_khz[m->perf_index] * 1000u;
++}
++
++uint32_t
++sgpu_gmu_state(struct sgpu *g)
++{
++	struct sgpu_gmu *m = g->gmu_state;
++	if (m == NULL || !m->running) {
++		return 0xffffffffu;
++	}
++	return gmu_rd(g, GMU_RPMH_POWER_STATE) | (m->perf_index << 16);
++}
++
++uint32_t
++sgpu_gmu_irq(struct sgpu *g)
++{
++	uint32_t ao, info;
++
++	if (g->gmu == NULL || g->stage_reached < SGPU_STAGE_CLOCKS) {
++		return 0;
++	}
++	ao = gmu_rd(g, GMU_AO_HOST_INTERRUPT_STATUS);
++	if (ao) {
++		gmu_wr(g, GMU_AO_HOST_INTERRUPT_CLR, ao);
++		if (ao & 1) {
++			sgpu_log("gmu: watchdog bite -- GMU hung");
++		}
++		if (ao & (1u << 3)) {
++			sgpu_log("gmu: AHB fence error, status %#x", gmu_rd(g, GMU_AHB_FENCE_STATUS));
++		}
++		if (ao & (1u << 5)) {
++			sgpu_log("gmu: host AHB bus error");
++		}
++	}
++	info = gmu_rd(g, GMU_GMU2HOST_INTR_INFO);
++	if (info & GMU2HOST_CM3_FAULT) {
++		gmu_wr(g, GMU_GMU2HOST_INTR_CLR, GMU2HOST_CM3_FAULT);
++		sgpu_log("gmu: CM3 fault");
++		ao |= 1u << 31;
++	}
++	return ao;
++}
++
++void
++sgpu_gmu_shutdown(struct sgpu *g)
++{
++	struct sgpu_gmu *m = g->gmu_state;
++
++	if (m == NULL || !m->running) {
++		return;
++	}
++	/* graceful: PREPARE_SLUMBER, else the force-off path (spec 6) */
++	uint32_t msg[3] = { 0, 0, 0 };
++	gmu_wr(g, GMU_POWER_COUNTER_ENABLE, 0);
++	if (hfi_send(g, m, HFI_H2F_PREPARE_SLUMBER, msg, 3) == 0) {
++		gmu_wr(g, GMU_AO_AHB_FENCE_CTRL, 0);
++		(void)sgpu_poll(g->gmu, GMU_CX_BUSY_STATUS, 1u << 23, 0, 10000);
++	} else {
++		gmu_wr(g, GMU_PWR_COL_KEEPALIVE, 0);
++		for (int i = 0; i < 4; i++) {
++			(void)sgpu_poll(g->rscc, rscc_tcs_status[i], 1, 1, i == 3 ? 1000 : 10000);
++		}
++		gmu_wr(g, GMU_AHB_FENCE_STATUS_CLR, 7);
++		gmu_wr(g, GMU_AO_AHB_FENCE_CTRL, 0);
++		sgpu_wmb();
++		gmu_wr(g, GMU_CM3_SYSRESET, 1);
++	}
++	hfi_reset_queues(m);
++	gmu_wr(g, GMU_AO_HOST_INTERRUPT_MASK, 0xffffffffu);
++	gmu_wr(g, GMU_GMU2HOST_INTR_MASK, 0xffffffffu);
++	rpmh_stop(g);
++	m->running = false;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.h
+@@ -0,0 +1,361 @@
++/*
++ * sweet_gpu.h - internal interface of the SWEET Adreno 650 driver
++ * (Xiaomi Mi 10T / 10T Pro "apollo", Qualcomm SM8250).
++ *
++ * Layering (see docs/GPU-DRIVER.md):
++ *
++ *   SweetAdreno.cpp      IOService + IOUserClient: UAPI, per-task mappings,
++ *                        IOSurface import, bring-up thread
++ *   sweet_gpu_cp.c       GPU core: hw_init, SQE, ringbuffer, submit, timestamps
++ *   sweet_gpu_gmu.c      GMU: RSC/PDC, firmware, HFI, OOB (GX power), DCVS
++ *   sweet_gpu_smmu.c     Adreno SMMU (MMU-500): context banks + LPAE tables
++ *   sweet_gpu_scm.c      TrustZone SCM calls + zap shader (PAS) loader
++ *   sweet_gpu_clk.c      GCC/GPU_CC clocks, PLL, CX GDSC
++ *   sweet_gpu_cmddb.c    RPMh command DB reader (ARC levels for GMU votes)
++ *   sweet_gpu_mem.c      GPU VA allocator, kernel buffers
++ *   sweet_gpu_os_xnu.c   the only file that knows XNU (hosttest/ swaps it)
++ *
++ * Everything except SweetAdreno.cpp and sweet_gpu_os_xnu.c is plain C
++ * against the sgpu_os_* API below, so the whole bring-up sequence also
++ * builds and runs on Linux against a register model (hosttest/).
++ */
++#ifndef SWEET_GPU_H
++#define SWEET_GPU_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include <stdbool.h>
++#include "sweet_gpu_uapi.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* ------------------------------------------------------------------ */
++/* OS layer                                                           */
++/* ------------------------------------------------------------------ */
++
++void     sgpu_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
++void     sgpu_udelay(uint32_t us);
++void     sgpu_msleep(uint32_t ms);              /* may block (thread context) */
++uint64_t sgpu_now_us(void);
++volatile uint8_t *sgpu_ioremap(uint64_t pa, size_t size);   /* Device-nGnRE */
++
++/*
++ * Physically contiguous, zeroed memory for the GPU, GMU, SMMU walker or
++ * TrustZone. Default CPU mapping is write-back cached (callers clean/
++ * invalidate around device access). SGPU_DMA_WC gives a Normal
++ * non-cacheable (write-combine) CPU mapping instead: the same thing Linux
++ * uses for every msm kernel BO (MSM_BO_WC). The cacheable alias of the
++ * pages is cleaned+invalidated before the WC mapping is handed out and is
++ * never touched again, so no dirty line can ever overwrite device data.
++ * WC memory still needs sgpu_wmb() before telling the device about it.
++ */
++#define SGPU_DMA_WC             (1u << 0)
++struct sgpu_dma {
++	void     *va;
++	uint64_t  pa;
++	size_t    size;
++	void     *os_md;                /* XNU: IOBufferMemoryDescriptor */
++	void     *os_map;               /* XNU: IOMemoryMap of the WC view */
++};
++int      sgpu_dma_alloc(size_t size, size_t align, uint32_t flags, struct sgpu_dma *out);
++void     sgpu_dma_free(struct sgpu_dma *dma);
++void     sgpu_cache_clean(const void *va, size_t len);  /* CPU -> device */
++void     sgpu_cache_inval(const void *va, size_t len);  /* device -> CPU */
++
++struct sgpu_smc {
++	uint64_t x[8];                  /* in: x0..x7, out: x0..x3 */
++};
++void     sgpu_smc_call(struct sgpu_smc *args);
++
++bool     sgpu_bootarg_u32(const char *name, uint32_t *out);
++/* Property of the ADT node /sweet-gpu (firmware blobs, regions). */
++bool     sgpu_dt_prop(const char *prop, const void **data, uint32_t *len);
++
++/* ------------------------------------------------------------------ */
++/* MMIO                                                               */
++/* ------------------------------------------------------------------ */
++
++#if defined(SGPU_HOST)
++/* hosttest/: every register access goes to the hardware model. */
++uint32_t sgpu_host_rd(volatile uint8_t *base, uint32_t off);
++void     sgpu_host_wr(volatile uint8_t *base, uint32_t off, uint32_t v);
++uint64_t sgpu_host_rd64(volatile uint8_t *base, uint32_t off);
++void     sgpu_host_wr64(volatile uint8_t *base, uint32_t off, uint64_t v);
++static inline uint32_t sgpu_rd(volatile uint8_t *b, uint32_t o) { return sgpu_host_rd(b, o); }
++static inline void sgpu_wr(volatile uint8_t *b, uint32_t o, uint32_t v) { sgpu_host_wr(b, o, v); }
++static inline uint64_t sgpu_rd64(volatile uint8_t *b, uint32_t o) { return sgpu_host_rd64(b, o); }
++static inline void sgpu_wr64(volatile uint8_t *b, uint32_t o, uint64_t v) { sgpu_host_wr64(b, o, v); }
++#else
++/*
++ * Single 32/64-bit LDR/STR with a base register and no writeback: the
++ * Adreno SMMU global space on SM8250 is trapped and emulated by the
++ * Qualcomm hypervisor (QHEE), which can only decode such accesses
++ * (ESR.ISV = 1), and it mishandles stores from WZR/XZR (Linux works
++ * around this with QCOM_DUMMY_VAL). The "r" constraint forces the value
++ * into a real register even when it is the constant 0, so every MMIO
++ * store in this driver is safe for trapped regions.
++ */
++static inline uint32_t
++sgpu_rd(volatile uint8_t *base, uint32_t off)
++{
++	uint32_t v;
++	__asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(base + off) : "memory");
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++sgpu_wr(volatile uint8_t *base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	__asm__ volatile("str %w0, [%1]" :: "r"(v), "r"(base + off) : "memory");
++}
++
++static inline uint64_t
++sgpu_rd64(volatile uint8_t *base, uint32_t off)
++{
++	uint64_t v;
++	__asm__ volatile("ldr %0, [%1]" : "=r"(v) : "r"(base + off) : "memory");
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++sgpu_wr64(volatile uint8_t *base, uint32_t off, uint64_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	__asm__ volatile("str %0, [%1]" :: "r"(v), "r"(base + off) : "memory");
++}
++#endif
++
++static inline void
++sgpu_rmw(volatile uint8_t *base, uint32_t off, uint32_t clear, uint32_t set)
++{
++	sgpu_wr(base, off, (sgpu_rd(base, off) & ~clear) | set);
++}
++
++/* Make prior normal-memory writes (ring, PTEs, HFI) visible to devices. */
++static inline void
++sgpu_wmb(void)
++{
++#if defined(__aarch64__)
++	__asm__ volatile("dsb sy" ::: "memory");
++#else
++	__sync_synchronize();
++#endif
++}
++
++/* Read shared memory the device writes (fences, rptr shadow, HFI). */
++static inline uint32_t
++sgpu_mem_rd32(const volatile void *p)
++{
++	uint32_t v = *(const volatile uint32_t *)p;
++#if defined(__aarch64__)
++	__asm__ volatile("dmb ld" ::: "memory");
++#endif
++	return v;
++}
++
++static inline void
++sgpu_mem_wr32(volatile void *p, uint32_t v)
++{
++	*(volatile uint32_t *)p = v;
++}
++
++/* Poll until (reg & mask) == want; returns 0 or -ETIMEDOUT-like -1. */
++int sgpu_poll(volatile uint8_t *base, uint32_t off, uint32_t mask, uint32_t want,
++    uint32_t timeout_us);
++
++/* ------------------------------------------------------------------ */
++/* Bring-up stages (boot-arg sweetgpu=N; 0 = driver does nothing)     */
++/* ------------------------------------------------------------------ */
++
++enum sgpu_stage {
++	SGPU_STAGE_OFF          = 0,
++	SGPU_STAGE_PROBE        = 1,    /* map MMIO, read always-on IDs */
++	SGPU_STAGE_CLOCKS       = 2,    /* GCC/GPU_CC clocks, CX GDSC; GMU regs readable */
++	SGPU_STAGE_SMMU         = 3,    /* Adreno SMMU context banks for GPU + GMU */
++	SGPU_STAGE_GMU          = 4,    /* GMU firmware running, HFI started */
++	SGPU_STAGE_GX           = 5,    /* GX powered via GMU OOB, GPU regs readable */
++	SGPU_STAGE_CP           = 6,    /* zap, hw_init, SQE, ringbuffer, CP_ME_INIT */
++	SGPU_STAGE_SELFTEST     = 7,    /* kernel submits a memwrite + timestamp */
++	SGPU_STAGE_USER         = 8,    /* user client published */
++	SGPU_STAGE_MAX          = SGPU_STAGE_USER,
++};
++
++/* ------------------------------------------------------------------ */
++/* Device state                                                       */
++/* ------------------------------------------------------------------ */
++
++struct sgpu_bo {                        /* kernel-owned GPU buffer */
++	struct sgpu_dma dma;
++	uint64_t        iova;
++};
++
++struct sgpu_ctx_slot {                  /* per-context memstore slot */
++	bool     used;
++	uint32_t queued;                /* last timestamp handed out */
++};
++
++#define SGPU_MAX_CTX            64
++
++struct sgpu {
++	/* MMIO */
++	volatile uint8_t *gpu;          /* 0x03d00000 GPU core (GX) */
++	volatile uint8_t *gmu;          /* 0x03d6a000 GMU (CX) */
++	volatile uint8_t *rscc;         /* 0x03de0000 GMU RSC */
++	volatile uint8_t *pdc;          /* 0x0b290000 GMU PDC config */
++	volatile uint8_t *pdc_seq;      /* 0x0b490000 GMU PDC sequencer */
++	volatile uint8_t *gpucc;        /* 0x03d90000 GPU clock controller */
++	volatile uint8_t *gcc;          /* 0x00100000 global clock controller */
++	volatile uint8_t *smmu;         /* 0x03da0000 Adreno SMMU */
++	volatile uint8_t *cx_dbgc;      /* 0x03d61000 CX debug controller */
++
++	uint32_t stage_requested;
++	uint32_t stage_reached;
++	int      last_error;
++	char     message[128];
++
++	/* firmware (point into the ADT) */
++	const uint8_t *sqe_fw;   uint32_t sqe_fw_len;
++	const uint8_t *gmu_fw;   uint32_t gmu_fw_len;
++	const uint8_t *zap_fw;   uint32_t zap_fw_len;
++	uint64_t zap_pa;         uint32_t zap_size;     /* pil_gpu_region */
++
++	uint32_t chip_id;               /* 0x06050002 */
++	bool     io_coherent;           /* boot-arg sweetgpu_coherent=1: SMMU snoops CPU caches */
++	uint32_t speed_bin;
++	uint32_t gpu_freq_index;        /* index into the GPU OPP table */
++
++	/* SMMU */
++	struct sgpu_smmu *smmu_state;
++
++	/* GMU */
++	struct sgpu_gmu  *gmu_state;
++
++	/* CP */
++	struct sgpu_bo   sqe;           /* SQE microcode */
++	struct sgpu_bo   rb;            /* ringbuffer */
++	struct sgpu_bo   memptrs;       /* rptr shadow, fence, per-ctx memstore */
++	struct sgpu_bo   scratch;       /* self-test target */
++	uint32_t         rb_wptr;       /* in dwords */
++	uint32_t         rb_dwords;
++	uint32_t         fence_seqno;   /* global ring fence */
++	struct sgpu_ctx_slot ctx[SGPU_MAX_CTX];
++	uint32_t         faults, hangs;
++
++	/* TrustZone / zap: PAS image authenticated (once per boot on a6xx) */
++	bool             zap_loaded;
++	/* hang check bookkeeping (sgpu_cp_hang_check) */
++	uint32_t         hc_fence, hc_ib1, hc_rem, hc_strikes;
++	uint64_t         hc_us;
++};
++
++/* Set message + error, log it, return err (negative errno style). */
++int sgpu_fail(struct sgpu *g, int err, const char *fmt, ...)
++__attribute__((format(printf, 3, 4)));
++
++/* ---- sweet_gpu_mem.c: GPU virtual addresses ---- */
++/*
++ * Kernel buffers start at 16 MiB like Linux (max(SZ_16M, aperture)):
++ * nothing may live in the GMEM aperture [gmem_base, +1.125 MiB) = [0, ..)
++ * that turnip assumes on A650, and VA 0 stays unmapped so NULL faults.
++ */
++#define SGPU_VA_KERNEL_BASE     0x0000000001000000ull   /* kernel buffers */
++#define SGPU_VA_KERNEL_SIZE     0x000000000f000000ull   /* 240 MiB */
++#define SGPU_VA_USER_BASE       0x0000000100000000ull
++#define SGPU_VA_USER_SIZE       0x0000003f00000000ull   /* 252 GiB (39-bit VA) */
++int  sgpu_va_init(struct sgpu *g);
++int  sgpu_va_alloc(struct sgpu *g, bool kernel, uint64_t size, uint64_t align, uint64_t *iova);
++void sgpu_va_free(struct sgpu *g, uint64_t iova, uint64_t size);
++/* contiguous kernel buffer mapped at a kernel GPU VA */
++int  sgpu_bo_alloc(struct sgpu *g, size_t size, uint32_t prot, struct sgpu_bo *bo);
++void sgpu_bo_free(struct sgpu *g, struct sgpu_bo *bo);
++
++/* ---- sweet_gpu_clk.c ---- */
++int  sgpu_clk_probe(struct sgpu *g);    /* read-only state dump */
++int  sgpu_clk_enable(struct sgpu *g);   /* clocks + CX GDSC */
++void sgpu_clk_disable(struct sgpu *g);
++
++/* ---- sweet_gpu_smmu.c ---- */
++#define SGPU_PROT_READ          (1u << 0)
++#define SGPU_PROT_WRITE         (1u << 1)
++#define SGPU_PROT_EXEC          (1u << 2)
++#define SGPU_PROT_CACHED        (1u << 3)   /* MAIR idx 1 (WB, inner-shareable): IO-coherent
++	                                     * when the interconnect snoops; otherwise the
++	                                     * CPU must clean/invalidate (always correct) */
++#define SGPU_PROT_PRIV          (1u << 4)   /* privileged-only (kernel ring etc.) */
++enum sgpu_smmu_domain { SGPU_DOM_GPU = 0, SGPU_DOM_GMU = 1, SGPU_DOM_COUNT };
++int  sgpu_smmu_init(struct sgpu *g);
++int  sgpu_smmu_restore(struct sgpu *g);  /* reprogram after a CX power collapse */
++int  sgpu_smmu_map(struct sgpu *g, enum sgpu_smmu_domain d, uint64_t iova,
++    uint64_t pa, uint64_t size, uint32_t prot);
++int  sgpu_smmu_unmap(struct sgpu *g, enum sgpu_smmu_domain d, uint64_t iova, uint64_t size);
++void sgpu_smmu_tlb_sync(struct sgpu *g, enum sgpu_smmu_domain d);
++uint32_t sgpu_smmu_check_faults(struct sgpu *g);   /* logs + clears, returns count */
++uint64_t sgpu_smmu_ttbr0(struct sgpu *g, enum sgpu_smmu_domain d);
++
++/* ---- sweet_gpu_scm.c ---- */
++int  sgpu_scm_probe(struct sgpu *g);
++int  sgpu_zap_load(struct sgpu *g);     /* first load: PAS init/auth */
++int  sgpu_zap_resume(struct sgpu *g);   /* later power-ups */
++
++/* ---- sweet_gpu_cmddb.c ---- */
++#define SGPU_ARC_MAX_LEVELS     16
++struct sgpu_arc {
++	uint32_t addr;                  /* RPMh address of the resource */
++	uint32_t count;
++	uint16_t level[SGPU_ARC_MAX_LEVELS];    /* vlvl per hlvl index */
++};
++int  sgpu_cmddb_arc(const char *res, struct sgpu_arc *out);
++int  sgpu_cmddb_addr(const char *res, uint32_t *addr);
++
++/* ---- sweet_gpu_gmu.c ---- */
++int  sgpu_gmu_init(struct sgpu *g);     /* memory, firmware, RSC/PDC, start, HFI */
++int  sgpu_gmu_gx_on(struct sgpu *g);    /* OOB GPU_SET */
++void sgpu_gmu_gx_off(struct sgpu *g);
++int  sgpu_gmu_set_freq(struct sgpu *g, uint32_t index);
++uint32_t sgpu_gmu_state(struct sgpu *g);
++uint32_t sgpu_gmu_max_freq_hz(struct sgpu *g);
++enum sgpu_oob { SGPU_OOB_GPU_SET, SGPU_OOB_PERFCOUNTER };
++int  sgpu_gmu_oob_set(struct sgpu *g, enum sgpu_oob oob);
++void sgpu_gmu_oob_clear(struct sgpu *g, enum sgpu_oob oob);
++uint32_t sgpu_gmu_irq(struct sgpu *g);  /* poll/IRQ: logs + clears GMU faults */
++void sgpu_gmu_shutdown(struct sgpu *g);
++
++/* ---- A650 constants shared by cp/core/info ---- */
++#define SGPU_A650_GMEM_SIZE     0x120000u   /* 1 MiB + 128 KiB */
++/*
++ * UCHE trap base: GPU accesses outside the UCHE range land here. Linux
++ * uses 0x1_ffff_ffff_f000 (top of its TTBR1 window); we run a single
++ * 39-bit TTBR0 space (SMMU option A), so use the top page of that space,
++ * which the VA allocator never hands out.
++ */
++#define SGPU_UCHE_TRAP_BASE     0x0000007ffffff000ull
++
++/* ---- sweet_gpu_cp.c ---- */
++int  sgpu_cp_init(struct sgpu *g);      /* hw_init, sqe, rb, me_init, secure exit */
++int  sgpu_cp_selftest(struct sgpu *g);
++int  sgpu_cp_ctx_alloc(struct sgpu *g, uint32_t *ctx_id);
++void sgpu_cp_ctx_free(struct sgpu *g, uint32_t ctx_id);
++int  sgpu_cp_submit(struct sgpu *g, uint32_t ctx_id, const struct sgpu_ib *ibs,
++    uint32_t n, uint32_t flags, uint32_t *ts_out);
++uint32_t sgpu_cp_retired(struct sgpu *g, uint32_t ctx_id);
++uint32_t sgpu_cp_queued(struct sgpu *g, uint32_t ctx_id);
++uint64_t sgpu_cp_always_on(struct sgpu *g);
++void sgpu_cp_status(struct sgpu *g, struct sgpu_status *st);
++bool sgpu_cp_hang_check(struct sgpu *g);   /* periodic watchdog */
++uint32_t sgpu_cp_ring_fence_submitted(struct sgpu *g);
++uint32_t sgpu_cp_ring_fence_retired(struct sgpu *g);
++uint32_t sgpu_cp_irq(struct sgpu *g);      /* RBBM_INT_0 handler, returns status */
++
++/* ---- top level (sweet_gpu_core.c) ---- */
++int  sgpu_bringup(struct sgpu *g, uint32_t stage);
++void sgpu_fill_info(struct sgpu *g, struct sgpu_info *info);
++
++#ifdef __cplusplus
++}
++#endif
++#endif /* SWEET_GPU_H */
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_mem.c
+@@ -0,0 +1,175 @@
++/*
++ * sweet_gpu_mem.c - GPU virtual address allocation and kernel buffers.
++ *
++ * One GPU address space (the SMMU context bank of the GPU) shared by the
++ * kernel and every client in this first version: kernel buffers (ring,
++ * memptrs, SQE microcode, self-test scratch) live in [16 MiB, 256 MiB),
++ * user buffers above 4 GiB. Per-process page tables (CP_SMMU_TABLE_UPDATE)
++ * can come later without changing the UAPI: user addresses stay in the
++ * same window.
++ *
++ * The allocator is a sorted array of free ranges with first-fit; GPU
++ * allocations are few and large, so O(n) is fine. All sizes are multiples
++ * of the 16 KiB CPU page (also a multiple of the 4 KiB SMMU granule).
++ * Callers serialise (SweetAdreno.cpp holds its lock around every call).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SGPU_HOST)
++#include "sweet_gpu.h"
++
++#define VA_MAX_RANGES   1024
++#define VA_PAGE         0x4000ull
++
++struct va_range {
++	uint64_t base, size;
++};
++
++struct va_space {
++	struct va_range r[VA_MAX_RANGES];
++	uint32_t n;
++};
++
++static struct va_space va_kernel, va_user;
++
++static void
++va_reset(struct va_space *s, uint64_t base, uint64_t size)
++{
++	s->n = 1;
++	s->r[0].base = base;
++	s->r[0].size = size;
++}
++
++int
++sgpu_va_init(struct sgpu *g)
++{
++	(void)g;
++	va_reset(&va_kernel, SGPU_VA_KERNEL_BASE, SGPU_VA_KERNEL_SIZE);
++	va_reset(&va_user, SGPU_VA_USER_BASE, SGPU_VA_USER_SIZE);
++	return 0;
++}
++
++int
++sgpu_va_alloc(struct sgpu *g, bool kernel, uint64_t size, uint64_t align, uint64_t *iova)
++{
++	struct va_space *s = kernel ? &va_kernel : &va_user;
++
++	(void)g;
++	if (size == 0) {
++		return -22;
++	}
++	size = (size + VA_PAGE - 1) & ~(VA_PAGE - 1);
++	if (align < VA_PAGE) {
++		align = VA_PAGE;
++	}
++	if (align & (align - 1)) {
++		return -22;
++	}
++	for (uint32_t i = 0; i < s->n; i++) {
++		uint64_t lo = (s->r[i].base + align - 1) & ~(align - 1);
++		uint64_t end = s->r[i].base + s->r[i].size;
++		if (lo < s->r[i].base || lo + size > end || lo + size < lo) {
++			continue;
++		}
++		/* carve [lo, lo+size) out of range i */
++		uint64_t head = lo - s->r[i].base, tail = end - (lo + size);
++		if (head && tail) {
++			if (s->n == VA_MAX_RANGES) {
++				return -12;
++			}
++			for (uint32_t j = s->n; j > i + 1; j--) {
++				s->r[j] = s->r[j - 1];
++			}
++			s->n++;
++			s->r[i].size = head;
++			s->r[i + 1].base = lo + size;
++			s->r[i + 1].size = tail;
++		} else if (head) {
++			s->r[i].size = head;
++		} else if (tail) {
++			s->r[i].base = lo + size;
++			s->r[i].size = tail;
++		} else {
++			for (uint32_t j = i; j + 1 < s->n; j++) {
++				s->r[j] = s->r[j + 1];
++			}
++			s->n--;
++		}
++		*iova = lo;
++		return 0;
++	}
++	return -12;
++}
++
++void
++sgpu_va_free(struct sgpu *g, uint64_t iova, uint64_t size)
++{
++	struct va_space *s = iova < SGPU_VA_USER_BASE ? &va_kernel : &va_user;
++	uint32_t i;
++
++	(void)g;
++	size = (size + VA_PAGE - 1) & ~(VA_PAGE - 1);
++	for (i = 0; i < s->n && s->r[i].base < iova; i++) {
++	}
++	/* merge with predecessor and/or successor, else insert at i */
++	bool prev = i > 0 && s->r[i - 1].base + s->r[i - 1].size == iova;
++	bool next = i < s->n && iova + size == s->r[i].base;
++	if (prev && next) {
++		s->r[i - 1].size += size + s->r[i].size;
++		for (uint32_t j = i; j + 1 < s->n; j++) {
++			s->r[j] = s->r[j + 1];
++		}
++		s->n--;
++	} else if (prev) {
++		s->r[i - 1].size += size;
++	} else if (next) {
++		s->r[i].base = iova;
++		s->r[i].size += size;
++	} else {
++		if (s->n == VA_MAX_RANGES) {
++			sgpu_log("va: free list full, leaking %#llx+%#llx",
++			    (unsigned long long)iova, (unsigned long long)size);
++			return;
++		}
++		for (uint32_t j = s->n; j > i; j--) {
++			s->r[j] = s->r[j - 1];
++		}
++		s->r[i].base = iova;
++		s->r[i].size = size;
++		s->n++;
++	}
++}
++
++int
++sgpu_bo_alloc(struct sgpu *g, size_t size, uint32_t prot, struct sgpu_bo *bo)
++{
++	int err;
++
++	err = sgpu_dma_alloc(size, VA_PAGE, SGPU_DMA_WC, &bo->dma);
++	if (err) {
++		return err > 0 ? -err : err;
++	}
++	err = sgpu_va_alloc(g, true, bo->dma.size, VA_PAGE, &bo->iova);
++	if (err) {
++		sgpu_dma_free(&bo->dma);
++		return err;
++	}
++	err = sgpu_smmu_map(g, SGPU_DOM_GPU, bo->iova, bo->dma.pa, bo->dma.size, prot);
++	if (err) {
++		sgpu_va_free(g, bo->iova, bo->dma.size);
++		sgpu_dma_free(&bo->dma);
++		return err;
++	}
++	return 0;
++}
++
++void
++sgpu_bo_free(struct sgpu *g, struct sgpu_bo *bo)
++{
++	if (bo->dma.va == NULL) {
++		return;
++	}
++	sgpu_smmu_unmap(g, SGPU_DOM_GPU, bo->iova, bo->dma.size);
++	sgpu_va_free(g, bo->iova, bo->dma.size);
++	sgpu_dma_free(&bo->dma);
++	bo->iova = 0;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_os_xnu.c
+@@ -0,0 +1,135 @@
++/*
++ * sweet_gpu_os_xnu.c - XNU implementation of the sgpu_os_* layer.
++ * The only C file of the GPU driver that includes XNU headers; the
++ * Linux host test (hosttest/os_host.c) provides the same functions.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include <stdarg.h>
++
++#include "sweet_gpu.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++void
++sgpu_log(const char *fmt, ...)
++{
++	char buf[256];
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++	printf("SWEET GPU: %s\n", buf);
++}
++
++void
++sgpu_udelay(uint32_t us)
++{
++	delay(us);
++}
++
++static int sgpu_sleep_chan;
++
++void
++sgpu_msleep(uint32_t ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&sgpu_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++uint64_t
++sgpu_now_us(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++volatile uint8_t *
++sgpu_ioremap(uint64_t pa, size_t size)
++{
++	return (volatile uint8_t *)ml_io_map((vm_offset_t)pa, (vm_size_t)size);
++}
++
++/* sgpu_dma_alloc/sgpu_dma_free live in sweet_gpu_os_dma.cpp (IOKit). */
++
++void
++sgpu_cache_clean(const void *va, size_t len)
++{
++	if (len) {
++		flush_dcache64((addr64_t)(uintptr_t)va, (unsigned)len, FALSE);
++	}
++}
++
++/*
++ * xnu-8796 has no exported invalidate-only primitive; clean+invalidate
++ * (DC CIVAC) is equivalent for lines the CPU has not dirtied, which is
++ * the only way this driver uses it.
++ */
++void
++sgpu_cache_inval(const void *va, size_t len)
++{
++	if (len) {
++		flush_dcache64((addr64_t)(uintptr_t)va, (unsigned)len, FALSE);
++	}
++}
++
++void
++sgpu_smc_call(struct sgpu_smc *a)
++{
++	register uint64_t x0 __asm__("x0") = a->x[0];
++	register uint64_t x1 __asm__("x1") = a->x[1];
++	register uint64_t x2 __asm__("x2") = a->x[2];
++	register uint64_t x3 __asm__("x3") = a->x[3];
++	register uint64_t x4 __asm__("x4") = a->x[4];
++	register uint64_t x5 __asm__("x5") = a->x[5];
++	register uint64_t x6 __asm__("x6") = a->x[6];
++	register uint64_t x7 __asm__("x7") = a->x[7];
++
++	__asm__ volatile("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3),
++	    "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++	    :
++	    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
++	    "x16", "x17", "memory");
++	a->x[0] = x0;
++	a->x[1] = x1;
++	a->x[2] = x2;
++	a->x[3] = x3;
++}
++
++bool
++sgpu_bootarg_u32(const char *name, uint32_t *out)
++{
++	return PE_parse_boot_argn(name, out, sizeof(*out)) ? true : false;
++}
++
++bool
++sgpu_dt_prop(const char *prop, const void **data, uint32_t *len)
++{
++	DTEntry node;
++	unsigned int size = 0;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-gpu", &node) != kSuccess ||
++	    SecureDTGetProperty(node, prop, data, &size) != kSuccess) {
++		return false;
++	}
++	*len = size;
++	return true;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_scm.c
+@@ -0,0 +1,371 @@
++/*
++ * sweet_gpu_scm.c - Qualcomm TrustZone (SCM) calls and the GPU zap shader.
++ *
++ * The Adreno boots in "secure" mode: CP may not run unprotected command
++ * streams until a TrustZone-signed microcode blob (the zap shader, PAS id
++ * 13) has been authenticated. After that the kernel emits
++ * CP_SET_SECURE_MODE 0 on the ring (sweet_gpu_cp.c). Linux:
++ * adreno_gpu.c zap_shader_load_mdt() + mdt_loader.c + qcom_scm.c.
++ * Derivation: docs/specs/clocks-scm-zap-a650.md, parts B and C.
++ *
++ * SMCCC, owner SIP, 64-bit convention:
++ *   x0 = 0x42000000 | svc << 8 | cmd   (yielding/"STD" call; FAST = 0xC2..)
++ *   x1 = arginfo = nargs | type_i << (4 + 2 i)   (0 VAL, 1 RO, 2 RW)
++ *   x2.. = args; return x0 = status, x1.. = results
++ *   x0 == 1 (INTERRUPTED): reissue with x0 = 1 and x6 from the reply
++ *   x0 == 2 (WAITQ_SLEEP): needs an SCM interrupt SM8250 does not have
++ *   x0 == -12 (busy): sleep 30 ms, retry up to 22 times
++ *
++ * The zap image is the phone's own Xiaomi-signed a650_zap (mdt+bNN joined
++ * into one ELF32 by tools/mkzap.py) embedded in the ADT; it is copied
++ * unchanged into the 8 KiB carve-out pil_gpu_region @ 0x8681a000.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SGPU_HOST)
++#include "sweet_gpu.h"
++
++#define SCM_STD(svc, cmd)       (0x42000000u | ((svc) << 8) | (cmd))
++#define SCM_FAST(svc, cmd)      (0xc2000000u | ((svc) << 8) | (cmd))
++#define SCM_SVC_BOOT            0x01u
++#define SCM_SVC_PIL             0x02u
++#define SCM_SVC_INFO            0x06u
++#define SCM_BOOT_SET_REMOTE     0x0au
++#define SCM_PIL_INIT_IMAGE      0x01u
++#define SCM_PIL_MEM_SETUP       0x02u
++#define SCM_PIL_AUTH_RESET      0x05u
++#define SCM_PIL_IS_SUPPORTED    0x07u
++#define SCM_INFO_IS_CALL_AVAIL  0x01u
++#define SCM_ARG_VAL             0u
++#define SCM_ARG_RW              2u
++#define SCM_ARGS(n)             ((uint64_t)(n))
++#define GPU_PAS_ID              13u
++#define SCM_INTERRUPTED         1
++#define SCM_WAITQ_SLEEP         2
++#define SCM_EBUSY               (-12)
++
++/* ELF32 */
++#define PT_LOAD                 1u
++#define MDT_TYPE_MASK           (7u << 24)
++#define MDT_TYPE_HASH           (2u << 24)
++#define MDT_RELOCATABLE         (1u << 27)
++
++static bool scm_arm64;
++
++static int
++scm_errno(int64_t x0)
++{
++	switch (x0) {
++	case 0:   return 0;
++	case -1:  return -5;    /* EIO */
++	case -2:
++	case -3:  return -22;   /* EINVAL */
++	case -4:  return -95;   /* EOPNOTSUPP */
++	case -5:  return -12;   /* ENOMEM */
++	case -12: return -16;   /* EBUSY */
++	default:  return -22;
++	}
++}
++
++/* One SCM call with the retry rules above. res may be NULL. */
++static int
++scm_call(uint32_t fn, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2,
++    uint64_t res[3])
++{
++	struct sgpu_smc s;
++	int busy = 0;
++
++	for (;;) {
++		for (int i = 0; i < 8; i++) {
++			s.x[i] = 0;
++		}
++		s.x[0] = fn;
++		s.x[1] = arginfo;
++		s.x[2] = a0;
++		s.x[3] = a1;
++		s.x[4] = a2;
++		sgpu_smc_call(&s);
++		while ((int64_t)s.x[0] == SCM_INTERRUPTED) {
++			uint64_t x6 = s.x[6];
++			s.x[0] = SCM_INTERRUPTED;
++			s.x[1] = arginfo;
++			s.x[2] = a0;
++			s.x[3] = a1;
++			s.x[4] = a2;
++			s.x[5] = 0;
++			s.x[6] = x6;
++			s.x[7] = 0;
++			sgpu_smc_call(&s);
++		}
++		if ((int64_t)s.x[0] == SCM_WAITQ_SLEEP) {
++			sgpu_log("scm: fn %#x asked to wait on an SCM IRQ (unsupported)", fn);
++			return -5;
++		}
++		if ((int64_t)s.x[0] == SCM_EBUSY && ++busy < 22) {
++			sgpu_msleep(30);
++			continue;
++		}
++		break;
++	}
++	if (res) {
++		res[0] = s.x[1];
++		res[1] = s.x[2];
++		res[2] = s.x[3];
++	}
++	return scm_errno((int64_t)s.x[0]);
++}
++
++static bool
++scm_call_available(uint32_t svc, uint32_t cmd)
++{
++	uint64_t res[3];
++	int err = scm_call(SCM_STD(SCM_SVC_INFO, SCM_INFO_IS_CALL_AVAIL), SCM_ARGS(1),
++	    0x02000000u | (svc << 8) | cmd, 0, 0, res);
++	return err == 0 && res[0] != 0;
++}
++
++int
++sgpu_scm_probe(struct sgpu *g)
++{
++	struct sgpu_smc s = { .x = {
++		SCM_FAST(SCM_SVC_INFO, SCM_INFO_IS_CALL_AVAIL), SCM_ARGS(1),
++		0x02000000u | (SCM_SVC_INFO << 8) | SCM_INFO_IS_CALL_AVAIL } };
++
++	sgpu_smc_call(&s);
++	scm_arm64 = s.x[0] == 0 && s.x[1] == 1;
++	if (!scm_arm64) {
++		return sgpu_fail(g, -95, "SCM: 64-bit SMCCC convention not detected (x0 %#llx x1 %#llx)",
++		           (unsigned long long)s.x[0], (unsigned long long)s.x[1]);
++	}
++	uint64_t res[3] = { 0 };
++	bool init = scm_call_available(SCM_SVC_PIL, SCM_PIL_INIT_IMAGE);
++	bool auth = scm_call_available(SCM_SVC_PIL, SCM_PIL_AUTH_RESET);
++	bool sup = scm_call_available(SCM_SVC_PIL, SCM_PIL_IS_SUPPORTED) &&
++	    scm_call(SCM_STD(SCM_SVC_PIL, SCM_PIL_IS_SUPPORTED), SCM_ARGS(1), GPU_PAS_ID,
++	    0, 0, res) == 0 && res[0] != 0;
++	sgpu_log("scm: arm64 convention, PIL init %d auth %d, GPU PAS %d", init, auth, sup);
++	return 0;
++}
++
++/* ---- ELF32 helpers (little endian, bounds-checked) ---- */
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static uint16_t
++le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | p[1] << 8);
++}
++
++struct phdr {
++	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
++};
++
++static int
++elf_phdr(const uint8_t *fw, uint32_t len, uint32_t i, struct phdr *p)
++{
++	uint32_t phoff = le32(fw + 0x1c);
++	uint16_t phentsize = le16(fw + 0x2a);
++	uint64_t at = (uint64_t)phoff + (uint64_t)i * phentsize;
++
++	if (phentsize != 32 || at + 32 > len) {
++		return -22;
++	}
++	const uint8_t *q = fw + at;
++	p->type = le32(q);
++	p->offset = le32(q + 4);
++	p->vaddr = le32(q + 8);
++	p->paddr = le32(q + 12);
++	p->filesz = le32(q + 16);
++	p->memsz = le32(q + 20);
++	p->flags = le32(q + 24);
++	p->align = le32(q + 28);
++	return 0;
++}
++
++static bool
++phdr_loadable(const struct phdr *p)
++{
++	return p->type == PT_LOAD && (p->flags & MDT_TYPE_MASK) != MDT_TYPE_HASH && p->memsz;
++}
++
++/* Copy to Device memory: aligned 32-bit stores only. */
++static void
++copy_to_io(volatile uint8_t *dst, uint32_t off, const uint8_t *src, uint32_t n, uint32_t memsz)
++{
++	uint32_t words = (memsz + 3) / 4;
++	for (uint32_t w = 0; w < words; w++) {
++		uint32_t v = 0;
++		for (uint32_t b = 0; b < 4; b++) {
++			uint32_t idx = w * 4 + b;
++			if (idx < n) {
++				v |= (uint32_t)src[idx] << (8 * b);
++			}
++		}
++		sgpu_wr(dst, off + w * 4, v);
++	}
++	sgpu_wmb();
++}
++
++int
++sgpu_zap_load(struct sgpu *g)
++{
++	const uint8_t *fw = g->zap_fw;
++	uint32_t len = g->zap_fw_len;
++	struct phdr p0, p;
++	int err;
++
++	if (g->zap_loaded) {
++		return 0;       /* a6xx: loaded once per boot, no resume call */
++	}
++	if (!fw || len < 0x34 || le32(fw) != 0x464c457fu || fw[4] != 1) {
++		return sgpu_fail(g, -22, "zap: not an ELF32 image (%u bytes)", len);
++	}
++	if (!g->zap_pa || !g->zap_size) {
++		return sgpu_fail(g, -22, "zap: no zap-region in /sweet-gpu");
++	}
++	uint16_t phnum = le16(fw + 0x2c);
++	if (phnum < 2 || elf_phdr(fw, len, 0, &p0) || p0.type == PT_LOAD) {
++		return sgpu_fail(g, -22, "zap: bad program headers");
++	}
++
++	/* layout: min/max of loadable segments, relocatable flag, hash segment */
++	uint64_t min_addr = ~0ull, max_addr = 0;
++	bool relocate = false;
++	int hash = -1;
++	for (uint32_t i = 0; i < phnum; i++) {
++		if (elf_phdr(fw, len, i, &p)) {
++			return sgpu_fail(g, -22, "zap: phdr %u out of range", i);
++		}
++		if (hash < 0 && i >= 1 && (p.flags & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
++			hash = (int)i;
++		}
++		if (!phdr_loadable(&p)) {
++			continue;
++		}
++		relocate |= (p.flags & MDT_RELOCATABLE) != 0;
++		if (p.paddr < min_addr) {
++			min_addr = p.paddr;
++		}
++		if ((uint64_t)p.paddr + p.memsz > max_addr) {
++			max_addr = (uint64_t)p.paddr + p.memsz;
++		}
++	}
++	max_addr = (max_addr + 0xfff) & ~0xfffull;
++	if (hash < 0 || min_addr == ~0ull) {
++		return sgpu_fail(g, -22, "zap: no hash or loadable segment");
++	}
++	uint64_t mem_size = max_addr - min_addr;
++	if (mem_size > g->zap_size) {
++		return sgpu_fail(g, -7, "zap: needs %#llx bytes, region is %#x",
++		           (unsigned long long)mem_size, g->zap_size);
++	}
++
++	/* metadata = ELF header + phdrs (phdr[0].filesz) followed by the hash segment */
++	struct phdr ph;
++	elf_phdr(fw, len, (uint32_t)hash, &ph);
++	if (p0.filesz > len || ph.offset > len || ph.filesz > len - ph.offset) {
++		return sgpu_fail(g, -22, "zap: metadata out of range");
++	}
++	/*
++	 * Linux allocates this from the SCM device's DMA pool, i.e. below
++	 * 4 GiB. On apollo XNU owns only the upper DDR bank, so prefer a
++	 * low bounce buffer from the ADT (scm-bounce = <pa size>, a free page
++	 * in 0xa0000000.. that ABL used for the shim) and fall back to kernel
++	 * memory above 4 GiB, which TrustZone may or may not accept.
++	 */
++	uint32_t meta_len = p0.filesz + ph.filesz;
++	uint64_t res[3] = { 0 };
++	struct sgpu_dma meta;
++	err = sgpu_dma_alloc(meta_len, 4096, 0, &meta);
++	if (err) {
++		return sgpu_fail(g, -12, "zap: no metadata buffer");
++	}
++	uint8_t *m = meta.va;
++	for (uint32_t i = 0; i < p0.filesz; i++) {
++		m[i] = fw[i];
++	}
++	for (uint32_t i = 0; i < ph.filesz; i++) {
++		m[p0.filesz + i] = fw[ph.offset + i];
++	}
++	uint64_t meta_pa = meta.pa;
++	const void *bp;
++	uint32_t blen;
++	if (sgpu_dt_prop("scm-bounce", &bp, &blen) && blen == 16 &&
++	    ((const uint64_t *)bp)[1] >= meta_len) {
++		meta_pa = ((const uint64_t *)bp)[0];
++		volatile uint8_t *bva = sgpu_ioremap(meta_pa, ((const uint64_t *)bp)[1]);
++		if (!bva) {
++			sgpu_dma_free(&meta);
++			return sgpu_fail(g, -12, "zap: cannot map scm-bounce");
++		}
++		copy_to_io(bva, 0, m, meta_len, meta_len);
++	} else {
++		/* TZ reads (and XPU-locks) it by physical address: push it to DRAM */
++		sgpu_cache_clean(meta.va, meta.size);
++		sgpu_cache_inval(meta.va, meta.size);
++	}
++	sgpu_log("zap: metadata %u bytes at %#llx%s", meta_len, (unsigned long long)meta_pa,
++	    meta_pa == meta.pa ? " (kernel memory, no scm-bounce)" : " (low bounce)");
++	err = scm_call(SCM_STD(SCM_SVC_PIL, SCM_PIL_INIT_IMAGE),
++	    SCM_ARGS(2) | (SCM_ARG_RW << 6), GPU_PAS_ID, meta_pa, 0, res);
++	sgpu_dma_free(&meta);
++	if (err || res[0]) {
++		return sgpu_fail(g, err ? err : -5, "zap: PAS init_image failed (err %d x1 %#llx)",
++		           err, (unsigned long long)res[0]);
++	}
++	if (relocate) {
++		err = scm_call(SCM_STD(SCM_SVC_PIL, SCM_PIL_MEM_SETUP), SCM_ARGS(3),
++		    GPU_PAS_ID, g->zap_pa, mem_size, res);
++		if (err || res[0]) {
++			return sgpu_fail(g, err ? err : -5, "zap: PAS mem_setup failed");
++		}
++	}
++
++	/* copy segments into the carve-out */
++	volatile uint8_t *region = sgpu_ioremap(g->zap_pa, g->zap_size);
++	if (!region) {
++		return sgpu_fail(g, -12, "zap: cannot map region");
++	}
++	uint64_t reloc = relocate ? min_addr : g->zap_pa;
++	for (uint32_t i = 0; i < phnum; i++) {
++		elf_phdr(fw, len, i, &p);
++		if (!phdr_loadable(&p)) {
++			continue;
++		}
++		if (p.paddr < reloc || p.paddr - reloc + p.memsz > mem_size ||
++		    p.filesz > p.memsz || p.offset > len || p.filesz > len - p.offset) {
++			return sgpu_fail(g, -22, "zap: segment %u (paddr %#x) does not fit", i, p.paddr);
++		}
++		copy_to_io(region, (uint32_t)(p.paddr - reloc), fw + p.offset, p.filesz, p.memsz);
++	}
++	sgpu_log("zap: %u segments, %#llx bytes at %#llx (%s)", phnum,
++	    (unsigned long long)mem_size, (unsigned long long)g->zap_pa,
++	    relocate ? "relocatable" : "fixed");
++
++	err = scm_call(SCM_STD(SCM_SVC_PIL, SCM_PIL_AUTH_RESET), SCM_ARGS(1),
++	    GPU_PAS_ID, 0, 0, res);
++	if (err || res[0]) {
++		return sgpu_fail(g, err ? err : -5, "zap: PAS auth_and_reset refused (err %d x1 %#llx)",
++		           err, (unsigned long long)res[0]);
++	}
++	g->zap_loaded = true;
++	sgpu_log("zap: authenticated by TrustZone");
++	return 0;
++}
++
++/* a5xx-style resume; kept as an experiment knob (sweetgpuzapresume=1). */
++int
++sgpu_zap_resume(struct sgpu *g)
++{
++	uint64_t res[3] = { 0 };
++	int err = scm_call(SCM_STD(SCM_SVC_BOOT, SCM_BOOT_SET_REMOTE), SCM_ARGS(2),
++	    0 /* SCM_GPU_ZAP_SHADER_RESUME */, GPU_PAS_ID, 0, res);
++	if (err) {
++		return sgpu_fail(g, err, "zap: set_remote_state resume failed");
++	}
++	return 0;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_smmu.c
+@@ -0,0 +1,823 @@
++/*
++ * sweet_gpu_smmu.c - Adreno SMMU (ARM MMU-500, "qcom,sm8250-smmu-500",
++ * 0x03da0000) for the GPU (SID 0, mask 0x401) and the GMU (SID 5, mask 0x400).
++ *
++ * Spec: specs/smmu-a650.md. Linux arm-smmu/io-pgtable-arm were used as
++ * documentation only; this is an independent implementation.
++ *
++ * What it does and why
++ * --------------------
++ *  - The GPU and the GMU fetch everything (ringbuffer, shaders, GMU code,
++ *    HFI queues) through this SMMU. Without a translating context bank for
++ *    their stream IDs, the first GPU/GMU memory access faults (or, if
++ *    firmware left the stream in bypass, goes to a raw physical address).
++ *  - GPU -> context bank 0. Mandatory: CP_SMMU_TABLE_UPDATE hard-codes
++ *    CONTEXTBANK 0 and TZ grants the CP access only to CB0 (the stock DT's
++ *    qcom,gpu-offset 0xa8000 is exactly CB0 = 0x3da8000).
++ *  - GMU -> the lowest free context bank >= 1 (CB1 on Linux).
++ *  - Stage 1 only (CBAR type "S1 translate, S2 bypass"), AArch64 LPAE,
++ *    4 KiB granule, 39-bit input (3 levels: 1G/2M/4K), one TTBR0 table per
++ *    domain (spec section 6 "option A": no split TTBR, no per-process
++ *    tables, no SCM aperture call needed yet).
++ *
++ * Hypervisor safety (SM8250 production devices run QHEE, which traps and
++ * emulates the SMMU global register space):
++ *  - no global reset: we never rewrite SMRs/S2CRs/CBs we did not pick,
++ *    never issue TLBIALLNSNH/TLBIALLH, never touch sACR;
++ *  - every store uses a real register as source (sweet_gpu.h sgpu_wr):
++ *    the GPU's S2CR value is exactly 0, which a "str wzr" would break;
++ *  - SMR and S2CR writes are read back: QHEE filters some of them.
++ *
++ * Page tables live in write-combined (Normal non-cacheable) memory and the
++ * TCR declares a non-cacheable walk, so no cache maintenance is needed for
++ * PTE updates and the setup is correct whether or not the SMMU's walker
++ * port is really IO-coherent (upstream DT says dma-coherent, the stock DT
++ * does not). A DSB orders PTE writes before any TLB operation or before
++ * handing an address to the GPU.
++ *
++ * Tables are never freed while the driver runs (an unmapped range keeps
++ * its empty L2/L3 tables): the VA allocator reuses low addresses first,
++ * so the table count is bounded by peak GPU memory (1 L3 table per 2 MiB).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SGPU_HOST)
++#include "sweet_gpu.h"
++
++/* ---- GR0 ---- */
++#define SMMU_sCR0               0x000
++#define  sCR0_CLIENTPD          (1u << 0)
++#define  sCR0_GFRE              (1u << 1)
++#define  sCR0_GFIE              (1u << 2)
++#define  sCR0_EXIDENABLE        (1u << 3)
++#define  sCR0_USFCFG            (1u << 10)
++#define  sCR0_VMID16EN          (1u << 31)
++#define SMMU_ID0                0x020
++#define  ID0_S1TS               (1u << 30)
++#define  ID0_SMS                (1u << 27)
++#define  ID0_CTTW               (1u << 14)
++#define  ID0_NUMSIDB(v)         (((v) >> 9) & 0xf)
++#define  ID0_EXIDS              (1u << 8)
++#define  ID0_NUMSMRG(v)         ((v) & 0xff)
++#define SMMU_ID1                0x024
++#define  ID1_PAGESIZE           (1u << 31)
++#define  ID1_NUMPAGENDXB(v)     (((v) >> 28) & 7)
++#define  ID1_NUMCB(v)           ((v) & 0xff)
++#define SMMU_ID2                0x028
++#define  ID2_PTFS_4K            (1u << 12)
++#define  ID2_UBS(v)             (((v) >> 8) & 0xf)
++#define  ID2_OAS(v)             (((v) >> 4) & 0xf)
++#define  ID2_IAS(v)             ((v) & 0xf)
++#define SMMU_ID7                0x03c
++#define SMMU_sGFSR              0x048
++#define SMMU_sGFSYNR0           0x050
++#define SMMU_sGFSYNR1           0x054
++#define SMMU_sGFSYNR2           0x058
++#define SMMU_SMR(n)             (0x800 + 4 * (n))
++#define  SMR_VALID              (1u << 31)
++#define SMMU_S2CR(n)            (0xc00 + 4 * (n))
++#define  S2CR_TYPE(v)           (((v) >> 16) & 3)
++#define  S2CR_TYPE_TRANS        0
++#define  S2CR_TYPE_BYPASS       1
++#define  S2CR_TYPE_FAULT        2
++#define  S2CR_EXIDVALID         (1u << 10)
++#define  S2CR_CBNDX(v)          ((v) & 0xff)
++
++/* ---- GR1 ---- */
++#define SMMU_CBAR(n)            (0x000 + 4 * (n))
++#define SMMU_CBFRSYNRA(n)       (0x400 + 4 * (n))
++#define SMMU_CBA2R(n)           (0x800 + 4 * (n))
++#define  CBA2R_VA64             (1u << 0)
++
++/* ---- context bank ---- */
++#define CB_SCTLR                0x000
++#define  SCTLR_M                (1u << 0)
++#define  SCTLR_TRE              (1u << 1)
++#define  SCTLR_AFE              (1u << 2)
++#define  SCTLR_CFRE             (1u << 5)
++#define  SCTLR_CFIE             (1u << 6)
++#define  SCTLR_HUPCF            (1u << 8)
++#define  SCTLR_ASIDPNE          (1u << 12)
++#define CB_ACTLR                0x004
++#define CB_RESUME               0x008
++#define CB_TCR2                 0x010
++#define CB_TTBR0                0x020
++#define CB_TTBR1                0x028
++#define CB_TCR                  0x030
++#define CB_MAIR0                0x038
++#define CB_MAIR1                0x03c
++#define CB_FSR                  0x058
++#define  FSR_SS                 (1u << 30)
++#define  FSR_FAULT              0xc00001feu
++#define CB_FAR                  0x060
++#define CB_FSYNR0               0x068
++#define CB_FSYNR1               0x06c
++#define CB_TLBIASID             0x610
++#define CB_TLBSYNC              0x7f0
++#define CB_TLBSTATUS            0x7f4
++
++/* values (spec 3.2-3.6) */
++#define IAS_BITS                39
++#define CBAR_S1_BYPASS_S2       0x0001f300u     /* TYPE=1, BPSHCFG=NSH, MEMATTR=WB */
++#define ACTLR_PREFETCH          0x00000303u     /* CMTLB | CPRE | deep prefetch (upstream) */
++#define MAIR0_VALUE             0xf404ff44u     /* 0:NC 1:WB-RWA 2:Device-nGnRE 3:iNC/oWB */
++#define SCTLR_VALUE             (SCTLR_M | SCTLR_TRE | SCTLR_AFE | SCTLR_CFRE | \
++	                         SCTLR_CFIE | SCTLR_HUPCF | SCTLR_ASIDPNE)     /* 0x1167 */
++/* TTBR0 only, EPD1, 4K, T0SZ = 25; walk Normal non-cacheable, outer-shareable */
++#define TCR_TTBR0_NC            (0x00800000u | (2u << 12) | (0u << 10) | (0u << 8) | (64 - IAS_BITS))
++#define TCR2_BASE               0x00038010u     /* SEP=7 (upstream), AS=16-bit ASID */
++
++/* LPAE stage-1 descriptors */
++#define PTE_VALID_TABLE         3ull            /* table (L1/L2) or page (L3) */
++#define PTE_ATTRIDX(n)          ((uint64_t)(n) << 2)
++#define PTE_AP_UNPRIV           (1ull << 6)
++#define PTE_AP_RDONLY           (1ull << 7)
++#define PTE_SH_OS               (2ull << 8)
++#define PTE_SH_IS               (3ull << 8)
++#define PTE_AF                  (1ull << 10)
++#define PTE_NG                  (1ull << 11)
++#define PTE_ADDR_MASK           0x0000fffffffff000ull
++
++#define GRANULE                 0x1000ull
++#define CHUNK_SIZE              0x10000u        /* 64 KiB of tables per DMA allocation */
++#define UNITS_PER_CHUNK         (CHUNK_SIZE / GRANULE)
++#define MAX_CHUNKS              2048            /* 128 MiB of tables = 64 GiB mapped */
++
++struct smmu_dom {
++	bool      active;
++	uint32_t  sid, mask;
++	int       cb;
++	int       sme;
++	bool      sme_reused;           /* covered by a pre-existing SMR */
++	uint32_t  asid;
++	uint64_t  root_pa;
++	uint64_t *root;
++	uint32_t  smr_val, s2cr_val;
++	uint32_t  old_s2cr;             /* for the log */
++};
++
++struct sgpu_smmu {
++	uint32_t pgshift, numpage, numcb, numsmr, oas_bits, ubs_bits, sid_bits;
++	uint32_t id0, id1, id2, id7, scr0;
++	bool     exids, vmid16;
++	struct smmu_dom dom[SGPU_DOM_COUNT];
++	struct sgpu_dma chunk[MAX_CHUNKS];
++	uint32_t nchunks, next_unit;    /* bump allocator inside chunk[nchunks-1] */
++	uint64_t tables;
++};
++
++static struct sgpu_smmu smmu_storage;
++
++static inline volatile uint8_t *gr0(struct sgpu *g) { return g->smmu; }
++static inline volatile uint8_t *gr1(struct sgpu *g) { return g->smmu + (1u << g->smmu_state->pgshift); }
++static inline volatile uint8_t *
++cbase(struct sgpu *g, int cb)
++{
++	struct sgpu_smmu *s = g->smmu_state;
++	return g->smmu + ((s->numpage + (uint32_t)cb) << s->pgshift);
++}
++
++static uint32_t
++id_size_to_bits(uint32_t f)
++{
++	static const uint32_t bits[] = { 32, 36, 40, 42, 44 };
++	return f < 5 ? bits[f] : 48;
++}
++
++static uint32_t
++oas_to_ips(uint32_t bits)
++{
++	switch (bits) {
++	case 32: return 0;
++	case 36: return 1;
++	case 40: return 2;
++	case 42: return 3;
++	case 44: return 4;
++	default: return 5;
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* page-table memory                                                  */
++/* ------------------------------------------------------------------ */
++
++static uint64_t *
++table_alloc(struct sgpu_smmu *s, uint64_t *pa)
++{
++	if (s->nchunks == 0 || s->next_unit == UNITS_PER_CHUNK) {
++		if (s->nchunks == MAX_CHUNKS) {
++			return NULL;
++		}
++		if (sgpu_dma_alloc(CHUNK_SIZE, CHUNK_SIZE, SGPU_DMA_WC, &s->chunk[s->nchunks])) {
++			return NULL;
++		}
++		if (s->chunk[s->nchunks].pa + CHUNK_SIZE > (1ull << s->oas_bits)) {
++			sgpu_log("smmu: table memory %#llx above the %u-bit output size",
++			    (unsigned long long)s->chunk[s->nchunks].pa, s->oas_bits);
++			sgpu_dma_free(&s->chunk[s->nchunks]);
++			return NULL;
++		}
++		s->nchunks++;
++		s->next_unit = 0;
++	}
++	struct sgpu_dma *c = &s->chunk[s->nchunks - 1];
++	uint32_t u = s->next_unit++;
++	*pa = c->pa + u * GRANULE;
++	s->tables++;
++	return (uint64_t *)(void *)((uint8_t *)c->va + u * GRANULE);     /* zeroed by dma_alloc */
++}
++
++/* next-level table PA -> its CPU address (linear in the number of chunks,
++ * done once per 2 MiB of a map/unmap) */
++static uint64_t *
++table_va(struct sgpu_smmu *s, uint64_t pa)
++{
++	for (uint32_t i = 0; i < s->nchunks; i++) {
++		if (pa >= s->chunk[i].pa && pa < s->chunk[i].pa + CHUNK_SIZE) {
++			return (uint64_t *)(void *)((uint8_t *)s->chunk[i].va + (pa - s->chunk[i].pa));
++		}
++	}
++	return NULL;
++}
++
++/* L3 table covering iova, optionally creating L2/L3 tables on the way. */
++static uint64_t *
++walk_l3(struct sgpu_smmu *s, struct smmu_dom *d, uint64_t iova, bool create)
++{
++	uint64_t *t = d->root;
++	for (int level = 1; level <= 2; level++) {
++		uint32_t idx = (uint32_t)(iova >> (level == 1 ? 30 : 21)) & 0x1ff;
++		uint64_t e = t[idx];
++		if ((e & 3) == 0) {
++			if (!create) {
++				return NULL;
++			}
++			uint64_t pa;
++			uint64_t *n = table_alloc(s, &pa);
++			if (n == NULL) {
++				return NULL;
++			}
++			sgpu_wmb();             /* zeroed table visible before it is linked */
++			t[idx] = pa | PTE_VALID_TABLE;
++			t = n;
++			continue;
++		}
++		if ((e & 3) != 3) {
++			return NULL;            /* block mapping: never created by this driver */
++		}
++		t = table_va(s, e & PTE_ADDR_MASK);
++		if (t == NULL) {
++			return NULL;
++		}
++	}
++	return t;
++}
++
++static uint64_t
++make_pte(uint64_t pa, uint32_t prot)
++{
++	uint64_t pte = (pa & PTE_ADDR_MASK) | PTE_VALID_TABLE | PTE_AF | PTE_NG;
++
++	if (prot & SGPU_PROT_CACHED) {
++		pte |= PTE_ATTRIDX(1) | PTE_SH_IS;
++	} else {
++		pte |= PTE_ATTRIDX(0) | PTE_SH_OS;
++	}
++	if (!(prot & SGPU_PROT_PRIV)) {
++		pte |= PTE_AP_UNPRIV;
++	}
++	if (!(prot & SGPU_PROT_WRITE)) {
++		pte |= PTE_AP_RDONLY;
++	}
++	/* XN is never set: the GPU/GMU fetch shaders/code from any buffer
++	 * (Linux msm never passes IOMMU_NOEXEC either). */
++	return pte;
++}
++
++/* ------------------------------------------------------------------ */
++/* TLB                                                                */
++/* ------------------------------------------------------------------ */
++
++static int
++cb_tlb_sync(struct sgpu *g, int cb)
++{
++	volatile uint8_t *c = cbase(g, cb);
++	uint64_t start = sgpu_now_us();
++
++	sgpu_wr(c, CB_TLBSYNC, 0xffffffffu);
++	while (sgpu_rd(c, CB_TLBSTATUS) & 1) {
++		if (sgpu_now_us() - start > 1000000) {
++			sgpu_log("smmu: CB%d TLB sync timed out -- SMMU may be deadlocked", cb);
++			return -60;
++		}
++		sgpu_udelay(1);
++	}
++	return 0;
++}
++
++static void
++dom_tlb_inval(struct sgpu *g, struct smmu_dom *d)
++{
++	sgpu_wmb();                     /* PTE updates before the invalidate */
++	sgpu_wr(cbase(g, d->cb), CB_TLBIASID, d->asid);
++	cb_tlb_sync(g, d->cb);
++}
++
++void
++sgpu_smmu_tlb_sync(struct sgpu *g, enum sgpu_smmu_domain dom)
++{
++	struct smmu_dom *d = &g->smmu_state->dom[dom];
++	if (d->active) {
++		dom_tlb_inval(g, d);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* map / unmap                                                        */
++/* ------------------------------------------------------------------ */
++
++int
++sgpu_smmu_map(struct sgpu *g, enum sgpu_smmu_domain dom, uint64_t iova,
++    uint64_t pa, uint64_t size, uint32_t prot)
++{
++	struct sgpu_smmu *s = g->smmu_state;
++	struct smmu_dom *d;
++	uint64_t done = 0;
++
++	if (s == NULL || dom >= SGPU_DOM_COUNT || !(d = &s->dom[dom])->root) {
++		return -19;     /* ENODEV */
++	}
++	if (((iova | pa | size) & (GRANULE - 1)) || size == 0 ||
++	    iova + size > (1ull << IAS_BITS) || iova + size < iova ||
++	    pa + size > (1ull << s->oas_bits)) {
++		sgpu_log("smmu: bad map dom %d iova %#llx pa %#llx size %#llx", dom,
++		    (unsigned long long)iova, (unsigned long long)pa, (unsigned long long)size);
++		return -22;
++	}
++	while (done < size) {
++		uint64_t va = iova + done;
++		uint64_t *l3 = walk_l3(s, d, va, true);
++		if (l3 == NULL) {
++			goto fail;
++		}
++		/* fill this L3 table as far as the range goes */
++		for (uint32_t i = (uint32_t)(va >> 12) & 0x1ff; i < 512 && done < size; i++) {
++			if (l3[i] & 1) {
++				sgpu_log("smmu: dom %d iova %#llx already mapped", dom,
++				    (unsigned long long)(iova + done));
++				goto fail;
++			}
++			l3[i] = make_pte(pa + done, prot);
++			done += GRANULE;
++		}
++	}
++	sgpu_wmb();     /* map needs no TLB maintenance, only ordering */
++	return 0;
++fail:
++	if (done) {
++		sgpu_smmu_unmap(g, dom, iova, done);
++	}
++	return -12;
++}
++
++int
++sgpu_smmu_unmap(struct sgpu *g, enum sgpu_smmu_domain dom, uint64_t iova, uint64_t size)
++{
++	struct sgpu_smmu *s = g->smmu_state;
++	struct smmu_dom *d;
++	uint64_t done = 0;
++
++	if (s == NULL || dom >= SGPU_DOM_COUNT || !(d = &s->dom[dom])->root) {
++		return -19;
++	}
++	size = (size + GRANULE - 1) & ~(GRANULE - 1);
++	while (done < size) {
++		uint64_t va = iova + done;
++		uint64_t *l3 = walk_l3(s, d, va, false);
++		if (l3 == NULL) {
++			/* nothing mapped in this 2 MiB: skip to the next L3 boundary */
++			uint64_t next = (va + 0x200000ull) & ~0x1fffffull;
++			done = next - iova;
++			continue;
++		}
++		for (uint32_t i = (uint32_t)(va >> 12) & 0x1ff; i < 512 && done < size; i++) {
++			l3[i] = 0;
++			done += GRANULE;
++		}
++	}
++	if (d->active) {
++		dom_tlb_inval(g, d);
++	}
++	return 0;
++}
++
++uint64_t
++sgpu_smmu_ttbr0(struct sgpu *g, enum sgpu_smmu_domain dom)
++{
++	struct smmu_dom *d = &g->smmu_state->dom[dom];
++	return d->root_pa | ((uint64_t)d->asid << 48);
++}
++
++/* ------------------------------------------------------------------ */
++/* discovery and stream/context-bank selection                        */
++/* ------------------------------------------------------------------ */
++
++static bool
++sme_valid(struct sgpu_smmu *s, uint32_t smr, uint32_t s2cr)
++{
++	return s->exids ? (s2cr & S2CR_EXIDVALID) != 0 : (smr & SMR_VALID) != 0;
++}
++
++/*
++ * Linux arm_smmu_find_sme semantics: an existing valid SMR that fully
++ * covers (id, mask) is reused; any partial overlap is an error; otherwise
++ * the first invalid index. Indices already claimed by the other domain
++ * are skipped.
++ */
++static int
++find_sme(struct sgpu *g, uint32_t id, uint32_t mask, int taken, bool *reused)
++{
++	struct sgpu_smmu *s = g->smmu_state;
++	int free_idx = -1;
++
++	*reused = false;
++	for (uint32_t i = 0; i < s->numsmr; i++) {
++		if ((int)i == taken) {
++			continue;
++		}
++		uint32_t smr = sgpu_rd(gr0(g), SMMU_SMR(i));
++		uint32_t s2cr = sgpu_rd(gr0(g), SMMU_S2CR(i));
++		if (!sme_valid(s, smr, s2cr)) {
++			if (free_idx < 0) {
++				free_idx = (int)i;
++			}
++			continue;
++		}
++		uint32_t eid = smr & 0xffff;
++		uint32_t emask = (smr >> 16) & (s->exids ? 0xffff : 0x7fff);
++		if ((mask & emask) == mask && !((id ^ eid) & ~emask)) {
++			*reused = true;
++			return (int)i;
++		}
++		if (!((id ^ eid) & ~(emask | mask))) {
++			sgpu_log("smmu: SID %#x/%#x overlaps foreign SMR%u %#x (S2CR %#x)",
++			    id, mask, i, smr, s2cr);
++			return -17;
++		}
++	}
++	return free_idx >= 0 ? free_idx : -28;
++}
++
++/* Is context bank cb referenced by a valid SME other than `ignore`? */
++static bool
++cb_referenced(struct sgpu *g, int cb, int ignore)
++{
++	struct sgpu_smmu *s = g->smmu_state;
++	for (uint32_t i = 0; i < s->numsmr; i++) {
++		if ((int)i == ignore) {
++			continue;
++		}
++		uint32_t smr = sgpu_rd(gr0(g), SMMU_SMR(i));
++		uint32_t s2cr = sgpu_rd(gr0(g), SMMU_S2CR(i));
++		if (sme_valid(s, smr, s2cr) && S2CR_TYPE(s2cr) == S2CR_TYPE_TRANS &&
++		    S2CR_CBNDX(s2cr) == (uint32_t)cb) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++snapshot(struct sgpu *g)
++{
++	struct sgpu_smmu *s = g->smmu_state;
++
++	for (uint32_t i = 0; i < s->numsmr; i++) {
++		uint32_t smr = sgpu_rd(gr0(g), SMMU_SMR(i));
++		uint32_t s2cr = sgpu_rd(gr0(g), SMMU_S2CR(i));
++		if (sme_valid(s, smr, s2cr)) {
++			sgpu_log("smmu: firmware SME%u: SMR %#010x S2CR %#010x (type %u cb %u)",
++			    i, smr, s2cr, S2CR_TYPE(s2cr), S2CR_CBNDX(s2cr));
++		}
++	}
++	for (uint32_t cb = 0; cb < s->numcb; cb++) {
++		uint32_t sctlr = sgpu_rd(cbase(g, (int)cb), CB_SCTLR);
++		if (sctlr & SCTLR_M) {
++			sgpu_log("smmu: firmware CB%u live: SCTLR %#x CBAR %#x TCR %#x", cb, sctlr,
++			    sgpu_rd(gr1(g), SMMU_CBAR(cb)), sgpu_rd(cbase(g, (int)cb), CB_TCR));
++		}
++	}
++}
++
++static int
++probe_ids(struct sgpu *g)
++{
++	struct sgpu_smmu *s = g->smmu_state;
++
++	s->id0 = sgpu_rd(gr0(g), SMMU_ID0);
++	s->id1 = sgpu_rd(gr0(g), SMMU_ID1);
++	s->id2 = sgpu_rd(gr0(g), SMMU_ID2);
++	s->id7 = sgpu_rd(gr0(g), SMMU_ID7);
++	s->scr0 = sgpu_rd(gr0(g), SMMU_sCR0);
++	sgpu_log("smmu: ID0 %#x ID1 %#x ID2 %#x ID7 %#x (MMU-500 r%up%u) sCR0 %#x",
++	    s->id0, s->id1, s->id2, s->id7, (s->id7 >> 4) & 0xf, s->id7 & 0xf, s->scr0);
++	if (s->id0 == 0xffffffffu || s->id1 == 0xffffffffu) {
++		return sgpu_fail(g, -5, "smmu: registers read all-ones (CX GDSC/AHB clock off?)");
++	}
++	s->pgshift = (s->id1 & ID1_PAGESIZE) ? 16 : 12;
++	s->numpage = 1u << (ID1_NUMPAGENDXB(s->id1) + 1);
++	s->numcb = ID1_NUMCB(s->id1);
++	s->numsmr = (s->id0 & ID0_SMS) ? ID0_NUMSMRG(s->id0) : 0;
++	if (s->numsmr > 128) {
++		s->numsmr = 128;
++	}
++	s->exids = (s->scr0 & sCR0_EXIDENABLE) != 0;    /* live config, not ID0 */
++	s->vmid16 = (s->scr0 & sCR0_VMID16EN) != 0;
++	s->sid_bits = s->exids ? 16 : ID0_NUMSIDB(s->id0);
++	s->oas_bits = id_size_to_bits(ID2_IAS(s->id2));     /* S1 output = IPA size */
++	s->ubs_bits = id_size_to_bits(ID2_UBS(s->id2));
++	sgpu_log("smmu: page %u KiB, %u pages/half, %u CBs, %u SMRs, %u-bit SIDs, "
++	    "S1 in %u / out %u bits, %s walk advertised, EXIDS %d VMID16 %d",
++	    1u << (s->pgshift - 10), s->numpage, s->numcb, s->numsmr, s->sid_bits,
++	    s->ubs_bits, s->oas_bits, (s->id0 & ID0_CTTW) ? "coherent" : "non-coherent",
++	    s->exids, s->vmid16);
++
++	if ((2u * s->numpage) << s->pgshift > 0x10000) {
++		return sgpu_fail(g, -22, "smmu: %u-page layout does not fit the 64 KiB window",
++		           s->numpage);
++	}
++	if (!(s->id0 & ID0_S1TS) || !(s->id2 & ID2_PTFS_4K)) {
++		return sgpu_fail(g, -22, "smmu: no stage-1 / 4K granule support");
++	}
++	if (s->numsmr == 0 || s->numcb < 2) {
++		return sgpu_fail(g, -22, "smmu: %u SMRs, %u CBs", s->numsmr, s->numcb);
++	}
++	if (s->ubs_bits < IAS_BITS || s->sid_bits < 11) {
++		return sgpu_fail(g, -22, "smmu: input %u bits / SID %u bits too small",
++		           s->ubs_bits, s->sid_bits);
++	}
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* programming                                                        */
++/* ------------------------------------------------------------------ */
++
++static int
++program_cb(struct sgpu *g, struct smmu_dom *d)
++{
++	struct sgpu_smmu *s = g->smmu_state;
++	volatile uint8_t *c = cbase(g, d->cb);
++	uint32_t vmid = (uint32_t)d->cb;
++
++	sgpu_wr(c, CB_SCTLR, 0);
++	sgpu_wr(c, CB_FSR, FSR_FAULT);
++	sgpu_wr(c, CB_ACTLR, ACTLR_PREFETCH);
++	sgpu_wr(gr1(g), SMMU_CBA2R(d->cb), CBA2R_VA64 | (s->vmid16 ? vmid << 16 : 0));
++	sgpu_wr(gr1(g), SMMU_CBAR(d->cb), CBAR_S1_BYPASS_S2 | (s->vmid16 ? 0 : (vmid & 0xff)));
++	sgpu_wr(c, CB_TCR2, TCR2_BASE | oas_to_ips(s->oas_bits));
++	sgpu_wr(c, CB_TCR, TCR_TTBR0_NC);
++	sgpu_wr64(c, CB_TTBR0, d->root_pa | ((uint64_t)d->asid << 48));
++	sgpu_wr64(c, CB_TTBR1, (uint64_t)d->asid << 48);
++	sgpu_wr(c, CB_MAIR0, MAIR0_VALUE);
++	sgpu_wr(c, CB_MAIR1, 0);
++	sgpu_wr(c, CB_TLBIASID, d->asid);
++	if (cb_tlb_sync(g, d->cb)) {
++		return sgpu_fail(g, -60, "smmu: CB%d TLB sync timeout", d->cb);
++	}
++	sgpu_wr(c, CB_SCTLR, SCTLR_VALUE);
++
++	uint32_t actlr = sgpu_rd(c, CB_ACTLR), sctlr = sgpu_rd(c, CB_SCTLR);
++	uint64_t ttbr0 = sgpu_rd64(c, CB_TTBR0);
++	if (sctlr != SCTLR_VALUE || ttbr0 != (d->root_pa | ((uint64_t)d->asid << 48))) {
++		return sgpu_fail(g, -5, "smmu: CB%d did not take SCTLR %#x/TTBR0 %#llx",
++		           d->cb, sctlr, (unsigned long long)ttbr0);
++	}
++	if (actlr != ACTLR_PREFETCH) {
++		sgpu_log("smmu: CB%d ACTLR reads %#x (sACR.CACHE_LOCK set by secure world; "
++		    "prefetch hints only)", d->cb, actlr);
++	}
++	return 0;
++}
++
++static int
++program_sme(struct sgpu *g, struct smmu_dom *d)
++{
++	/* S2CR first, then SMR (a valid SMR must never point at a stale S2CR) */
++	sgpu_wr(gr0(g), SMMU_S2CR(d->sme), d->s2cr_val);
++	sgpu_wr(gr0(g), SMMU_SMR(d->sme), d->smr_val);
++	uint32_t s2cr = sgpu_rd(gr0(g), SMMU_S2CR(d->sme));
++	uint32_t smr = sgpu_rd(gr0(g), SMMU_SMR(d->sme));
++	if (s2cr != d->s2cr_val || smr != d->smr_val) {
++		return sgpu_fail(g, -1, "smmu: SME%d write filtered (hypervisor?): "
++		           "S2CR %#x want %#x, SMR %#x want %#x", d->sme, s2cr, d->s2cr_val,
++		           smr, d->smr_val);
++	}
++	return 0;
++}
++
++static int
++setup_dom(struct sgpu *g, enum sgpu_smmu_domain dom, uint32_t sid, uint32_t mask)
++{
++	struct sgpu_smmu *s = g->smmu_state;
++	struct smmu_dom *d = &s->dom[dom];
++	struct smmu_dom *other = &s->dom[dom == SGPU_DOM_GPU ? SGPU_DOM_GMU : SGPU_DOM_GPU];
++	uint32_t force = 0;
++
++	(void)sgpu_bootarg_u32("sweetgpu_smmu_force", &force);
++	d->sid = sid;
++	d->mask = mask;
++	if ((sid | mask) >> s->sid_bits) {
++		return sgpu_fail(g, -22, "smmu: SID %#x mask %#x exceed %u SID bits",
++		           sid, mask, s->sid_bits);
++	}
++	int sme = find_sme(g, sid, mask, other->active ? other->sme : -1, &d->sme_reused);
++	if (sme < 0) {
++		return sgpu_fail(g, sme, "smmu: no stream match entry for SID %#x/%#x", sid, mask);
++	}
++	d->sme = sme;
++	d->old_s2cr = sgpu_rd(gr0(g), SMMU_S2CR(sme));
++
++	/* context bank */
++	if (dom == SGPU_DOM_GPU) {
++		d->cb = 0;
++		bool live = (sgpu_rd(cbase(g, 0), CB_SCTLR) & SCTLR_M) != 0;
++		bool used = cb_referenced(g, 0, d->sme_reused ? sme : -1);
++		if ((live || used) && !force) {
++			return sgpu_fail(g, -16, "smmu: CB0 is in use by firmware (live %d, "
++			           "referenced %d); boot with sweetgpu_smmu_force=1 to take it",
++			           live, used);
++		}
++	} else {
++		d->cb = -1;
++		for (uint32_t cb = 1; cb < s->numcb; cb++) {
++			if (other->active && (int)cb == other->cb) {
++				continue;
++			}
++			if (sgpu_rd(cbase(g, (int)cb), CB_SCTLR) & SCTLR_M) {
++				continue;
++			}
++			if (cb_referenced(g, (int)cb, d->sme_reused ? sme : -1)) {
++				continue;
++			}
++			d->cb = (int)cb;
++			break;
++		}
++		if (d->cb < 0) {
++			return sgpu_fail(g, -28, "smmu: no free context bank for the GMU");
++		}
++	}
++	if (d->sme_reused && S2CR_TYPE(d->old_s2cr) == S2CR_TYPE_TRANS &&
++	    (int)S2CR_CBNDX(d->old_s2cr) != d->cb &&
++	    (sgpu_rd(cbase(g, (int)S2CR_CBNDX(d->old_s2cr)), CB_SCTLR) & SCTLR_M) && !force) {
++		return sgpu_fail(g, -16, "smmu: SID %#x already translated by live CB%u",
++		           sid, S2CR_CBNDX(d->old_s2cr));
++	}
++	d->asid = (uint32_t)d->cb;
++
++	/* root table */
++	d->root = table_alloc(s, &d->root_pa);
++	if (d->root == NULL) {
++		return sgpu_fail(g, -12, "smmu: no page-table memory");
++	}
++
++	d->s2cr_val = (S2CR_TYPE_TRANS << 16) | (uint32_t)d->cb | (s->exids ? S2CR_EXIDVALID : 0);
++	if (d->sme_reused) {
++		d->smr_val = sgpu_rd(gr0(g), SMMU_SMR(sme));     /* keep the covering SMR */
++	} else {
++		d->smr_val = sid | (mask << 16) | (s->exids ? 0 : SMR_VALID);
++	}
++
++	int err = program_cb(g, d);
++	if (!err) {
++		err = program_sme(g, d);
++	}
++	if (err) {
++		return err;
++	}
++	d->active = true;
++	sgpu_log("smmu: %s SID %#x/%#x -> SME%d%s (old S2CR %#x) -> CB%d ASID %u, "
++	    "TTBR0 %#llx", dom == SGPU_DOM_GPU ? "GPU" : "GMU", sid, mask, d->sme,
++	    d->sme_reused ? " (reused firmware SMR)" : "", d->old_s2cr, d->cb, d->asid,
++	    (unsigned long long)d->root_pa);
++	return 0;
++}
++
++int
++sgpu_smmu_init(struct sgpu *g)
++{
++	struct sgpu_smmu *s = &smmu_storage;
++	int err;
++
++	if (g->smmu_state == NULL) {        /* first init of this device */
++		for (size_t i = 0; i < sizeof(*s); i++) {
++			((uint8_t *)s)[i] = 0;
++		}
++		g->smmu_state = s;
++	}
++	if ((err = probe_ids(g)) != 0) {
++		return err;
++	}
++	snapshot(g);
++
++	uint32_t gfsr = sgpu_rd(gr0(g), SMMU_sGFSR);
++	if (gfsr) {
++		sgpu_log("smmu: stale global fault sGFSR %#x SYNR0 %#x SYNR1 %#x", gfsr,
++		    sgpu_rd(gr0(g), SMMU_sGFSYNR0), sgpu_rd(gr0(g), SMMU_sGFSYNR1));
++		sgpu_wr(gr0(g), SMMU_sGFSR, gfsr);
++	}
++
++	if ((err = setup_dom(g, SGPU_DOM_GPU, 0x000, 0x401)) != 0) {
++		return err;
++	}
++	if ((err = setup_dom(g, SGPU_DOM_GMU, 0x005, 0x400)) != 0) {
++		return err;
++	}
++
++	/*
++	 * sCR0.CLIENTPD = 1 means the whole SMMU bypasses: our banks would
++	 * never be used. Clear only that bit (and enable global fault
++	 * reporting); leave USFCFG/VMID16EN/EXIDENABLE etc. as firmware set
++	 * them, since they define how everybody else's entries are decoded.
++	 */
++	uint32_t scr0 = sgpu_rd(gr0(g), SMMU_sCR0);
++	if (scr0 & sCR0_CLIENTPD) {
++		sgpu_log("smmu: sCR0 %#x has CLIENTPD set (global bypass) -- clearing it", scr0);
++		sgpu_wr(gr0(g), SMMU_sCR0, (scr0 & ~sCR0_CLIENTPD) | sCR0_GFRE | sCR0_GFIE);
++		scr0 = sgpu_rd(gr0(g), SMMU_sCR0);
++		if (scr0 & sCR0_CLIENTPD) {
++			return sgpu_fail(g, -1, "smmu: sCR0.CLIENTPD write ignored (%#x)", scr0);
++		}
++	}
++	sgpu_log("smmu: ready, sCR0 %#x, %llu table pages", scr0,
++	    (unsigned long long)s->tables);
++	return 0;
++}
++
++int
++sgpu_smmu_restore(struct sgpu *g)
++{
++	struct sgpu_smmu *s = g->smmu_state;
++	int err;
++
++	if (s == NULL) {
++		return -19;
++	}
++	for (int i = 0; i < SGPU_DOM_COUNT; i++) {
++		struct smmu_dom *d = &s->dom[i];
++		if (!d->active) {
++			continue;
++		}
++		if ((err = program_cb(g, d)) != 0 || (err = program_sme(g, d)) != 0) {
++			return err;
++		}
++	}
++	return 0;
++}
++
++uint32_t
++sgpu_smmu_check_faults(struct sgpu *g)
++{
++	struct sgpu_smmu *s = g->smmu_state;
++	uint32_t n = 0;
++
++	if (s == NULL || g->stage_reached < SGPU_STAGE_SMMU) {
++		return 0;
++	}
++	for (int i = 0; i < SGPU_DOM_COUNT; i++) {
++		struct smmu_dom *d = &s->dom[i];
++		if (!d->active) {
++			continue;
++		}
++		volatile uint8_t *c = cbase(g, d->cb);
++		uint32_t fsr = sgpu_rd(c, CB_FSR);
++		if (!(fsr & FSR_FAULT)) {
++			continue;
++		}
++		uint64_t far = sgpu_rd64(c, CB_FAR);
++		uint32_t syn0 = sgpu_rd(c, CB_FSYNR0), syn1 = sgpu_rd(c, CB_FSYNR1);
++		uint32_t sid = sgpu_rd(gr1(g), SMMU_CBFRSYNRA(d->cb)) & 0xffff;
++		static const char *const client[] = { "CP", "?", "?", "?", "CCU", "?", "CDP", "GMU" };
++		uint32_t cl = syn1 & 0xff;
++		sgpu_log("smmu: %s fault CB%d FSR %#x (%s%s%s%s) FAR %#llx %s SID %#x "
++		    "FSYNR0 %#x FSYNR1 %#x client %s", i == SGPU_DOM_GPU ? "GPU" : "GMU",
++		    d->cb, fsr, (fsr & 2) ? "translation " : "", (fsr & 8) ? "permission " : "",
++		    (fsr & 0x10) ? "external " : "", (fsr & 0x80) ? "address-size " : "",
++		    (unsigned long long)far, (syn0 & 0x10) ? "write" : "read", sid, syn0, syn1,
++		    i == SGPU_DOM_GPU ? (cl < 8 ? client[cl] : "UCHE") : "GMU");
++		sgpu_wr(c, CB_FSR, fsr);
++		if (fsr & FSR_SS) {
++			sgpu_wr(c, CB_RESUME, 1);       /* terminate the stalled transaction */
++		}
++		n++;
++	}
++	uint32_t gfsr = sgpu_rd(gr0(g), SMMU_sGFSR);
++	if (gfsr) {
++		sgpu_log("smmu: global fault sGFSR %#x SYNR0 %#x SYNR1 %#x (SID %#x) SYNR2 %#x",
++		    gfsr, sgpu_rd(gr0(g), SMMU_sGFSYNR0), sgpu_rd(gr0(g), SMMU_sGFSYNR1),
++		    sgpu_rd(gr0(g), SMMU_sGFSYNR1) & 0xffff, sgpu_rd(gr0(g), SMMU_sGFSYNR2));
++		sgpu_wr(gr0(g), SMMU_sGFSR, gfsr);
++		n++;
++	}
++	g->faults += n;
++	return n;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_uapi.h
+@@ -0,0 +1,184 @@
++/*
++ * sweet_gpu_uapi.h - user/kernel interface of the SWEET Adreno driver.
++ *
++ * Shared verbatim by the XNU driver (iokit/Kernel/arm/SweetAdreno.cpp),
++ * libsweetgpu and the Mesa turnip "sweet" backend. Plain C, fixed-width
++ * fields, no pointers: every struct crosses the user/kernel boundary as an
++ * IOConnectCallStructMethod in/out blob, so layout is ABI.
++ *
++ * Model: Qualcomm KGSL, not Linux msm DRM. Reasons:
++ *   - turnip's KGSL backend needs no DRM syncobj, dma-buf or GEM handles:
++ *     synchronisation is "context + monotonically increasing timestamp",
++ *     which needs no extra kernel objects;
++ *   - the kernel assigns GPU virtual addresses (one call returns id,
++ *     gpuaddr and the CPU mapping), which keeps the first driver simple;
++ *   - KGSL is what Qualcomm's own stack used on this exact SoC, so the
++ *     semantics are known to fit the hardware (memstore timestamps written
++ *     by CP_EVENT_WRITE at the end of every submission).
++ *
++ * Service: IOServiceMatching("SweetAdreno"), IOServiceOpen type 0.
++ * Every method: IOConnectCallStructMethod(conn, selector, in, sizeof in,
++ * out, &outsize). Methods without input pass NULL/0.
++ */
++#ifndef SWEET_GPU_UAPI_H
++#define SWEET_GPU_UAPI_H
++
++#include <stdint.h>
++
++#define SGPU_SERVICE_CLASS      "SweetAdreno"
++#define SGPU_UAPI_VERSION       1
++
++enum sgpu_selector {
++	SGPU_SEL_GET_INFO       = 0,    /* -> sgpu_info */
++	SGPU_SEL_CTX_CREATE     = 1,    /* sgpu_ctx_create -> sgpu_ctx_create */
++	SGPU_SEL_CTX_DESTROY    = 2,    /* sgpu_ctx_destroy */
++	SGPU_SEL_MEM_ALLOC      = 3,    /* sgpu_mem_alloc -> sgpu_mem_alloc */
++	SGPU_SEL_MEM_FREE       = 4,    /* sgpu_mem_free */
++	SGPU_SEL_SUBMIT         = 5,    /* sgpu_submit -> sgpu_submit */
++	SGPU_SEL_WAIT_TS        = 6,    /* sgpu_wait_ts */
++	SGPU_SEL_READ_TS        = 7,    /* sgpu_read_ts -> sgpu_read_ts */
++	SGPU_SEL_IMPORT_SURFACE = 8,    /* sgpu_import_surface -> same */
++	SGPU_SEL_SYNC_CACHE     = 9,    /* sgpu_sync_cache */
++	SGPU_SEL_GPU_TIME       = 10,   /* -> sgpu_gpu_time */
++	SGPU_SEL_GET_STATUS     = 11,   /* -> sgpu_status (bring-up diagnostics) */
++	SGPU_SEL_COUNT
++};
++
++/* ---- GET_INFO ---- */
++struct sgpu_info {
++	uint32_t uapi_version;          /* SGPU_UAPI_VERSION */
++	uint32_t gpu_id;                /* 650 */
++	uint32_t chip_id;               /* 0x06050002 (core.major.minor.patch) */
++	uint32_t gmem_size;             /* bytes of on-chip GMEM */
++	uint64_t gmem_base;             /* GPU address the CP uses for GMEM */
++	uint64_t va_start;              /* user GPU VA range handed out */
++	uint64_t va_size;
++	uint32_t highest_bank_bit;      /* UBWC/tiling config (stock DT: 16) */
++	uint32_t ubwc_mode;             /* stock DT qcom,ubwc-mode (4) */
++	uint32_t min_access_length;     /* 32 */
++	uint32_t timer_freq_hz;         /* CP always-on counter: 19200000 */
++	uint32_t max_freq_hz;           /* current GPU clock ceiling */
++	uint32_t max_contexts;
++	uint32_t flags;                 /* SGPU_INFO_* */
++	uint32_t reserved0;
++	uint64_t uche_trap_base;        /* unmapped GPU VA programmed as UCHE_TRAP_BASE */
++	uint32_t reserved[6];
++};
++#define SGPU_INFO_IO_COHERENT   (1u << 0)   /* SMMU snoops CPU caches */
++#define SGPU_INFO_PER_PROCESS_PT (1u << 1)  /* each client has its own GPU VA space */
++
++/* ---- contexts (one hardware timeline each) ---- */
++struct sgpu_ctx_create {
++	uint32_t flags;                 /* in: SGPU_CTX_* */
++	uint32_t priority;              /* in: 0 = highest .. 15 */
++	uint32_t ctx_id;                /* out */
++	uint32_t reserved;
++};
++#define SGPU_CTX_NO_FAULT_TOLERANCE (1u << 0)
++
++struct sgpu_ctx_destroy {
++	uint32_t ctx_id;
++	uint32_t reserved;
++};
++
++/* ---- memory ---- */
++struct sgpu_mem_alloc {
++	uint64_t size;                  /* in: bytes (rounded up to 16 KiB) */
++	uint32_t flags;                 /* in: SGPU_MEM_* */
++	uint32_t align_log2;            /* in: GPU VA alignment, 0 = default 16 KiB */
++	uint32_t id;                    /* out: handle for free/sync */
++	uint32_t reserved;
++	uint64_t gpuaddr;               /* out */
++	uint64_t cpu_addr;              /* out: mapping in the caller's task, 0 if NO_CPU_MAP */
++	uint64_t alloc_size;            /* out: actual size */
++};
++#define SGPU_MEM_CACHED         (1u << 0)   /* CPU mapping write-back cached */
++#define SGPU_MEM_GPU_READONLY   (1u << 1)
++#define SGPU_MEM_NO_CPU_MAP     (1u << 2)
++#define SGPU_MEM_GPU_EXEC       (1u << 3)   /* holds command streams / shaders */
++
++struct sgpu_mem_free {
++	uint32_t id;
++	uint32_t reserved;
++};
++
++/* Import an IOSurface (SweetSurface id) so the GPU can render into it. */
++struct sgpu_import_surface {
++	uint32_t surface_id;            /* in */
++	uint32_t flags;                 /* in: SGPU_MEM_GPU_READONLY */
++	uint32_t id;                    /* out: memory handle (free with MEM_FREE) */
++	uint32_t reserved;
++	uint64_t gpuaddr;               /* out */
++	uint64_t size;                  /* out */
++};
++
++struct sgpu_sync_cache {
++	uint32_t id;
++	uint32_t op;                    /* SGPU_CACHE_* */
++	uint64_t offset;
++	uint64_t length;                /* 0 = to the end */
++};
++#define SGPU_CACHE_CLEAN        1   /* CPU wrote, GPU will read */
++#define SGPU_CACHE_INVALIDATE   2   /* GPU wrote, CPU will read */
++#define SGPU_CACHE_FLUSH        3   /* both */
++
++/* ---- submission ---- */
++#define SGPU_MAX_IBS            64
++
++struct sgpu_ib {
++	uint64_t gpuaddr;               /* command stream in GPU memory */
++	uint32_t size_dwords;
++	uint32_t flags;                 /* reserved, 0 */
++};
++
++struct sgpu_submit {
++	uint32_t ctx_id;                /* in */
++	uint32_t num_ibs;               /* in: 0..SGPU_MAX_IBS (0 = marker) */
++	uint32_t flags;                 /* in: SGPU_SUBMIT_* */
++	uint32_t timestamp;             /* out: this submission's timestamp */
++	struct sgpu_ib ibs[SGPU_MAX_IBS];
++};
++#define SGPU_SUBMIT_NO_CACHE_FLUSH (1u << 0)
++
++struct sgpu_wait_ts {
++	uint32_t ctx_id;
++	uint32_t timestamp;
++	uint32_t timeout_ms;            /* 0 = poll only */
++	uint32_t reserved;
++};
++
++struct sgpu_read_ts {
++	uint32_t ctx_id;                /* in */
++	uint32_t retired;               /* out: last completed timestamp */
++	uint32_t queued;                /* out: last submitted timestamp */
++	uint32_t reserved;
++};
++
++/* Timestamps wrap: a is at or after b. */
++static inline int
++sgpu_ts_ge(uint32_t a, uint32_t b)
++{
++	return (int32_t)(a - b) >= 0;
++}
++
++struct sgpu_gpu_time {
++	uint64_t gpu_ticks;             /* CP always-on counter */
++	uint64_t cpu_ticks;             /* mach_absolute_time() sampled together */
++};
++
++/* ---- diagnostics ---- */
++struct sgpu_status {
++	uint32_t stage_reached;         /* last bring-up stage that succeeded */
++	uint32_t stage_requested;       /* sweetgpu=N */
++	int32_t  last_error;            /* errno-style */
++	uint32_t faults;                /* SMMU / CP faults seen */
++	uint32_t hangs;
++	uint32_t rbbm_status;
++	uint32_t cp_rb_rptr;
++	uint32_t cp_rb_wptr;
++	uint32_t gmu_state;
++	uint32_t reserved[7];
++	char     message[128];          /* last error text */
++};
++
++#endif /* SWEET_GPU_UAPI_H */
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -18,6 +18,8 @@
+ iokit/Kernel/arm/SweetBacklight.cpp                              optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetAdreno.cpp                                 optional iokitcpp
++iokit/Kernel/arm/SweetAdrenoDMA.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+--- a/iokit/conf/Makefile.template
++++ b/iokit/conf/Makefile.template
+@@ -63,6 +63,8 @@
+ # DO NOT ADD MORE HERE.
+ #
+ # -Wno-cast-align
++SweetAdreno.cpo_CXXWARNFLAGS_ADD += -Wno-unsafe-buffer-usage -Wno-cast-align
++SweetAdrenoDMA.cpo_CXXWARNFLAGS_ADD += -Wno-unsafe-buffer-usage
+ IODataQueue.cpo_CXXWARNFLAGS_ADD += -Wno-cast-align
+ IOHibernateIO.cpo_CXXWARNFLAGS_ADD += -Wno-cast-align
+ IOHibernateRestoreKernel.o_CWARNFLAGS_ADD += -Wno-cast-align
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -0,0 +1,758 @@
++/*
++ * SweetAdreno - IOKit front end of the SWEET Adreno 650 driver.
++ *
++ * Kernel side of sweet_gpu_uapi.h. The hardware code is plain C
++ * (bsd/dev/sweet_gpu_*.c); this file only does what needs IOKit:
++ *
++ *   - start a bring-up thread that runs sgpu_bringup() to the stage in
++ *     boot-arg sweetgpu=N (default 0: nothing happens), after an optional
++ *     delay sweetgpudelay=S seconds so a hang never blocks early boot;
++ *   - publish the service (IOUserClientClass SweetAdrenoUserClient) only
++ *     when the GPU reached the "user" stage, so Metal/turnip never see a
++ *     half-initialised GPU;
++ *   - buffers: IOBufferMemoryDescriptor pages, wired, mapped into the GPU
++ *     address space (SMMU) and into the client task;
++ *   - IOSurface import: the SweetSurface pixel memory mapped into the GPU,
++ *     which is how CoreAnimation output will reach the GPU later;
++ *   - deferred frees: a buffer is unmapped from the GPU only after every
++ *     submission queued before the free has retired (ring fence).
++ *
++ * Diagnostics are mirrored into IORegistry properties of the service
++ * ("sweetgpu-stage", "sweetgpu-error", "sweetgpu-message"), readable with
++ * ioreg even when the user client is not published.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>
++#include <sys/errno.h>
++
++#include "SweetSurface.h"
++
++extern "C" {
++#include "../../../bsd/dev/sweet_gpu.h"
++}
++
++#define SGPU_MAX_CLIENT_MEM     65536
++#define SGPU_MAX_WIRED          (1536ull << 20)         /* all GPU buffers together */
++
++/* ---------------------------------------------------------------- */
++
++static struct sgpu sgpu_dev;
++static IOLock    *sgpu_lock;            /* serialises every sgpu_* call */
++static uint64_t   sgpu_wired;
++
++struct sgpu_umem {
++	struct sgpu_umem         *next;
++	uint32_t                  id;
++	uint32_t                  flags;
++	uint64_t                  gpuaddr;
++	uint64_t                  size;
++	IOMemoryDescriptor       *md;           /* retained */
++	IOMemoryMap              *userMap;      /* in the owning task, may be NULL */
++	SweetSurface             *surface;      /* retained for imports */
++	bool                      prepared;
++};
++
++/* Freed buffers wait here until the GPU is past them. */
++struct sgpu_deferred {
++	struct sgpu_deferred     *next;
++	struct sgpu_umem         *mem;
++	uint32_t                  fence;
++};
++static struct sgpu_deferred *sgpu_deferred_head;
++
++/* Unmap from the GPU and drop the memory. Called with sgpu_lock held. */
++static void
++sgpu_umem_destroy(struct sgpu_umem *m)
++{
++	if (m->gpuaddr) {
++		sgpu_smmu_unmap(&sgpu_dev, SGPU_DOM_GPU, m->gpuaddr, m->size);
++		sgpu_va_free(&sgpu_dev, m->gpuaddr, m->size);
++	}
++	if (m->md) {
++		if (m->prepared) {
++			m->md->complete();
++		}
++		m->md->release();
++	}
++	if (m->surface) {
++		m->surface->release();
++	} else {
++		sgpu_wired -= m->size;
++	}
++	IOFreeType(m, struct sgpu_umem);
++}
++
++static void
++sgpu_reap_deferred(void)
++{
++	uint32_t retired = sgpu_cp_ring_fence_retired(&sgpu_dev);
++	struct sgpu_deferred **pp = &sgpu_deferred_head;
++
++	while (*pp) {
++		struct sgpu_deferred *d = *pp;
++		if (sgpu_ts_ge(retired, d->fence)) {
++			*pp = d->next;
++			sgpu_umem_destroy(d->mem);
++			IOFreeType(d, struct sgpu_deferred);
++		} else {
++			pp = &d->next;
++		}
++	}
++}
++
++static void
++sgpu_umem_release(struct sgpu_umem *m)
++{
++	if (m->userMap) {
++		m->userMap->release();      /* the task's mapping goes now */
++		m->userMap = NULL;
++	}
++	struct sgpu_deferred *d = IOMallocType(struct sgpu_deferred);
++	d->mem = m;
++	d->fence = sgpu_cp_ring_fence_submitted(&sgpu_dev);
++	d->next = sgpu_deferred_head;
++	sgpu_deferred_head = d;
++	sgpu_reap_deferred();
++}
++
++/* Map every physical segment of md at gpuaddr. */
++static int
++sgpu_map_descriptor(IOMemoryDescriptor *md, uint64_t gpuaddr, uint64_t size, uint32_t prot)
++{
++	uint64_t off = 0;
++
++	while (off < size) {
++		IOByteCount seglen = 0;
++		addr64_t pa = md->getPhysicalSegment(off, &seglen, kIOMemoryMapperNone);
++		if (pa == 0 || seglen == 0) {
++			return -EFAULT;
++		}
++		if (seglen > size - off) {
++			seglen = (IOByteCount)(size - off);
++		}
++		int err = sgpu_smmu_map(&sgpu_dev, SGPU_DOM_GPU, gpuaddr + off, pa, seglen, prot);
++		if (err) {
++			if (off) {
++				sgpu_smmu_unmap(&sgpu_dev, SGPU_DOM_GPU, gpuaddr, off);
++			}
++			return err;
++		}
++		off += seglen;
++	}
++	sgpu_smmu_tlb_sync(&sgpu_dev, SGPU_DOM_GPU);
++	return 0;
++}
++
++static IOReturn
++sgpu_ioreturn(int err)
++{
++	switch (-err) {
++	case 0:         return kIOReturnSuccess;
++	case ENOMEM:    return kIOReturnNoMemory;
++	case EINVAL:    return kIOReturnBadArgument;
++	case ENOENT:    return kIOReturnNotFound;
++	case ETIMEDOUT: return kIOReturnTimeout;
++	case EBUSY:     return kIOReturnBusy;
++	case EAGAIN:    return kIOReturnNotReady;
++	case ENODEV:    return kIOReturnNoDevice;
++	case ENOTSUP:   return kIOReturnUnsupported;
++	case EPERM:     return kIOReturnNotPrivileged;
++	default:        return kIOReturnIOError;
++	}
++}
++
++/* ---------------------------------------------------------------- */
++
++class SweetAdreno : public IOService {
++	OSDeclareDefaultStructors(SweetAdreno);
++
++	uint32_t fStage;
++	uint32_t fDelay;
++
++	static void bringupThread(void *arg, wait_result_t wr);
++	void publishStatus();
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetAdreno, IOService);
++
++void
++SweetAdreno::publishStatus()
++{
++	setProperty("sweetgpu-stage", (unsigned long long)sgpu_dev.stage_reached, 32);
++	setProperty("sweetgpu-requested", (unsigned long long)sgpu_dev.stage_requested, 32);
++	setProperty("sweetgpu-error", (unsigned long long)(uint32_t)sgpu_dev.last_error, 32);
++	setProperty("sweetgpu-message", sgpu_dev.message[0] ? sgpu_dev.message : "ok");
++}
++
++void
++SweetAdreno::bringupThread(void *arg, __unused wait_result_t wr)
++{
++	SweetAdreno *self = (SweetAdreno *)arg;
++
++	if (self->fDelay) {
++		IOLog("SWEET GPU: bring-up in %u s\n", self->fDelay);
++		IOSleep(self->fDelay * 1000);
++	}
++	IOLockLock(sgpu_lock);
++	int err = sgpu_bringup(&sgpu_dev, self->fStage);
++	IOLockUnlock(sgpu_lock);
++	self->publishStatus();
++	if (!err && sgpu_dev.stage_reached >= SGPU_STAGE_USER) {
++		self->setProperty(kIOUserClientClassKey, "SweetAdrenoUserClient");
++		/*
++		 * Metal plugin discovery (docs/METAL.md). Metal.framework reads
++		 * these from the accelerator service and loads
++		 * /System/Library/Extensions/<MetalPluginName>.bundle, then
++		 * instantiates <MetalPluginClassName> with -initWithAcceleratorPort:.
++		 * Off unless sweetmetal=1: as soon as a Metal device exists,
++		 * QuartzCore switches from its working software renderer to Metal,
++		 * so this must stay off until SweetMetal can render the UI.
++		 */
++		uint32_t metal = 0;
++		PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal));
++		if (metal == 1) {
++			self->setProperty("MetalPluginName", "SweetMetal");
++			self->setProperty("MetalPluginClassName", "SweetMetalDevice");
++			self->setProperty("MetalStatisticsName", "SweetMetalStatistics");
++			IOLog("SWEET GPU: Metal plugin properties published (sweetmetal=1)\n");
++		}
++		self->registerService();
++		IOLog("SWEET GPU: SweetAdreno published\n");
++	} else {
++		IOLog("SWEET GPU: not published (stage %u of %u, error %d)\n",
++		    sgpu_dev.stage_reached, self->fStage, err);
++	}
++	self->release();
++	thread_terminate(current_thread());
++}
++
++bool
++SweetAdreno::start(IOService *provider)
++{
++	fStage = 0;
++	fDelay = 10;
++	PE_parse_boot_argn("sweetgpu", &fStage, sizeof(fStage));
++	PE_parse_boot_argn("sweetgpudelay", &fDelay, sizeof(fDelay));
++	uint32_t coherent = 0;
++	PE_parse_boot_argn("sweetgpu_coherent", &coherent, sizeof(coherent));
++	sgpu_dev.io_coherent = coherent == 1;
++	if (fStage == 0) {
++		return false;   /* default: no service, no register access */
++	}
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	sgpu_lock = IOLockAlloc();
++	if (sgpu_lock == NULL) {
++		return false;
++	}
++	publishStatus();
++	retain();
++	thread_t thread;
++	if (kernel_thread_start(&SweetAdreno::bringupThread, this, &thread) != KERN_SUCCESS) {
++		release();
++		return false;
++	}
++	thread_deallocate(thread);
++	return true;
++}
++
++/* ---------------------------------------------------------------- */
++
++class SweetAdrenoUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetAdrenoUserClient);
++
++	task_t            fTask;
++	struct sgpu_umem *fMem;
++	uint64_t          fCtxMask;     /* contexts owned (bit = ctx id) */
++
++	struct sgpu_umem *findMem(uint32_t id, struct sgpu_umem ***link);
++	uint32_t allocId();
++	bool ibInClientMemory(uint64_t gpuaddr, uint64_t bytes);
++	IOReturn memAlloc(struct sgpu_mem_alloc *req);
++	IOReturn importSurface(struct sgpu_import_surface *req);
++	IOReturn submit(struct sgpu_submit *req);
++	IOReturn waitTimestamp(const struct sgpu_wait_ts *req);
++	IOReturn syncCache(const struct sgpu_sync_cache *req);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetAdrenoUserClient, IOUserClient);
++
++bool
++SweetAdrenoUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	fMem = NULL;
++	fCtxMask = 0;
++	return true;
++}
++
++IOReturn
++SweetAdrenoUserClient::clientClose(void)
++{
++	IOLockLock(sgpu_lock);
++	/* Let this client's work drain (bounded), then drop everything it owns. */
++	for (uint32_t c = 0; c < SGPU_MAX_CTX; c++) {
++		if (!(fCtxMask & (1ull << c))) {
++			continue;
++		}
++		uint32_t q = sgpu_cp_queued(&sgpu_dev, c);
++		for (int i = 0; i < 1000 && !sgpu_ts_ge(sgpu_cp_retired(&sgpu_dev, c), q); i++) {
++			IOLockUnlock(sgpu_lock);
++			IOSleep(1);
++			IOLockLock(sgpu_lock);
++		}
++		sgpu_cp_ctx_free(&sgpu_dev, c);
++	}
++	fCtxMask = 0;
++	while (fMem) {
++		struct sgpu_umem *m = fMem;
++		fMem = m->next;
++		sgpu_umem_release(m);
++	}
++	IOLockUnlock(sgpu_lock);
++	terminate();
++	return kIOReturnSuccess;
++}
++
++struct sgpu_umem *
++SweetAdrenoUserClient::findMem(uint32_t id, struct sgpu_umem ***link)
++{
++	struct sgpu_umem **pp = &fMem;
++
++	for (; *pp; pp = &(*pp)->next) {
++		if ((*pp)->id == id) {
++			if (link) {
++				*link = pp;
++			}
++			return *pp;
++		}
++	}
++	return NULL;
++}
++
++bool
++SweetAdrenoUserClient::ibInClientMemory(uint64_t gpuaddr, uint64_t bytes)
++{
++	for (struct sgpu_umem *m = fMem; m; m = m->next) {
++		if (gpuaddr >= m->gpuaddr && bytes <= m->size &&
++		    gpuaddr - m->gpuaddr <= m->size - bytes) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/*
++ * Lowest free id of this client. turnip uses the id as the index of its
++ * per-device sparse BO array (tu_device_lookup_bo), so ids must stay
++ * small and get reused, like KGSL's.
++ */
++uint32_t
++SweetAdrenoUserClient::allocId()
++{
++	for (uint32_t id = 1;; id++) {
++		if (findMem(id, NULL) == NULL) {
++			return id;
++		}
++	}
++}
++
++IOReturn
++SweetAdrenoUserClient::memAlloc(struct sgpu_mem_alloc *req)
++{
++	uint64_t size = (req->size + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
++	uint64_t align = req->align_log2 ? (1ull << req->align_log2) : PAGE_SIZE;
++
++	if (size == 0 || size > (1ull << 32) || req->align_log2 > 32) {
++		return kIOReturnBadArgument;
++	}
++	if (sgpu_wired + size > SGPU_MAX_WIRED) {
++		return kIOReturnNoMemory;
++	}
++	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, size, PAGE_SIZE);
++	if (md == NULL) {
++		return kIOReturnNoMemory;
++	}
++	bzero(md->getBytesNoCopy(), size);
++	/* the client maps this write-combined: drop the dirty zero lines of
++	 * the kernel's cacheable alias so they can never be written back over
++	 * data the client or the GPU stored later */
++	sgpu_cache_clean(md->getBytesNoCopy(), (size_t)size);
++	if (md->prepare() != kIOReturnSuccess) {
++		md->release();
++		return kIOReturnNoMemory;
++	}
++	struct sgpu_umem *m = IOMallocType(struct sgpu_umem);
++	m->md = md;
++	m->prepared = true;
++	m->size = size;
++	m->flags = req->flags;
++	sgpu_wired += size;
++
++	uint32_t prot = SGPU_PROT_READ;
++	if (!(req->flags & SGPU_MEM_GPU_READONLY)) {
++		prot |= SGPU_PROT_WRITE;
++	}
++	if (req->flags & SGPU_MEM_GPU_EXEC) {
++		prot |= SGPU_PROT_EXEC;
++	}
++	if (req->flags & SGPU_MEM_CACHED) {
++		prot |= SGPU_PROT_CACHED;       /* inner-shareable WB: snooped if IO-coherent */
++	}
++	int err = sgpu_va_alloc(&sgpu_dev, false, size, align, &m->gpuaddr);
++	if (!err) {
++		err = sgpu_map_descriptor(md, m->gpuaddr, size, prot);
++		if (err) {
++			sgpu_va_free(&sgpu_dev, m->gpuaddr, size);
++		}
++	}
++	if (err) {
++		m->gpuaddr = 0;
++		sgpu_umem_destroy(m);
++		return sgpu_ioreturn(err);
++	}
++	if (!(req->flags & SGPU_MEM_NO_CPU_MAP)) {
++		IOOptionBits cache = (req->flags & SGPU_MEM_CACHED) ?
++		    kIOMapDefaultCache : kIOMapWriteCombineCache;
++		m->userMap = md->createMappingInTask(fTask, 0, kIOMapAnywhere | cache);
++		if (m->userMap == NULL) {
++			sgpu_umem_destroy(m);
++			return kIOReturnNoMemory;
++		}
++	}
++	m->id = allocId();
++	m->next = fMem;
++	fMem = m;
++
++	req->id = m->id;
++	req->gpuaddr = m->gpuaddr;
++	req->cpu_addr = m->userMap ? m->userMap->getAddress() : 0;
++	req->alloc_size = size;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetAdrenoUserClient::importSurface(struct sgpu_import_surface *req)
++{
++	SweetSurface *s = sweet_surface_copy(req->surface_id);
++	if (s == NULL || s->memory == NULL) {
++		OSSafeReleaseNULL(s);
++		return kIOReturnNotFound;
++	}
++	uint64_t size = (s->memory->getLength() + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
++	struct sgpu_umem *m = IOMallocType(struct sgpu_umem);
++	m->surface = s;
++	m->size = size;
++	m->flags = req->flags;
++	s->memory->retain();
++	m->md = s->memory;
++	m->prepared = m->md->prepare() == kIOReturnSuccess;
++	if (!m->prepared) {
++		sgpu_umem_destroy(m);
++		return kIOReturnNoMemory;
++	}
++	uint32_t prot = SGPU_PROT_READ;
++	if (!(req->flags & SGPU_MEM_GPU_READONLY)) {
++		prot |= SGPU_PROT_WRITE;
++	}
++	int err = sgpu_va_alloc(&sgpu_dev, false, size, PAGE_SIZE, &m->gpuaddr);
++	if (!err) {
++		err = sgpu_map_descriptor(m->md, m->gpuaddr, size, prot);
++		if (err) {
++			sgpu_va_free(&sgpu_dev, m->gpuaddr, size);
++		}
++	}
++	if (err) {
++		m->gpuaddr = 0;
++		sgpu_umem_destroy(m);
++		return sgpu_ioreturn(err);
++	}
++	m->id = allocId();
++	m->next = fMem;
++	fMem = m;
++	req->id = m->id;
++	req->gpuaddr = m->gpuaddr;
++	req->size = size;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetAdrenoUserClient::submit(struct sgpu_submit *req)
++{
++	if (req->ctx_id >= SGPU_MAX_CTX || !(fCtxMask & (1ull << req->ctx_id)) ||
++	    req->num_ibs > SGPU_MAX_IBS) {
++		return kIOReturnBadArgument;
++	}
++	for (uint32_t i = 0; i < req->num_ibs; i++) {
++		uint64_t bytes = (uint64_t)req->ibs[i].size_dwords * 4;
++		if (bytes == 0 || bytes > (1u << 22) || (req->ibs[i].gpuaddr & 3) ||
++		    !ibInClientMemory(req->ibs[i].gpuaddr, bytes)) {
++			return kIOReturnBadArgument;
++		}
++	}
++	int err = sgpu_cp_submit(&sgpu_dev, req->ctx_id, req->ibs, req->num_ibs,
++	    req->flags, &req->timestamp);
++	sgpu_reap_deferred();
++	return sgpu_ioreturn(err);
++}
++
++IOReturn
++SweetAdrenoUserClient::waitTimestamp(const struct sgpu_wait_ts *req)
++{
++	if (req->ctx_id >= SGPU_MAX_CTX || !(fCtxMask & (1ull << req->ctx_id))) {
++		return kIOReturnBadArgument;
++	}
++	uint64_t start = sgpu_now_us();
++	uint32_t sleep_us = 50;
++
++	for (;;) {
++		if (sgpu_ts_ge(sgpu_cp_retired(&sgpu_dev, req->ctx_id), req->timestamp)) {
++			sgpu_reap_deferred();
++			return kIOReturnSuccess;
++		}
++		if (sgpu_cp_hang_check(&sgpu_dev)) {
++			return kIOReturnIOError;
++		}
++		if (sgpu_now_us() - start >= (uint64_t)req->timeout_ms * 1000) {
++			return kIOReturnTimeout;
++		}
++		/* No GPU interrupt yet (GIC SPI 332 not wired): poll with backoff. */
++		IOLockUnlock(sgpu_lock);
++		IODelay(sleep_us < 1000 ? sleep_us : 0);
++		if (sleep_us >= 1000) {
++			IOSleep(1);
++		}
++		IOLockLock(sgpu_lock);
++		if (sleep_us < 1000) {
++			sleep_us *= 2;
++		}
++	}
++}
++
++IOReturn
++SweetAdrenoUserClient::syncCache(const struct sgpu_sync_cache *req)
++{
++	struct sgpu_umem *m = findMem(req->id, NULL);
++	if (m == NULL || req->offset > m->size) {
++		return kIOReturnBadArgument;
++	}
++	uint64_t len = req->length ? req->length : m->size - req->offset;
++	if (len > m->size - req->offset) {
++		return kIOReturnBadArgument;
++	}
++	/*
++	 * Needed for SGPU_MEM_CACHED buffers unless the GPU path is proven
++	 * IO-coherent (boot-arg sweetgpu_coherent=1 -> SGPU_INFO_IO_COHERENT);
++	 * the upstream and stock device trees disagree on that, so clients
++	 * must assume it is not.
++	 */
++	IOMemoryMap *km = m->md->map(kIOMapDefaultCache);
++	if (km == NULL) {
++		return kIOReturnNoMemory;
++	}
++	const void *va = (const void *)(km->getVirtualAddress() + req->offset);
++	if (req->op & SGPU_CACHE_CLEAN) {
++		sgpu_cache_clean(va, (size_t)len);
++	}
++	if (req->op & SGPU_CACHE_INVALIDATE) {
++		sgpu_cache_inval(va, (size_t)len);
++	}
++	km->release();
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++struct_in(IOExternalMethodArguments *a, void *buf, uint32_t len)
++{
++	if (a->structureInputDescriptor != NULL) {
++		if (a->structureInputDescriptor->getLength() != len) {
++			return kIOReturnBadArgument;
++		}
++		a->structureInputDescriptor->readBytes(0, buf, len);
++		return kIOReturnSuccess;
++	}
++	if (a->structureInput == NULL || a->structureInputSize != len) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(buf, a->structureInput, len);
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++struct_out(IOExternalMethodArguments *a, const void *buf, uint32_t len)
++{
++	if (a->structureOutputDescriptor != NULL) {
++		if (a->structureOutputDescriptor->getLength() < len) {
++			return kIOReturnNoSpace;
++		}
++		a->structureOutputDescriptor->writeBytes(0, buf, len);
++		a->structureOutputDescriptorSize = len;
++		return kIOReturnSuccess;
++	}
++	if (a->structureOutput == NULL || a->structureOutputSize < len) {
++		return kIOReturnNoSpace;
++	}
++	memcpy(a->structureOutput, buf, len);
++	a->structureOutputSize = len;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	union {
++		struct sgpu_info           info;
++		struct sgpu_ctx_create     ctx;
++		struct sgpu_ctx_destroy    ctxd;
++		struct sgpu_mem_alloc      alloc;
++		struct sgpu_mem_free       free;
++		struct sgpu_import_surface import;
++		struct sgpu_wait_ts        wait;
++		struct sgpu_read_ts        rts;
++		struct sgpu_sync_cache     sync;
++		struct sgpu_gpu_time       time;
++		struct sgpu_status         status;
++	} u;
++	struct sgpu_submit *sub = NULL;
++	IOReturn ret;
++
++	bzero(&u, sizeof(u));
++	IOLockLock(sgpu_lock);
++	switch (selector) {
++	case SGPU_SEL_GET_INFO:
++		sgpu_fill_info(&sgpu_dev, &u.info);
++		ret = struct_out(args, &u.info, sizeof(u.info));
++		break;
++	case SGPU_SEL_GET_STATUS:
++		sgpu_cp_status(&sgpu_dev, &u.status);
++		ret = struct_out(args, &u.status, sizeof(u.status));
++		break;
++	case SGPU_SEL_CTX_CREATE:
++		ret = struct_in(args, &u.ctx, sizeof(u.ctx));
++		if (ret == kIOReturnSuccess) {
++			ret = sgpu_ioreturn(sgpu_cp_ctx_alloc(&sgpu_dev, &u.ctx.ctx_id));
++		}
++		if (ret == kIOReturnSuccess) {
++			fCtxMask |= 1ull << u.ctx.ctx_id;
++			ret = struct_out(args, &u.ctx, sizeof(u.ctx));
++		}
++		break;
++	case SGPU_SEL_CTX_DESTROY:
++		ret = struct_in(args, &u.ctxd, sizeof(u.ctxd));
++		if (ret == kIOReturnSuccess) {
++			if (u.ctxd.ctx_id >= SGPU_MAX_CTX || !(fCtxMask & (1ull << u.ctxd.ctx_id))) {
++				ret = kIOReturnBadArgument;
++			} else {
++				sgpu_cp_ctx_free(&sgpu_dev, u.ctxd.ctx_id);
++				fCtxMask &= ~(1ull << u.ctxd.ctx_id);
++			}
++		}
++		break;
++	case SGPU_SEL_MEM_ALLOC:
++		ret = struct_in(args, &u.alloc, sizeof(u.alloc));
++		if (ret == kIOReturnSuccess) {
++			ret = memAlloc(&u.alloc);
++		}
++		if (ret == kIOReturnSuccess) {
++			ret = struct_out(args, &u.alloc, sizeof(u.alloc));
++		}
++		break;
++	case SGPU_SEL_MEM_FREE: {
++		struct sgpu_umem **link = NULL;
++		ret = struct_in(args, &u.free, sizeof(u.free));
++		if (ret == kIOReturnSuccess) {
++			struct sgpu_umem *m = findMem(u.free.id, &link);
++			if (m == NULL) {
++				ret = kIOReturnNotFound;
++			} else {
++				*link = m->next;
++				sgpu_umem_release(m);
++			}
++		}
++		break;
++	}
++	case SGPU_SEL_IMPORT_SURFACE:
++		ret = struct_in(args, &u.import, sizeof(u.import));
++		if (ret == kIOReturnSuccess) {
++			ret = importSurface(&u.import);
++		}
++		if (ret == kIOReturnSuccess) {
++			ret = struct_out(args, &u.import, sizeof(u.import));
++		}
++		break;
++	case SGPU_SEL_SYNC_CACHE:
++		ret = struct_in(args, &u.sync, sizeof(u.sync));
++		if (ret == kIOReturnSuccess) {
++			ret = syncCache(&u.sync);
++		}
++		break;
++	case SGPU_SEL_SUBMIT:
++		sub = IOMallocType(struct sgpu_submit);
++		ret = struct_in(args, sub, sizeof(*sub));
++		if (ret == kIOReturnSuccess) {
++			ret = submit(sub);
++		}
++		if (ret == kIOReturnSuccess) {
++			ret = struct_out(args, sub, sizeof(*sub));
++		}
++		IOFreeType(sub, struct sgpu_submit);
++		break;
++	case SGPU_SEL_WAIT_TS:
++		ret = struct_in(args, &u.wait, sizeof(u.wait));
++		if (ret == kIOReturnSuccess) {
++			ret = waitTimestamp(&u.wait);
++		}
++		break;
++	case SGPU_SEL_READ_TS:
++		ret = struct_in(args, &u.rts, sizeof(u.rts));
++		if (ret == kIOReturnSuccess) {
++			if (u.rts.ctx_id >= SGPU_MAX_CTX || !(fCtxMask & (1ull << u.rts.ctx_id))) {
++				ret = kIOReturnBadArgument;
++			} else {
++				u.rts.retired = sgpu_cp_retired(&sgpu_dev, u.rts.ctx_id);
++				u.rts.queued = sgpu_cp_queued(&sgpu_dev, u.rts.ctx_id);
++				ret = struct_out(args, &u.rts, sizeof(u.rts));
++			}
++		}
++		break;
++	case SGPU_SEL_GPU_TIME:
++		u.time.gpu_ticks = sgpu_cp_always_on(&sgpu_dev);
++		u.time.cpu_ticks = mach_absolute_time();
++		ret = struct_out(args, &u.time, sizeof(u.time));
++		break;
++	default:
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(sgpu_lock);
++	return ret;
++}
++#endif /* SWEET */
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAdrenoDMA.cpp
+@@ -0,0 +1,101 @@
++/*
++ * sweet_gpu_os_dma.cpp - physically contiguous DMA memory for the SWEET
++ * Adreno driver, built on IOBufferMemoryDescriptor.
++ *
++ * Why IOKit and not kmem_alloc_contig: the GPU, the GMU and the SMMU
++ * walker need buffers whose CPU view is Normal non-cacheable (Linux:
++ * MSM_BO_WC). IOKit is the supported way to get such a kernel mapping of
++ * RAM (createMappingInTask(kernel_task, kIOMapWriteCombineCache)); the
++ * pmap enforces consistent attributes for managed pages there, which a
++ * raw ml_io_map of RAM would bypass.
++ *
++ * Aliasing rule: the descriptor's own (cacheable) kernel mapping is
++ * zeroed, cleaned+invalidated to PoC once, and then never touched; all
++ * CPU access goes through the WC map. No dirty line can therefore be
++ * written back over data the device produced.
++ *
++ * Physical address limit: SMMU output size on MMU-500 SM8250 is at least
++ * 36 bits (read from ID2 at stage 3); RAM on apollo ends below 0x2_8000_0000,
++ * so a 36-bit mask never excludes usable memory.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOLib.h>
++
++extern "C" {
++#include "../../../bsd/dev/sweet_gpu.h"
++void flush_dcache64(addr64_t addr, unsigned count, int phys);
++}
++
++#define SGPU_DMA_PHYS_MASK      0x0000000ffffff000ULL   /* 36-bit PA */
++
++extern "C" int
++sgpu_dma_alloc(size_t size, size_t align, uint32_t flags, struct sgpu_dma *out)
++{
++	bzero(out, sizeof(*out));
++	size = round_page(size);
++	if (align < PAGE_SIZE) {
++		align = PAGE_SIZE;
++	}
++	if (align & (align - 1)) {
++		return EINVAL;
++	}
++	mach_vm_address_t mask = SGPU_DMA_PHYS_MASK & ~((mach_vm_address_t)align - 1);
++
++	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++		kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, mask);
++	if (md == NULL) {
++		return ENOMEM;
++	}
++	if (md->prepare() != kIOReturnSuccess) {
++		md->release();
++		return ENOMEM;
++	}
++	IOByteCount seglen = 0;
++	addr64_t pa = md->getPhysicalSegment(0, &seglen, kIOMemoryMapperNone);
++	if (pa == 0 || seglen < size) {
++		/* kIOMemoryPhysicallyContiguous should make this impossible */
++		md->complete();
++		md->release();
++		return EFAULT;
++	}
++	void *cva = md->getBytesNoCopy();
++	bzero(cva, size);
++	/* push the zeroes to DRAM and drop the lines (clean + invalidate) */
++	flush_dcache64((addr64_t)(uintptr_t)cva, (unsigned)size, FALSE);
++
++	out->pa = pa;
++	out->size = size;
++	out->os_md = md;
++	if (flags & SGPU_DMA_WC) {
++		IOMemoryMap *map = md->createMappingInTask(kernel_task, 0,
++		    kIOMapAnywhere | kIOMapWriteCombineCache);
++		if (map == NULL) {
++			md->complete();
++			md->release();
++			bzero(out, sizeof(*out));
++			return ENOMEM;
++		}
++		out->os_map = map;
++		out->va = (void *)map->getVirtualAddress();
++	} else {
++		out->va = cva;
++	}
++	return 0;
++}
++
++extern "C" void
++sgpu_dma_free(struct sgpu_dma *dma)
++{
++	if (dma->os_map != NULL) {
++		((IOMemoryMap *)dma->os_map)->release();
++	}
++	if (dma->os_md != NULL) {
++		IOBufferMemoryDescriptor *md = (IOBufferMemoryDescriptor *)dma->os_md;
++		md->complete();
++		md->release();
++	}
++	bzero(dma, sizeof(*dma));
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -92,6 +92,11 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = SweetAdreno;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetAdreno;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
