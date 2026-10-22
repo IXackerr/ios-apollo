@@ -1,13 +1,22 @@
-# Copy to .github/workflows/gpu-userland.yml. Builds the iOS GPU userland
-# (turnip + sweet backend, libsweetgpu, gputest, sweetmetal-core,
-# SweetMetal.bundle) on the same macOS runner type as the kernel, and runs the
-# Linux host tests first. Written for the handoff, not yet run.
+# Builds the iOS GPU userland (gpu/ci/build-ios-userland.sh: turnip with the
+# sweet backend, libsweetvk, vktest, and with parts "metal" also
+# sweetmetal-core and SweetMetal.bundle) on the same macOS runner type as the
+# kernel, after the Linux host tests.
 name: gpu-userland
 on:
   workflow_dispatch:
+    inputs:
+      parts:
+        description: "build-ios-userland.sh PARTS"
+        default: "mesa tools"
   push:
+    branches: [apollo]
     paths:
-      - "gpu/**"
+      - "gpu/mesa/**"
+      - "gpu/ci/**"
+      - "gpu/hosttest/vktest.c"
+      - "gpu/userland/sweetmetal/**"
+      - "ios/sweetrun/**"
       - ".github/workflows/gpu-userland.yml"
 jobs:
   hosttest:
@@ -30,6 +39,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build
+        env:
+          PARTS: ${{ github.event.inputs.parts || 'mesa tools' }}
         run: gpu/ci/build-ios-userland.sh
       - uses: actions/upload-artifact@v4
         with:

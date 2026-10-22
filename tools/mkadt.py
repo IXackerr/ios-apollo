@@ -7,7 +7,7 @@ address comes from the sweet live FDT. Usage:
   mkadt.py OUT.adt [--dump] [--qemu] [--highmem]                  # sweet
   mkadt.py OUT.adt --board apollo --phys-base HEX --mem-size HEX  # Mi 10T (Pro)
            [--touch-fw novatek_nt36675_j3s_fw01.bin] [--gpu-fw DIR]
-           [--run PROGRAM [--run-args "ARGS"] [--run-delay SECONDS]]
+           [--run PROGRAM [--run-args "ARGS"] [--run-delay SECONDS] [--run-lib FILE]]
 
 --gpu-fw DIR adds /sweet-gpu with the phone's own a650_sqe.fw, a650_gmu.bin
 and a650_zap (.mbn, or .mdt + .bNN which are joined like tools/mkzap.py)
@@ -18,7 +18,8 @@ ADT is a local build product.
 --run PROGRAM adds /sweet-run: ios/sweetrun, started by launchd at boot,
 runs PROGRAM (an iOS Mach-O) with ARGS after SECONDS and its output goes
 to the console. Tests reach the phone in the boot image, the root stays
-as it is.
+as it is. --run-lib FILE adds one more file for the program (property
+"lib", ios/sweetrun/sweetrun.h sweetrun_file), e.g. the Vulkan driver.
 
 For apollo the RAM window has no default on purpose: take it from the
 phone's live FDT with tools/fdtmem.py (see PORTING-APOLLO.md). The touch
@@ -338,13 +339,13 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
         extra.append(gpu_node(gpu_fw, ph))
     if run:
         # read by ios/sweetrun at boot: a program to run without changing the root
-        program, args, delay = run
+        program, args, delay, lib = run
         extra.append(node('sweet-run', [
             ph(),
             ('program', program),
             ('args', b''.join(cstr(a) for a in args)),
             ('delay', u32(delay)),
-        ]))
+        ] + ([('lib', lib)] if lib else [])))
     if b['touch']:
         extra.append(node('sweet-touch', [
             ph(),
@@ -389,7 +390,8 @@ if __name__ == '__main__':
                  gpu_fw=_opt('--gpu-fw'),
                  run=_opt('--run', lambda f: (open(f, 'rb').read(),
                                               _opt('--run-args', default='').split(),
-                                              _opt('--run-delay', int, 0))))
+                                              _opt('--run-delay', int, 0),
+                                              _opt('--run-lib', lambda f: open(f, 'rb').read()))))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

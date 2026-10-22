@@ -14,6 +14,11 @@
  * a register our CP_PROTECT table blocks.
  *
  * Build: see hosttest/Makefile target "vktest".
+ *
+ * The same file runs on the phone (built by gpu/ci/build-ios-userland.sh):
+ * there turnip talks to the real SweetAdreno, the model checks are left
+ * out, and the ICD comes with the boot image (mkadt.py --run-lib), started
+ * by ios/sweetrun.
  */
 #include <dlfcn.h>
 #include <stdio.h>
@@ -21,9 +26,13 @@
 #include <string.h>
 #include <vulkan/vulkan.h>
 
+#if defined(__APPLE__)
+#include "sweetrun.h"
+#else
 int sgpu_host_boot(int verbose, int permissive);
 int sgpu_host_model_errors(void);
 unsigned sgpu_host_cp_stats(unsigned *skipped);
+#endif
 
 static int fails;
 #define CHECK(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
@@ -33,6 +42,14 @@ static int fails;
 int
 main(int argc, char **argv)
 {
+#if defined(__APPLE__)
+	const char *icd = argc > 1 ? argv[1] :
+	    sweetrun_file("lib", "/private/var/tmp/libvulkan_freedreno.dylib");
+	if (icd == NULL) {
+		printf("FAIL: no ICD (mkadt.py --run-lib)\n");
+		return 1;
+	}
+#else
 	const char *icd = argc > 1 ? argv[1] :
 	    "libvulkan_freedreno.so";
 	int err = sgpu_host_boot(0, 1);
@@ -40,6 +57,7 @@ main(int argc, char **argv)
 		printf("FAIL: kernel bring-up %d\n", err);
 		return 1;
 	}
+#endif
 	void *lib = dlopen(icd, RTLD_NOW | RTLD_LOCAL);
 	if (!lib) {
 		printf("FAIL: dlopen: %s\n", dlerror());
@@ -207,10 +225,12 @@ out:
 		PFN_vkDestroyInstance di = (PFN_vkDestroyInstance)gipa(inst, "vkDestroyInstance");
 		di(inst, NULL);
 	}
+#if !defined(__APPLE__)
 	unsigned skipped, pk = sgpu_host_cp_stats(&skipped);
 	printf("CP executed %u packets (%u unmodelled skipped), model errors %d\n", pk, skipped,
 	    sgpu_host_model_errors());
 	EXPECT(sgpu_host_model_errors() == 0, "model errors");
+#endif
 	printf("%s\n", fails ? "VKTEST FAILED" : "VKTEST PASSED");
 	return fails ? 1 : 0;
 }

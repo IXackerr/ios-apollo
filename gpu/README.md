@@ -15,7 +15,7 @@ userland/
   sweetmetal/core/    libsweetmetal_core: C ABI over metal2vulkan (Rust, LGPL)
   sweetmetal/bundle/  SweetMetal.bundle (ObjC, skeleton) + libsweetvk
 tools/         mk-xnu-patch.sh, metal-re.sh, llvm-as-compat (mkzap.py is in the top-level tools/)
-ci/            build-ios-userland.sh, gpu-userland.yml
+ci/            build-ios-userland.sh (run by .github/workflows/gpu-userland.yml)
 docs/          GPU-DRIVER.md (kernel), METAL.md (Metal)
 ```
 
