@@ -86,6 +86,8 @@ macro_rules! release {
     };
 }
 
+mod surface;
+
 fn pixel_format(raw: u32) -> Result<PixelFormat, String> {
     PixelFormat::try_from(raw).map_err(|e| format!("MTLPixelFormat {raw}: {e:?}"))
 }

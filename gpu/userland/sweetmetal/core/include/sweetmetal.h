@@ -32,6 +32,7 @@ typedef struct smtl_queue smtl_queue;
 typedef struct smtl_cmdbuf smtl_cmdbuf;
 typedef struct smtl_buffer smtl_buffer;
 typedef struct smtl_texture smtl_texture;
+typedef struct smtl_surface_image smtl_surface_image;
 typedef struct smtl_library smtl_library;
 typedef struct smtl_function smtl_function;
 typedef struct smtl_compute_pipeline smtl_compute_pipeline;
@@ -82,6 +83,17 @@ smtl_texture *smtl_buffer_new_iosurface_texture(smtl_buffer *surface, uint32_t p
 smtl_texture *smtl_buffer_new_texture(smtl_buffer *b, uint32_t pixel_format, uint64_t width,
     uint64_t height, uint32_t usage, uint64_t offset, uint64_t bytes_per_row, int linear);
 void          smtl_texture_release(smtl_texture *t);
+
+/* newTextureWithDescriptor:iosurface:plane: with no copy: a linear image over the surface's
+ * pages (`size` bytes mapped at `pages`), its texels at offset/bytes_per_row. NULL where the
+ * format or layout has none; the caller then uses smtl_buffer_new_iosurface_texture. */
+smtl_surface_image *smtl_device_new_surface_image(smtl_device *d, void *pages, uint64_t size,
+    uint64_t offset, uint64_t bytes_per_row, uint32_t pixel_format, uint64_t width,
+    uint64_t height, uint32_t usage);
+/* a texture handle over the image, released with smtl_texture_release */
+smtl_texture *smtl_surface_image_texture(smtl_surface_image *s);
+/* only once no command buffer that used the image can still run */
+void          smtl_surface_image_release(smtl_surface_image *s);
 
 /* MTLSamplerDescriptor, raw Metal values */
 struct smtl_sampler_desc {

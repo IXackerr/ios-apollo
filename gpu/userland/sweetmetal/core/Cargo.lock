@@ -198,6 +198,7 @@ dependencies = [
 name = "sweetmetal-core"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "metal2vulkan",
  "metal2vulkan-runtime",
 ]

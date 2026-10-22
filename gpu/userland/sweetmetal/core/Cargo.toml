@@ -15,6 +15,8 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # metal2vulkan asks for Rust 1.98; 1.97 builds it with `cargo build --ignore-rust-version`.
 metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan", rev = "a2c440b8bcdcf20d34aa1694b61ae22c2a7ea68b" }
 metal2vulkan-runtime = { git = "https://github.com/steelbrain/metal2vulkan", rev = "a2c440b8bcdcf20d34aa1694b61ae22c2a7ea68b" }
+# The runtime's own Vulkan bindings, for the images made over IOSurface pages (`surface.rs`).
+ash = { version = "0.38", default-features = false, features = ["std"] }
 
 [profile.release]
 panic = "abort"

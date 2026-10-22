@@ -24,6 +24,8 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
 #import <os/log.h>
+#include <mach/mach_time.h>
+#include <os/lock.h>
 #include "sweetmetal.h"
 #include "sweetgpu.h"
 
@@ -108,6 +110,74 @@ smcount(Class c, int delta)
 }
 
 static unsigned smCompleted;
+static uint64_t smLatencySum, smLatencyMax;    /* commit to completion, mach ticks */
+
+/*
+ * Which command buffers may still run, for what outlives the textures they
+ * used: each takes a sequence number when made and is done once it
+ * completed (or was dropped uncommitted). A surface image retired at
+ * sequence n is destroyed once every buffer up to n is done.
+ */
+static os_unfair_lock smSeqLock = OS_UNFAIR_LOCK_INIT;
+static NSMutableIndexSet *smRunning;
+static uint64_t smLastSeq;
+static struct smGrave { smtl_surface_image *image; uint64_t seq; } *smGraves;
+static unsigned smGraveCount, smGraveCap;
+
+static uint64_t
+smSeqTake(void)
+{
+	os_unfair_lock_lock(&smSeqLock);
+	if (smRunning == nil) {
+		smRunning = [NSMutableIndexSet new];
+	}
+	uint64_t seq = ++smLastSeq;
+	[smRunning addIndex:(NSUInteger)seq];
+	os_unfair_lock_unlock(&smSeqLock);
+	return seq;
+}
+
+/* `seq` is done (0: none); destroys what no running buffer can use any more */
+static void
+smSeqDone(uint64_t seq)
+{
+	smtl_surface_image *dead[16];
+	unsigned n = 0;
+	do {
+		n = 0;
+		os_unfair_lock_lock(&smSeqLock);
+		if (seq != 0) {
+			[smRunning removeIndex:(NSUInteger)seq];
+			seq = 0;
+		}
+		uint64_t first = smRunning.count ? smRunning.firstIndex : UINT64_MAX;
+		for (unsigned i = 0; i < smGraveCount && n < 16; ) {
+			if (smGraves[i].seq < first) {
+				dead[n++] = smGraves[i].image;
+				smGraves[i] = smGraves[--smGraveCount];
+			} else {
+				i++;
+			}
+		}
+		os_unfair_lock_unlock(&smSeqLock);
+		for (unsigned i = 0; i < n; i++) {
+			smtl_surface_image_release(dead[i]);
+		}
+	} while (n == 16);
+}
+
+static void
+smRetire(smtl_surface_image *image)
+{
+	os_unfair_lock_lock(&smSeqLock);
+	if (smGraveCount == smGraveCap) {
+		smGraveCap = smGraveCap ? smGraveCap * 2 : 16;
+		smGraves = reallocf(smGraves, smGraveCap * sizeof(*smGraves));
+	}
+	smGraves[smGraveCount++] = (struct smGrave){ image, smLastSeq };
+	os_unfair_lock_unlock(&smSeqLock);
+	smSeqDone(0);
+}
 
 /* every 50 command buffers: how many completed, the rate, and how many of
  * each object are alive */
@@ -122,9 +192,19 @@ smstats(void)
 	uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 	double per_s = last_ns ? 50e9 / (double)(now - last_ns) : 0;
 	last_ns = now;
+	static mach_timebase_info_data_t tb;
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	unsigned done = __atomic_load_n(&smCompleted, __ATOMIC_RELAXED);
+	static unsigned done_before;
+	uint64_t sum = __atomic_exchange_n(&smLatencySum, 0, __ATOMIC_RELAXED);
+	uint64_t max = __atomic_exchange_n(&smLatencyMax, 0, __ATOMIC_RELAXED);
+	double ms = (double)tb.numer / tb.denom / 1e6;
 	NSMutableString *line = [NSMutableString stringWithFormat:
-	    @"%u commits (%.1f/s), %u completed, live:", commits, per_s,
-	    __atomic_load_n(&smCompleted, __ATOMIC_RELAXED)];
+	    @"%u commits (%.1f/s), %u completed, latency %.1f ms (max %.1f), live:", commits,
+	    per_s, done, done > done_before ? sum * ms / (done - done_before) : 0, max * ms];
+	done_before = done;
 	@synchronized ([SMBase class]) {
 		for (NSString *k in [smLive.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
 			[line appendFormat:@" %@ %@", [k stringByReplacingOccurrencesOfString:@"SweetMetal"
@@ -212,6 +292,9 @@ smstats(void)
 	IOSurfaceRef _iosurface;        /* retained, for -iosurface */
 	NSUInteger _plane;
 	SweetMetalBuffer *_backing;     /* buffer standing for the surface */
+	id _image;                      /* SweetSurfaceImage the texture lies on */
+	uint8_t *_cpu;                  /* with _image: the texels in this process */
+	NSUInteger _cpuRow, _cpuTexel;  /* their bytes per row and per texel */
 }
 @property (copy, atomic) NSString *label;
 @end
@@ -239,9 +322,39 @@ regionBytes(MTLRegion r, NSUInteger bpr, NSUInteger bpi)
 {
 	return r.size.depth > 1 ? bpi * r.size.depth : bpr * r.size.height;
 }
+/*
+ * The CPU calls of a texture over a surface image: the texels are the
+ * surface's own bytes, which the GPU reads and writes in place, so the CPU
+ * copies them there as Metal does for an IOSurface texture.
+ */
+- (BOOL)cpuCopy:(MTLRegion)r texels:(uint8_t *)texels bytesPerRow:(NSUInteger)bpr
+    toTexture:(BOOL)to
+{
+	if (r.origin.x + r.size.width > _width || r.origin.y + r.size.height > _height ||
+	    r.origin.z != 0 || r.size.depth > 1) {
+		return NO;
+	}
+	size_t row = r.size.width * _cpuTexel;
+	for (NSUInteger y = 0; y < r.size.height; y++) {
+		uint8_t *surface = _cpu + (r.origin.y + y) * _cpuRow + r.origin.x * _cpuTexel;
+		if (to) {
+			memcpy(surface, texels + y * bpr, row);
+		} else {
+			memcpy(texels + y * bpr, surface, row);
+		}
+	}
+	return YES;
+}
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice
     withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
 {
+	if (_image != nil) {
+		if (level != 0 || slice != 0 || ![self cpuCopy:r texels:(uint8_t *)bytes
+		    bytesPerRow:bpr toTexture:YES]) {
+			SMError(@"replaceRegion: (surface)");
+		}
+		return;
+	}
 	const uint64_t reg[6] = { r.origin.x, r.origin.y, r.origin.z, r.size.width, r.size.height,
 		r.size.depth };
 	if (smtl_texture_replace_region(_t, reg, level, slice, bytes, regionBytes(r, bpr, bpi), bpr,
@@ -258,6 +371,13 @@ regionBytes(MTLRegion r, NSUInteger bpr, NSUInteger bpi)
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
     fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice
 {
+	if (_image != nil) {
+		if (level != 0 || slice != 0 || ![self cpuCopy:r texels:bytes bytesPerRow:bpr
+		    toTexture:NO]) {
+			SMError(@"getBytes: (surface)");
+		}
+		return;
+	}
 	const uint64_t reg[6] = { r.origin.x, r.origin.y, r.origin.z, r.size.width, r.size.height,
 		r.size.depth };
 	if (smtl_texture_get_bytes(_t, bytes, regionBytes(r, bpr, bpi), bpr, bpi, reg, level,
@@ -489,6 +609,7 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 	id<MTLCommandQueue> _queue;
 	NSMutableArray<MTLCommandBufferHandler> *_scheduled;
 	dispatch_semaphore_t _slot;     /* the queue's in-flight slot this buffer holds */
+	uint64_t _seq;                  /* smSeqTake, until its completion takes it */
 }
 @property (copy, atomic) NSString *label;
 @end
@@ -792,28 +913,65 @@ runHandler(void *ctx)
 	}
 }
 
+/* What a buffer gives back once it completed: its queue slot and its
+ * sequence number; and its latency, for smstats. */
+struct smDone {
+	void *slot;             /* retained dispatch_semaphore_t, or NULL */
+	uint64_t seq;
+	uint64_t committed;     /* mach_absolute_time */
+	int given;              /* the slot and seq went back already */
+};
+
+static void
+smGiveBack(struct smDone *d)
+{
+	if (__atomic_exchange_n(&d->given, 1, __ATOMIC_ACQ_REL)) {
+		return;
+	}
+	if (d->slot != NULL) {
+		dispatch_semaphore_signal((__bridge_transfer dispatch_semaphore_t)d->slot);
+	}
+	smSeqDone(d->seq);
+}
+
 static void
 countCompleted(void *ctx)
 {
-	__atomic_fetch_add(&smCompleted, 1, __ATOMIC_RELAXED);
-	if (ctx != NULL) {
-		dispatch_semaphore_signal((__bridge_transfer dispatch_semaphore_t)ctx);
+	struct smDone *d = ctx;
+	uint64_t latency = mach_absolute_time() - d->committed;
+	__atomic_fetch_add(&smLatencySum, latency, __ATOMIC_RELAXED);
+	uint64_t max = __atomic_load_n(&smLatencyMax, __ATOMIC_RELAXED);
+	while (latency > max && !__atomic_compare_exchange_n(&smLatencyMax, &max, latency, false,
+	    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
 	}
+	__atomic_fetch_add(&smCompleted, 1, __ATOMIC_RELAXED);
+	smGiveBack(d);
+	free(d);
 }
 
 - (void)commit
 {
-	/* every buffer reports its completion, for smstats, and gives its
-	 * queue slot back then */
-	dispatch_semaphore_t slot = _slot;
-	if (smtl_cmdbuf_add_handler(_c, 0, countCompleted,
-	    slot ? (__bridge_retained void *)slot : NULL) == 0) {
+	/* every buffer reports its completion: smstats, its queue slot, and
+	 * what waits for it to be done (smSeqDone) */
+	struct smDone *d = calloc(1, sizeof(*d));
+	d->slot = _slot ? (__bridge_retained void *)_slot : NULL;
+	d->seq = _seq;
+	d->committed = mach_absolute_time();
+	if (smtl_cmdbuf_add_handler(_c, 0, countCompleted, d) != 0) {
+		/* nothing will call it: keep the slot and seq for -dealloc */
+		if (d->slot != NULL) {
+			CFRelease(d->slot);
+		}
+		free(d);
+		d = NULL;
+	} else {
 		_slot = nil;
+		_seq = 0;
 	}
 	if (smtl_cmdbuf_commit(_c) != 0) {
-		/* a refused commit runs no handler: the slot is free again */
-		if (slot != nil && _slot == nil) {
-			dispatch_semaphore_signal(slot);
+		/* a refused commit runs no handler (which keeps d, unused) */
+		if (d != NULL) {
+			smGiveBack(d);
 		}
 		SMError(@"commit");
 		return;
@@ -850,11 +1008,14 @@ countCompleted(void *ctx)
 }
 - (void)dealloc
 {
-	/* never committed (or its handler not taken): give the slot back here */
+	/* never committed (or its handler not taken): give back here */
 	if (_slot != nil) {
 		dispatch_semaphore_signal(_slot);
 	}
 	smtl_cmdbuf_release(_c);
+	if (_seq != 0) {
+		smSeqDone(_seq);
+	}
 }
 @end
 
@@ -899,6 +1060,7 @@ countCompleted(void *ctx)
 	cb->_c = c;
 	cb->_queue = self;
 	cb->_slot = slot ? _slots : nil;
+	cb->_seq = smSeqTake();
 	return cb;
 }
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
@@ -914,6 +1076,25 @@ countCompleted(void *ctx)
 /* The device                                                       */
 /* ---------------------------------------------------------------- */
 
+/*
+ * A surface's pages as an image of the GPU (smtl_surface_image), shared by
+ * the textures CoreAnimation makes over the surface. Retired, not
+ * destroyed, when the last of them and the device's cache let go: command
+ * buffers that used it may still run (smRetire).
+ */
+@interface SweetSurfaceImage : NSObject {
+@public
+	smtl_surface_image *_s;
+}
+@end
+
+@implementation SweetSurfaceImage
+- (void)dealloc
+{
+	smRetire(_s);
+}
+@end
+
 @interface SweetMetalDevice : _MTLDevice <MTLDevice> {
 @public
 	smtl_device *_d;
@@ -923,8 +1104,9 @@ countCompleted(void *ctx)
 	/* IOSurface imports by surface: CoreAnimation makes textures over the
 	 * same few surfaces again and again (docs in -newTextureWithDescriptor:
 	 * iosurface:plane:) */
-	NSMutableDictionary<NSString *, SweetMetalBuffer *> *_surfaces;
+	NSMutableDictionary<NSString *, id> *_surfaces;  /* SweetMetalBuffer, SweetSurfaceImage */
 	NSMutableArray<NSString *> *_surfaceOrder;
+	BOOL _noSurfaceImages;          /* SWEETMETAL_COPY_SURFACES: the copying path only */
 }
 @end
 
@@ -1038,6 +1220,7 @@ processAllowed(void)
 	}
 	_name = [NSString stringWithUTF8String:smtl_device_name(_d)];
 	sgpu_open(&_gpu);       /* for IOSurface import (IMPORT_SURFACE) */
+	_noSurfaceImages = getenv("SWEETMETAL_COPY_SURFACES") != NULL;
 	SMLOG(@"device %@ ready in %s", _name, getprogname());
 	return self;
 }
@@ -1222,6 +1405,74 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 	return tex;
 }
 
+/* The imports of the surfaces seen last, by key */
+- (void)keepSurface:(id)import key:(NSString *)key
+{
+	@synchronized (self) {
+		if (_surfaces == nil) {
+			_surfaces = [NSMutableDictionary new];
+			_surfaceOrder = [NSMutableArray new];
+		}
+		_surfaces[key] = import;
+		[_surfaceOrder addObject:key];
+		while (_surfaceOrder.count > 24) {
+			[_surfaces removeObjectForKey:_surfaceOrder[0]];
+			[_surfaceOrder removeObjectAtIndex:0];
+		}
+	}
+}
+
+/*
+ * A texture over the surface's pages with no copy (smtl_surface_image): the
+ * GPU renders into and samples the surface's bytes themselves. One image
+ * per surface and format, which every texture over it shares, so that the
+ * runtime orders their uses as those of one texture. nil where the format
+ * or layout has none.
+ */
+- (id<MTLTexture>)newSurfaceTexture:(MTLTextureDescriptor *)desc surface:(IOSurfaceRef)surface
+    base:(uint8_t *)base size:(size_t)size bytesPerRow:(size_t)bpr
+{
+	BOOL write = (desc.usage & MTLTextureUsageShaderWrite) != 0;
+	NSString *key = [NSString stringWithFormat:@"%u:%p:%zu:%lu:%lux%lu:%d",
+	    IOSurfaceGetID(surface), base, size, (unsigned long)desc.pixelFormat,
+	    (unsigned long)desc.width, (unsigned long)desc.height, write];
+	SweetSurfaceImage *image;
+	@synchronized (self) {
+		image = _surfaces[key];
+	}
+	if (image == nil) {
+		smtl_surface_image *s = smtl_device_new_surface_image(_d, base, size, 0, bpr,
+		    (uint32_t)desc.pixelFormat, desc.width, desc.height, (uint32_t)desc.usage);
+		if (s == NULL) {
+			SMLOG(@"iosurface %u (%lux%lu format %lu): copied, no image: %s",
+			    IOSurfaceGetID(surface), (unsigned long)desc.width,
+			    (unsigned long)desc.height, (unsigned long)desc.pixelFormat,
+			    smtl_last_error());
+			return nil;
+		}
+		image = [SweetSurfaceImage new];
+		image->_s = s;
+		[self keepSurface:image key:key];
+	}
+	smtl_texture *t = smtl_surface_image_texture(image->_s);
+	if (t == NULL) {
+		return nil;
+	}
+	SweetMetalTexture *tex = [SweetMetalTexture new];
+	tex->_t = t;
+	tex->_device = self;
+	tex->_format = desc.pixelFormat;
+	tex->_width = desc.width;
+	tex->_height = desc.height;
+	tex->_usage = desc.usage;
+	tex->_iosurface = (IOSurfaceRef)CFRetain(surface);
+	tex->_image = image;
+	tex->_cpu = base;
+	tex->_cpuRow = bpr;
+	tex->_cpuTexel = IOSurfaceGetBytesPerElement(surface);
+	return tex;
+}
+
 /*
  * CoreAnimation's path: render into the IOSurface of a layer. The GPU uses
  * the surface's own pages, mapped in this process: a no-copy buffer over
@@ -1247,6 +1498,13 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 	 * last (a texture keeps its own alive too) and reuse them while the
 	 * surface is still mapped at the same place.
 	 */
+	if (planes == 0 && base != NULL && !_noSurfaceImages) {
+		id<MTLTexture> tex = [self newSurfaceTexture:desc surface:surface base:base
+		    size:size bytesPerRow:bpr];
+		if (tex != nil) {
+			return tex;
+		}
+	}
 	NSString *key = [NSString stringWithFormat:@"%u:%p:%zu", IOSurfaceGetID(surface), base, size];
 	SweetMetalBuffer *backing;
 	@synchronized (self) {
@@ -1261,18 +1519,7 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 			return nil;
 		}
 		backing = wrapBuffer(self, b, 0);
-		@synchronized (self) {
-			if (_surfaces == nil) {
-				_surfaces = [NSMutableDictionary new];
-				_surfaceOrder = [NSMutableArray new];
-			}
-			_surfaces[key] = backing;
-			[_surfaceOrder addObject:key];
-			while (_surfaceOrder.count > 24) {
-				[_surfaces removeObjectForKey:_surfaceOrder[0]];
-				[_surfaceOrder removeObjectAtIndex:0];
-			}
-		}
+		[self keepSurface:backing key:key];
 	}
 	smtl_buffer *b = backing->_b;
 	smtl_texture *t = smtl_buffer_new_iosurface_texture(b, (uint32_t)desc.pixelFormat,
