@@ -1569,7 +1569,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_gmu.c
-@@ -0,0 +1,1094 @@
+@@ -0,0 +1,1120 @@
 +/*
 + * sweet_gpu_gmu.c - Adreno 650 GMU (graphics management unit) on SM8250.
 + *
@@ -1733,6 +1733,7 @@
 +	uint32_t        gmu_freq_khz[HFI_MAX_LEVELS_CX];
 +	uint32_t        cx_votes[HFI_MAX_LEVELS_CX];
 +	uint32_t        perf_index;
++	bool            ddr_votes;      /* BW table level 1 in use (sweetgpu_ddr, default on) */
 +	bool            dcvs_pinned;    /* sweetgpu_freq=N: no DCVS */
 +	uint64_t        dcvs_busy_us;   /* last time the GPU had work */
 +};
@@ -2256,13 +2257,28 @@
 +	return hfi_send(g, m, HFI_H2F_PERF_TABLE, msg, 59);
 +}
 +
++/*
++ * BCM votes for the GPU's path to DDR, sent by the GMU with each GX level
++ * (its own RSC). Level 0 votes nothing, as Linux's a650 table, which leaves
++ * the bandwidth to the kernel's interconnect votes; with none of those
++ * here, DDR stayed wherever the boot left it, and the GPU spent most of a
++ * frame waiting for memory. Level 1 asks the most of DDR (MC0) and the
++ * system cache (SH0), with the apps' clock voter (ACV) bit, as the GPU
++ * does while it has work (sgpu_dcvs_busy). Addresses from cmd-db.
++ */
++#define BCM_CMD(valid, x, y)    (0x40000000u | ((valid) ? 0x20000000u : 0) | \
++	                         ((uint32_t)(x) << 14) | (uint32_t)(y))
++#define BCM_MAX                 0x3fff
++#define ACV_APPS                0x8
++
 +static int
 +hfi_send_bw_table(struct sgpu *g, struct sgpu_gmu *m)
 +{
 +	uint32_t msg[160] = { 0 };
++	static const char *const bcm[3] = { "SH0", "MC0", "ACV" };
++	static const uint32_t fallback[3] = { 0x50000, 0x50004, 0x5007c };
 +
-+	/* Linux a650_build_bw_table: one DDR level ("off" BCM votes), CNOC on/off */
-+	msg[1] = 1;                     /* bw_level_num */
++	msg[1] = m->ddr_votes ? 2 : 1;  /* bw_level_num */
 +	msg[2] = 1;                     /* cnoc_cmds_num */
 +	msg[3] = 3;                     /* ddr_cmds_num */
 +	msg[4] = 0x01;                  /* cnoc_wait_bitmask */
@@ -2270,19 +2286,26 @@
 +	msg[6] = 0x500a4;               /* cnoc_cmds_addrs[0] */
 +	msg[12 + 0 * 6 + 0] = 0x40000000;       /* cnoc_cmds_data[0][0] */
 +	msg[12 + 1 * 6 + 0] = 0x60000001;       /* cnoc_cmds_data[1][0] */
-+	msg[24] = 0x50000;              /* ddr_cmds_addrs */
-+	msg[25] = 0x50004;
-+	msg[26] = 0x5007c;
-+	msg[32 + 0] = 0x40000000;       /* ddr_cmds_data[0][0..2] */
-+	msg[32 + 1] = 0x40000000;
-+	msg[32 + 2] = 0x40000000;
++	for (uint32_t i = 0; i < 3; i++) {
++		uint32_t addr;
++		if (sgpu_cmddb_addr(bcm[i], &addr) != 0) {
++			addr = fallback[i];
++		}
++		msg[24 + i] = addr;                     /* ddr_cmds_addrs */
++		msg[32 + i] = BCM_CMD(0, 0, 0);         /* level 0: no vote */
++		msg[40 + i] = i == 2 ? BCM_CMD(1, ACV_APPS, ACV_APPS) : BCM_CMD(1, BCM_MAX, BCM_MAX);
++	}
++	sgpu_log("gmu: DDR votes %s (SH0 %#x MC0 %#x ACV %#x)",
++	    m->ddr_votes ? "while busy" : "off (sweetgpu_ddr=0)", msg[24], msg[25], msg[26]);
 +	return hfi_send(g, m, HFI_H2F_BW_TABLE, msg, 160);
 +}
 +
 +static int
 +hfi_perf_vote(struct sgpu *g, struct sgpu_gmu *m, uint32_t index)
 +{
-+	uint32_t msg[4] = { 0, 1 /* blocking ack */, index, 0 /* bw index */ };
++	/* the busy levels vote DDR bandwidth (hfi_send_bw_table) */
++	uint32_t bw = m->ddr_votes && index > 1 ? 1 : 0;
++	uint32_t msg[4] = { 0, 1 /* blocking ack */, index, bw };
 +	return hfi_send(g, m, HFI_H2F_GX_BW_PERF_VOTE, msg, 4);
 +}
 +
@@ -2290,8 +2313,11 @@
 +hfi_start(struct sgpu *g, struct sgpu_gmu *m)
 +{
 +	uint32_t msg[2] = { 0, 0 };
++	uint32_t ddr = 1;
 +	int err;
 +
++	(void)sgpu_bootarg_u32("sweetgpu_ddr", &ddr);
++	m->ddr_votes = ddr != 0;
 +	if ((err = hfi_send_perf_table(g, m)) != 0 ||
 +	    (err = hfi_send_bw_table(g, m)) != 0) {
 +		return err;

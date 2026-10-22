@@ -885,7 +885,7 @@ hfi_process(void)
 			}
 			break;
 		case 3:
-			if (n != 160 || m[1] != 1 || m[3] != 3 || m[24] != 0x50000 || m[6] != 0x500a4) {
+			if (n != 160 || (m[1] != 1 && m[1] != 2) || m[3] != 3 || m[24] != 0x50000 || m[6] != 0x500a4) {
 				merr("BW_TABLE malformed");
 			}
 			break;
