@@ -925,6 +925,33 @@ countCompleted(void *ctx)
  * mkadt.py --metal-processes: while the driver grows, only the processes
  * named get a device; the others see no Metal and render as before.
  */
+/* mkadt.py --metal-env: K=V strings for metal2vulkan's diagnostics. */
+static void
+applyEnvironment(void)
+{
+	io_registry_entry_t node = IORegistryEntryFromPath(MACH_PORT_NULL, "IODeviceTree:/sweet-metal");
+	if (node == MACH_PORT_NULL) {
+		return;
+	}
+	CFTypeRef v = IORegistryEntryCreateCFProperty(node, CFSTR("env"), NULL, 0);
+	IOObjectRelease(node);
+	if (v == NULL || CFGetTypeID(v) != CFDataGetTypeID()) {
+		if (v != NULL) {
+			CFRelease(v);
+		}
+		return;
+	}
+	NSData *d = CFBridgingRelease(v);
+	const char *p = d.bytes, *end = p + d.length;
+	for (; p < end; p += strlen(p) + 1) {
+		const char *eq = strchr(p, '=');
+		if (eq != NULL) {
+			setenv([[NSString alloc] initWithBytes:p length:(NSUInteger)(eq - p)
+			    encoding:NSUTF8StringEncoding].UTF8String, eq + 1, 1);
+		}
+	}
+}
+
 static BOOL
 processAllowed(void)
 {
@@ -957,6 +984,7 @@ processAllowed(void)
 	if ((self = [super init]) == nil || !processAllowed()) {
 		return nil;
 	}
+	applyEnvironment();
 	_acceleratorPort = port;
 	NSString *bundle = [NSBundle bundleForClass:[self class]].bundlePath;
 	NSString *vk = [bundle stringByAppendingPathComponent:@"libsweetvk.dylib"];

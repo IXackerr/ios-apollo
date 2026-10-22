@@ -8,7 +8,8 @@ address comes from the sweet live FDT. Usage:
   mkadt.py OUT.adt --board apollo --phys-base HEX --mem-size HEX  # Mi 10T (Pro)
            [--touch-fw novatek_nt36675_j3s_fw01.bin] [--gpu-fw DIR]
            [--run PROGRAM [--run-args "ARGS"] [--run-delay SECONDS] [--run-file NAME=FILE]...]
-           [--metal-file NAME=FILE]... [--metal-processes A,B] [--display-gamut sRGB|P3]
+           [--metal-file NAME=FILE]... [--metal-processes A,B] [--metal-env K=V,...]
+           [--display-gamut sRGB|P3]
 
 --gpu-fw DIR adds /sweet-gpu with the phone's own a650_sqe.fw, a650_gmu.bin
 and a650_zap (.mbn, or .mdt + .bNN which are joined like tools/mkzap.py)
@@ -27,7 +28,9 @@ Vulkan driver.
 --metal-file NAME=FILE (repeatable) adds /sweet-metal: the Metal driver
 the SweetMetal loader on the root unpacks (gpu/userland/sweetmetal/loader),
 the same encoding plus an "id" that changes with the files; with
---metal-processes only the processes named get a Metal device from it.
+--metal-processes only the processes named get a Metal device from it, and
+--metal-env K=V,... sets environment variables (metal2vulkan's diagnostics)
+before the driver makes its device.
 
 --display-gamut overrides /product artwork-display-gamut (D22AP: P3).
 
@@ -191,7 +194,7 @@ def gpu_node(fwdir, ph):
 
 def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, mem_size=None,
           touch_fw=None, gpu_fw=None, run=None, metal=None, display_gamut=None,
-          metal_processes=None):
+          metal_processes=None, metal_env=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     b = BOARDS[board]
     if phys_base is None or mem_size is None:
@@ -379,6 +382,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
         # unpacked once per boot image into /private/var/sweetmetal/<id>
         digest = hashlib.sha256(b''.join(n.encode() + d for n, d in metal)).hexdigest()[:16]
         procs = [('processes', b''.join(cstr(p) for p in metal_processes))] if metal_processes else []
+        procs += [('env', b''.join(cstr(e) for e in metal_env))] if metal_env else []
         extra.append(node('sweet-metal', [ph(), ('id', cstr(digest))] + procs + file_props(metal)))
     if b['touch']:
         extra.append(node('sweet-touch', [
@@ -445,7 +449,8 @@ if __name__ == '__main__':
                                               run_files())),
                  metal=run_files('--metal-file'),
                  display_gamut=_opt('--display-gamut'),
-                 metal_processes=_opt('--metal-processes', lambda v: v.split(',')))
+                 metal_processes=_opt('--metal-processes', lambda v: v.split(',')),
+                 metal_env=_opt('--metal-env', lambda v: v.split(',')))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

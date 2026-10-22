@@ -75,7 +75,24 @@ struct sgpu_umem {
 	IOMemoryMap              *userMap;      /* in the owning task, may be NULL */
 	SweetSurface             *surface;      /* retained for imports */
 	bool                      prepared;
+	uint8_t                   kind;         /* SGPU_KIND_* */
 };
+
+/* Live buffers by kind and size, for the periodic log (what clients keep). */
+enum { SGPU_KIND_ALLOC, SGPU_KIND_USER, SGPU_KIND_SURFACE, SGPU_KINDS };
+static const uint64_t sgpu_size_limit[] = { 64 << 10, 1 << 20, 8 << 20, 64 << 20, ~0ull };
+#define SGPU_SIZES (sizeof(sgpu_size_limit) / sizeof(sgpu_size_limit[0]))
+static uint32_t sgpu_by_size[SGPU_KINDS][SGPU_SIZES];
+
+static void
+sgpu_track(const struct sgpu_umem *m, int delta)
+{
+	unsigned b = 0;
+	while (m->size >= sgpu_size_limit[b]) {
+		b++;
+	}
+	sgpu_by_size[m->kind][b] += delta;
+}
 
 /* Freed buffers wait here until the GPU is past them. */
 struct sgpu_deferred {
@@ -104,6 +121,7 @@ sgpu_umem_destroy(struct sgpu_umem *m)
 	} else {
 		sgpu_wired -= m->size;
 	}
+	sgpu_track(m, -1);
 	sgpu_buffers--;
 	IOFreeType(m, struct sgpu_umem);
 }
@@ -275,6 +293,13 @@ SweetAdreno::bringupThread(void *arg, __unused wait_result_t wr)
 				last_wired = sgpu_wired;
 				IOLog("SWEET GPU: %llu MiB in %u buffers wired\n", sgpu_wired >> 20,
 				    sgpu_buffers);
+				/* <64K <1M <8M <64M >=64M, per kind */
+				for (unsigned k = 0; k < SGPU_KINDS; k++) {
+					const uint32_t *n = sgpu_by_size[k];
+					IOLog("SWEET GPU:   %s %u %u %u %u %u\n",
+					    k == SGPU_KIND_ALLOC ? "alloc  " : k == SGPU_KIND_USER ?
+					    "user   " : "surface", n[0], n[1], n[2], n[3], n[4]);
+				}
 			}
 			IOLockUnlock(sgpu_lock);
 		}
@@ -459,6 +484,8 @@ SweetAdrenoUserClient::memAlloc(struct sgpu_mem_alloc *req)
 	m->prepared = true;
 	m->size = size;
 	m->flags = req->flags;
+	m->kind = SGPU_KIND_ALLOC;
+	sgpu_track(m, 1);
 	sgpu_wired += size;
 
 	uint32_t prot = SGPU_PROT_READ;
@@ -536,6 +563,8 @@ SweetAdrenoUserClient::importUser(struct sgpu_import_user *req)
 	m->md = md;
 	m->size = req->size;
 	m->flags = req->flags;
+	m->kind = SGPU_KIND_USER;
+	sgpu_track(m, 1);
 	sgpu_wired += req->size;        /* given back by sgpu_umem_destroy */
 	m->prepared = md->prepare() == kIOReturnSuccess;     /* wires the pages */
 	if (!m->prepared) {
@@ -584,6 +613,8 @@ SweetAdrenoUserClient::importSurface(struct sgpu_import_surface *req)
 	m->surface = s;
 	m->size = size;
 	m->flags = req->flags;
+	m->kind = SGPU_KIND_SURFACE;
+	sgpu_track(m, 1);
 	s->memory->retain();
 	m->md = s->memory;
 	m->prepared = m->md->prepare() == kIOReturnSuccess;
