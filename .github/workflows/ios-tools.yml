@@ -1,7 +1,7 @@
 # Small iOS programs for the phone: ios/sweetrun (runs a program handed
 # over in the boot image) and the GPU user-space tests (gpu/userland/gputest,
-# gpu/hosttest/vktest.c, gpu/userland/vkcompute; turnip itself comes from
-# gpu-userland).
+# gpu/hosttest/vktest.c, gpu/userland/vkcompute, vkdraw; turnip itself comes
+# from gpu-userland).
 name: ios-tools
 on:
   workflow_dispatch:
@@ -14,6 +14,7 @@ on:
       - "gpu/kernel/sweet_gpu_uapi.h"
       - "gpu/hosttest/vktest.c"
       - "gpu/userland/vkcompute/**"
+      - "gpu/userland/vkdraw/**"
       - ".github/workflows/ios-tools.yml"
 jobs:
   build:
@@ -38,6 +39,11 @@ jobs:
           glslangValidator -V --vn square_spv gpu/userland/vkcompute/square.comp -o gen/square_spv.h
           $CC -I"$(brew --prefix vulkan-headers)/include" -Iios/sweetrun -Igen -o out/vkcompute \
             gpu/userland/vkcompute/vkcompute.c ios/sweetrun/sweetlog.c -framework IOKit -framework CoreFoundation
+          for s in vert frag; do
+            glslangValidator -V --vn tri_${s}_spv gpu/userland/vkdraw/tri.$s -o gen/tri_${s}_spv.h
+          done
+          $CC -I"$(brew --prefix vulkan-headers)/include" -Iios/sweetrun -Igen -o out/vkdraw \
+            gpu/userland/vkdraw/vkdraw.c ios/sweetrun/sweetlog.c -framework IOKit -framework CoreFoundation
           for f in out/*; do codesign -f -s - "$f"; done
           file out/*
       - uses: actions/upload-artifact@v4
