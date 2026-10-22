@@ -104,6 +104,9 @@ BOARDS = {
         # their lowest level; without the vendor thermal (LMh) setup the big
         # cores stay well below their 2419 / 2841 MHz maximum.
         cpufreq=[(0x18591000, 1804), (0x18592000, 2000), (0x18593000, 2000)],
+        # SDE INTF_1, the DSI panel's timing engine (mdss_mdp@ae00000,
+        # qcom,sde-intf-off 0x6b800): the framebuffer follows its scanout
+        intf=(0x0ae6b800, 0x800),
     ),
 }
 
@@ -309,7 +312,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
-        ])])
+        ] + ([('intf-reg', u64(*b['intf']))] if 'intf' in b else []))])
 
     fbcon = node('sweet-fbcon', [
         ph(),

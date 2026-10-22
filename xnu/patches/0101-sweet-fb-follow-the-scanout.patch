@@ -1,0 +1,174 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -53,6 +53,22 @@
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/*
++ * The display interface's timing engine (a Qualcomm SDE INTF in video mode,
++ * /arm-io/disp0 "intf-reg"): its line counter tells which line the panel
++ * is fetching from memory.
++ */
++#define INTF_TIMING_ENGINE_EN           0x000
++#define INTF_HSYNC_CTL                  0x008   /* period in pixels << 16 | pulse */
++#define INTF_VSYNC_PERIOD_F0            0x00c   /* in pixels */
++#define INTF_DISPLAY_V_START_F0         0x01c
++#define INTF_DISPLAY_V_END_F0           0x024
++#define INTF_FRAME_LINE_COUNT_EN        0x0a8
++#define INTF_FRAME_COUNT                0x0ac
++#define INTF_LINE_COUNT                 0x0b0
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -100,6 +116,9 @@
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	void scanoutSetup(IOService *provider);
++	void scanoutWaitBlanking();
++	uint32_t nextTickUS();
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -120,6 +139,10 @@
+ 	bool          fGpuSnoops;     /* the GPU's writes reach the CPU caches */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	volatile uint32_t *fIntf;     /* timing engine registers, NULL: plain 60 Hz timer */
++	uint32_t      fLines;         /* lines per frame, blanking included */
++	uint32_t      fActiveStart, fActiveEnd;     /* the visible lines */
++	uint32_t      fLineNS;        /* time per line */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -210,7 +233,8 @@
+ 	PE_parse_boot_argn("sweetgpu_coherent", &coherent, sizeof(coherent));
+ 	fGpuSnoops = coherent == 1;
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	scanoutSetup(provider);
++	fVsync->setTimeoutUS(nextTickUS());
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -221,10 +245,99 @@
+ 	return true;
+ }
+ 
++/*
++ * The panel scans the frame out of memory continuously (video mode): a
++ * copy into it while it is fetched shows half of one frame over half of
++ * another. So the vsync tick follows the panel's own: it fires as the
++ * visible lines end, and the copy starts in the blanking that follows.
++ * It writes rows several times faster than the panel fetches them, so it
++ * stays ahead of the fetch all the way down.
++ */
++void
++AppleCLCD::scanoutSetup(IOService *provider)
++{
++	OSData *reg = OSDynamicCast(OSData, provider->getProperty("intf-reg"));
++	if (reg == NULL || reg->getLength() < 16) {
++		return;
++	}
++	const uint64_t *r = (const uint64_t *)reg->getBytesNoCopy();
++	uint64_t page = r[0] & ~(uint64_t)PAGE_MASK;
++	vm_offset_t map = ml_io_map((vm_offset_t)page, (vm_size_t)round_page(r[0] + r[1] - page));
++	if (map == 0) {
++		return;
++	}
++	volatile uint32_t *intf = (volatile uint32_t *)(map + (r[0] - page));
++	uint32_t hperiod = intf[INTF_HSYNC_CTL / 4] >> 16;
++	uint32_t enabled = intf[INTF_TIMING_ENGINE_EN / 4] & 1;
++	if (intf[INTF_FRAME_LINE_COUNT_EN / 4] != 3) {
++		intf[INTF_FRAME_LINE_COUNT_EN / 4] = 3;
++	}
++	uint32_t lines = hperiod ? intf[INTF_VSYNC_PERIOD_F0 / 4] / hperiod : 0;
++	uint32_t vstart = hperiod ? intf[INTF_DISPLAY_V_START_F0 / 4] / hperiod : 0;
++	uint32_t vend = hperiod ? intf[INTF_DISPLAY_V_END_F0 / 4] / hperiod : 0;
++	uint32_t f0 = intf[INTF_FRAME_COUNT / 4];
++	uint64_t t0 = mach_absolute_time();
++	IOSleep(500);
++	uint32_t f1 = intf[INTF_FRAME_COUNT / 4];
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	uint32_t l0 = intf[INTF_LINE_COUNT / 4];
++	IODelay(200);
++	uint32_t l1 = intf[INTF_LINE_COUNT / 4];
++	uint32_t frames = f1 - f0;
++	IOLog("SWEET FB: scanout: engine %u, %u lines (visible %u-%u), %u frames in %llu ms, "
++	    "line %u then %u\n", enabled, lines, vstart, vend, frames, ns / 1000000, l0, l1);
++	if (!enabled || frames < 10 || vend <= vstart || lines <= vend || l0 == l1 ||
++	    l0 >= lines || l1 >= lines) {
++		IOLog("SWEET FB: scanout not followed: plain 60 Hz ticks\n");
++		return;
++	}
++	fLines = lines;
++	fActiveStart = vstart;
++	fActiveEnd = vend;
++	fLineNS = (uint32_t)(ns / frames / lines);
++	fIntf = intf;
++	IOLog("SWEET FB: following the scanout, %llu Hz\n", (uint64_t)frames * 1000000000ull / ns);
++}
++
++/* Spin (2 ms at most) until the panel fetches no visible line. */
++void
++AppleCLCD::scanoutWaitBlanking()
++{
++	if (fIntf == NULL) {
++		return;
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(2, NSEC_PER_MSEC, &deadline);
++	for (;;) {
++		uint32_t line = fIntf[INTF_LINE_COUNT / 4];
++		if (line > fActiveEnd || line < fActiveStart || mach_absolute_time() > deadline) {
++			return;
++		}
++	}
++}
++
++/* Microseconds to the next tick: the end of the visible lines, a little early. */
++uint32_t
++AppleCLCD::nextTickUS()
++{
++	if (fIntf == NULL) {
++		return SWEET_FB_VSYNC_US;
++	}
++	uint32_t line = fIntf[INTF_LINE_COUNT / 4];
++	uint32_t to = (fActiveEnd + 1 + fLines - line % fLines) % fLines;
++	if (to == 0) {
++		to = fLines;    /* at the tick's own line: the next frame's */
++	}
++	uint64_t us = (uint64_t)to * fLineNS / 1000;
++	return us > 300 ? (uint32_t)(us - 300) : 1;
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
++	fb->scanoutWaitBlanking();
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	uint64_t values[6] = {
+@@ -267,7 +380,7 @@
+ 			}
+ 			IOLockUnlock(fb->fLock);
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		sender->setTimeoutUS(fb->nextTickUS());
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -289,7 +402,7 @@
+ 		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	sender->setTimeoutUS(fb->nextTickUS());
+ }
+ 
+ void
