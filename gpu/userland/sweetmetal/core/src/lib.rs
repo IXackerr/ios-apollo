@@ -135,6 +135,44 @@ pub unsafe extern "C" fn smtl_device_create(
 }
 release!(smtl_device_release, SmtlDevice);
 
+/// What the runtime did since the last call, per `per` command buffers: every counter of its
+/// `WorkCounts` that moved, as `name=value` (value divided by `per`), for smstats. The string
+/// lives until the thread's next call.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_device_work_counts(d: *const SmtlDevice, per: u64) -> *const c_char {
+    thread_local! {
+        static OUT: RefCell<CString> = RefCell::new(CString::default());
+    }
+    static LAST: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+    let Some(d) = d.as_ref() else {
+        return std::ptr::null();
+    };
+    // The counters are plain u64 fields: read them off their Debug form.
+    let text = format!("{:?}", d.device.work_counts());
+    let now: Vec<(String, u64)> = text
+        .split(['{', '}', ','])
+        .filter_map(|f| {
+            let (k, v) = f.split_once(':')?;
+            Some((k.trim().to_owned(), v.trim().parse().ok()?))
+        })
+        .collect();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let mut line = String::new();
+    for (k, v) in &now {
+        let before = last.iter().find(|(lk, _)| lk == k).map_or(0, |(_, lv)| *lv);
+        if *v > before {
+            let delta = (*v - before) as f64 / per.max(1) as f64;
+            line.push_str(&format!(" {k}={delta:.1}"));
+        }
+    }
+    *last = now;
+    let line = CString::new(line).unwrap_or_default();
+    OUT.with(|o| {
+        *o.borrow_mut() = line;
+        o.borrow().as_ptr()
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn smtl_device_name(d: *const SmtlDevice) -> *const c_char {
     d.as_ref().map_or(std::ptr::null(), |d| d.name.as_ptr())

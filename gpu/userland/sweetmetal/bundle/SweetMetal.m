@@ -118,6 +118,7 @@ smcount(Class c, int delta)
 
 static unsigned smCompleted;
 static sgpu_dev *smGpu;         /* the device's kernel client, for SURFACE_BUSY */
+static smtl_device *smDev;      /* for smstats' work counts */
 static uint64_t smLatencySum, smLatencyMax;    /* commit to completion, mach ticks */
 static uint64_t smGpuSum, smGpuMax, smGpuCount; /* GPUEndTime - GPUStartTime, ns */
 
@@ -226,6 +227,10 @@ smstats(void)
 		}
 	}
 	fprintf(stderr, "SweetMetal: %s\n", line.UTF8String);
+	const char *work = smDev ? smtl_device_work_counts(smDev, 50) : NULL;
+	if (work != NULL && *work) {
+		fprintf(stderr, "SweetMetal: per command buffer:%s\n", work);
+	}
 }
 
 @implementation SMBase
@@ -1377,6 +1382,7 @@ processAllowed(void)
 	sgpu_open(&_gpu);       /* for IOSurface import and SURFACE_BUSY */
 	if (smGpu == NULL) {
 		smGpu = _gpu;
+		smDev = _d;
 	}
 	_noSurfaceImages = getenv("SWEETMETAL_COPY_SURFACES") != NULL;
 	SMLOG(@"device %@ ready in %s", _name, getprogname());

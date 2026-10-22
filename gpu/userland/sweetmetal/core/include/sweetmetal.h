@@ -57,6 +57,8 @@ smtl_device *smtl_device_create(const char *vulkan_library, const char *shader_c
 void         smtl_device_release(smtl_device *d);
 const char  *smtl_device_name(const smtl_device *d);       /* owned by d */
 uint64_t     smtl_device_registry_id(const smtl_device *d);
+/* the runtime's work counters that moved since the last call, per `per` command buffers */
+const char  *smtl_device_work_counts(const smtl_device *d, uint64_t per);
 
 /* ---- buffers (MTLResourceOptions raw value; 0 = shared) ---- */
 smtl_buffer *smtl_device_new_buffer(smtl_device *d, uint64_t length, uint64_t options);
