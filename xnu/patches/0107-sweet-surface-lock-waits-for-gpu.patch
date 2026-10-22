@@ -1,0 +1,35 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -66,6 +66,7 @@
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
++#define kIOSurfaceLockAvoidSync         0x2
+ 
+ static IOLock       *sweet_surface_lock;
+ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+@@ -874,13 +875,23 @@
+ }
+ 
+ IOReturn
+-IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
++IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+ 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	/*
++	 * Lock for the CPU once the GPU is done writing the surface, as on
++	 * Apple's GPUs: a client may render into a surface and hand it over as
++	 * soon as the work is submitted. 100 ms at most.
++	 */
++	if (!((uintptr_t)options & kIOSurfaceLockAvoidSync)) {
++		for (int i = 0; i < 100 && s->gpuWrites != 0; i++) {
++			IOSleep(1);
++		}
++	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;

@@ -1144,8 +1144,25 @@ countCompleted(void *ctx)
 }
 - (void)enqueue { }
 - (NSError *)error { return nil; }
-- (void)commitAndWaitUntilSubmitted { [self commit]; }
-- (void)waitUntilScheduled { }
+/*
+ * QuartzCore renders a snapshot (CARenderServerRenderDisplay) and replies
+ * as soon as these return, and the requester reads the surface on the CPU
+ * at once: on Apple's GPUs the surface's lock waits for the GPU's writes.
+ * Here they return once the GPU is done. The method returns a BOOL, which
+ * QuartzCore tests (MetalContext::flush).
+ */
+- (BOOL)commitAndWaitUntilSubmitted
+{
+	[self commit];
+	smtl_cmdbuf_wait(_c, UINT32_MAX);
+	return YES;
+}
+- (void)waitUntilScheduled
+{
+	if (smtl_cmdbuf_status(_c) >= 2) {      /* committed */
+		smtl_cmdbuf_wait(_c, UINT32_MAX);
+	}
+}
 - (void)addScheduledHandler:(MTLCommandBufferHandler)h
 {
 	/* scheduled at commit: call it then (and at once when already committed) */
