@@ -587,9 +587,19 @@ program_cb(struct sgpu *g, struct smmu_dom *d)
 
 	uint32_t actlr = sgpu_rd(c, CB_ACTLR), sctlr = sgpu_rd(c, CB_SCTLR);
 	uint64_t ttbr0 = sgpu_rd64(c, CB_TTBR0);
-	if (sctlr != SCTLR_VALUE || ttbr0 != (d->root_pa | ((uint64_t)d->asid << 48))) {
+	/*
+	 * The Qualcomm hypervisor keeps ASIDPNE clear in HLOS context banks
+	 * (one ASID namespace, as the stock DT's qcom,no-dynamic-asid says).
+	 * Each domain has its own ASID, so a shared namespace is harmless.
+	 */
+	if ((sctlr | SCTLR_ASIDPNE) != SCTLR_VALUE ||
+	    ttbr0 != (d->root_pa | ((uint64_t)d->asid << 48))) {
 		return sgpu_fail(g, -5, "smmu: CB%d did not take SCTLR %#x/TTBR0 %#llx",
 		           d->cb, sctlr, (unsigned long long)ttbr0);
+	}
+	if (!(sctlr & SCTLR_ASIDPNE)) {
+		sgpu_log("smmu: CB%d SCTLR reads %#x: ASIDPNE kept clear by the hypervisor",
+		    d->cb, sctlr);
 	}
 	if (actlr != ACTLR_PREFETCH) {
 		sgpu_log("smmu: CB%d ACTLR reads %#x (sACR.CACHE_LOCK set by secure world; "
