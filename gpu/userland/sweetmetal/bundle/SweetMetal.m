@@ -817,6 +817,11 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 	sgpu_dev *_gpu;
 	mach_port_t _acceleratorPort;
 	NSString *_name;
+	/* IOSurface imports by surface: CoreAnimation makes textures over the
+	 * same few surfaces again and again (docs in -newTextureWithDescriptor:
+	 * iosurface:plane:) */
+	NSMutableDictionary<NSString *, SweetMetalBuffer *> *_surfaces;
+	NSMutableArray<NSString *> *_surfaceOrder;
 }
 @end
 
@@ -1104,14 +1109,40 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 	uint64_t offset = planes ? (uint64_t)((uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface, plane) -
 	    base) : 0;
 	IOSurfaceUnlock(surface, 0, NULL);
-	smtl_buffer *b = base ? smtl_device_new_buffer_no_copy(_d, base, size, 0) : NULL;
-	if (b == NULL) {
-		SMError([NSString stringWithFormat:@"iosurface %u (%zux%zu, %zu bytes at %p)",
-		    IOSurfaceGetID(surface), IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
-		    size, base]);
-		return nil;
+	/*
+	 * Importing a surface wires and maps all its pages, which costs more
+	 * than a frame for a framebuffer: keep the imports of the surfaces seen
+	 * last (a texture keeps its own alive too) and reuse them while the
+	 * surface is still mapped at the same place.
+	 */
+	NSString *key = [NSString stringWithFormat:@"%u:%p:%zu", IOSurfaceGetID(surface), base, size];
+	SweetMetalBuffer *backing;
+	@synchronized (self) {
+		backing = _surfaces[key];
 	}
-	SweetMetalBuffer *backing = wrapBuffer(self, b, 0);
+	if (backing == nil) {
+		smtl_buffer *b = base ? smtl_device_new_buffer_no_copy(_d, base, size, 0) : NULL;
+		if (b == NULL) {
+			SMError([NSString stringWithFormat:@"iosurface %u (%zux%zu, %zu bytes at %p)",
+			    IOSurfaceGetID(surface), IOSurfaceGetWidth(surface),
+			    IOSurfaceGetHeight(surface), size, base]);
+			return nil;
+		}
+		backing = wrapBuffer(self, b, 0);
+		@synchronized (self) {
+			if (_surfaces == nil) {
+				_surfaces = [NSMutableDictionary new];
+				_surfaceOrder = [NSMutableArray new];
+			}
+			_surfaces[key] = backing;
+			[_surfaceOrder addObject:key];
+			while (_surfaceOrder.count > 24) {
+				[_surfaces removeObjectForKey:_surfaceOrder[0]];
+				[_surfaceOrder removeObjectAtIndex:0];
+			}
+		}
+	}
+	smtl_buffer *b = backing->_b;
 	smtl_texture *t = smtl_buffer_new_iosurface_texture(b, (uint32_t)desc.pixelFormat,
 	    desc.width, desc.height, (uint32_t)desc.usage, offset, bpr, planes > 0);
 	if (t == NULL) {
