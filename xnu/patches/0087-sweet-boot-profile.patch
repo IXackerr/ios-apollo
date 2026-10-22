@@ -1,0 +1,79 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -112,6 +112,9 @@
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
++	/* boot profile: commands, blocks moved and device time, per direction */
++	uint64_t ncmd[2], nblk[2], busy[2], next_report;
++	unsigned reports;
+ } su;
+ 
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+@@ -142,6 +145,33 @@
+ }
+ 
+ /*
++ * Every 10 s for the first five minutes: what the device did so far. The
++ * "busy" times are doorbell-to-completion, the part a faster host driver
++ * (queueing, interrupts) cannot remove.
++ */
++static void
++ufs_profile(bool write, uint32_t len, uint64_t elapsed)
++{
++	uint64_t now = mach_absolute_time(), ns, busy_r, busy_w, step;
++
++	su.ncmd[write]++;
++	su.nblk[write] += len / UFS_BLOCK;
++	su.busy[write] += elapsed;
++	if (su.reports >= 30 || now < su.next_report) {
++		return;
++	}
++	nanoseconds_to_absolutetime(10 * NSEC_PER_SEC, &step);
++	su.next_report = now + step;
++	su.reports++;
++	absolutetime_to_nanoseconds(now, &ns);
++	absolutetime_to_nanoseconds(su.busy[0], &busy_r);
++	absolutetime_to_nanoseconds(su.busy[1], &busy_w);
++	printf("SWEET UFS: %llus read %llu cmds %llu MiB %llu ms, write %llu cmds %llu MiB %llu ms\n",
++	    ns / NSEC_PER_SEC, su.ncmd[0], su.nblk[0] * UFS_BLOCK >> 20, busy_r / NSEC_PER_MSEC,
++	    su.ncmd[1], su.nblk[1] * UFS_BLOCK >> 20, busy_w / NSEC_PER_MSEC);
++}
++
++/*
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+  */
+@@ -204,6 +234,7 @@
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 
++	uint64_t started = mach_absolute_time();
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+@@ -236,6 +267,7 @@
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
++	ufs_profile(write, len, mach_absolute_time() - started);
+ 
+ 	dma_sync(DMA_UTRL, sizeof(*utrd));
+ 	if (su.cache) {
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7412,8 +7412,12 @@
+ 				goto done;
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-			/* SWEET runs every iOS binary this way: one short line per exec. */
+-			printf("exec %s\n", p->p_name);
++			/* SWEET runs every iOS binary this way: one short line per exec,
++			 * with the time since boot for profiling. */
++			uint64_t exec_ns;
++			absolutetime_to_nanoseconds(mach_absolute_time(), &exec_ns);
++			printf("exec %s %llu.%03llus\n", p->p_name, exec_ns / NSEC_PER_SEC,
++			    (exec_ns / NSEC_PER_MSEC) % 1000);
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "

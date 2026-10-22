@@ -12,6 +12,7 @@
 #include "loader.h"
 #include "ufs.h"
 #include "touch.h"
+#include "cpufreq.h"
 #include "board.h"
 
 #define GICR_SIZE		0x100000UL
@@ -550,6 +551,15 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 
+#if defined(CPUFREQ_PROBE)
+	stage = "cpufreq";
+	con_str("BOARD", BOARD_NAME);
+	con_skip();
+	test_cpufreq();
+	con_str("CPUFREQ", "done, reset in ~2 min");
+	delay_ms(120000);
+	reset(20);
+#endif
 #if defined(TOUCH_PROBE)
 	stage = "touch";
 	con_str("BOARD", BOARD_NAME);
