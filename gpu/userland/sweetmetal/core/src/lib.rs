@@ -12,9 +12,9 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use metal2vulkan::bind::SamplerDescriptor;
 use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
-use metal2vulkan::bind::SamplerDescriptor;
 use metal2vulkan::metal::{
     CompareFunction, CullMode, IndexType, PixelFormat, PrimitiveType, StencilOperation,
     TextureUsage, TriangleFillMode, Winding,
@@ -26,10 +26,10 @@ use metal2vulkan::pipeline::{
 use metal2vulkan_runtime::{
     BlitCommandEncoder, BlitOption, Buffer, ClearColor, CommandBuffer, CommandBufferStatus,
     CommandQueue, ComputeCommandEncoder, ComputePipelineState, DepthStencilState, Device,
-    DeviceOptions, Function,
-    HostMemory, IoSurfacePlane, Library, Region, SamplerState, ScissorRect, Viewport, LoadAction, Origin, PipelineOptions, RenderCommandEncoder,
-    RenderPassDescriptor, RenderPipelineState, ResourceOptions, Size, StoreAction, Texture,
-    TextureDescriptor,
+    DeviceOptions, Function, HostMemory, IoSurfacePlane, Library, LoadAction, Origin,
+    PipelineOptions, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState,
+    ResourceOptions, SamplerState, ScissorRect, Size, StoreAction, Texture, TextureDescriptor,
+    Viewport,
 };
 
 thread_local! {
@@ -111,12 +111,16 @@ pub unsafe extern "C" fn smtl_device_create(
     let mut options = DeviceOptions::default();
     if !vulkan_library.is_null() {
         options.loader = Some(PathBuf::from(
-            CStr::from_ptr(vulkan_library).to_string_lossy().into_owned(),
+            CStr::from_ptr(vulkan_library)
+                .to_string_lossy()
+                .into_owned(),
         ));
     }
     if !shader_cache_dir.is_null() {
         options.shader_cache.directory = Some(PathBuf::from(
-            CStr::from_ptr(shader_cache_dir).to_string_lossy().into_owned(),
+            CStr::from_ptr(shader_cache_dir)
+                .to_string_lossy()
+                .into_owned(),
         ));
     }
     boxed(
@@ -255,8 +259,15 @@ pub unsafe extern "C" fn smtl_device_new_texture_2d(
     let d = handle!(d, std::ptr::null_mut());
     boxed(
         "newTextureWithDescriptor:",
-        texture_descriptor(pixel_format_raw, width, height, mipmapped != 0, usage, resource_options_raw)
-            .and_then(|desc| d.device.new_texture(&desc).map_err(|e| format!("{e:?}"))),
+        texture_descriptor(
+            pixel_format_raw,
+            width,
+            height,
+            mipmapped != 0,
+            usage,
+            resource_options_raw,
+        )
+        .and_then(|desc| d.device.new_texture(&desc).map_err(|e| format!("{e:?}"))),
     )
 }
 
@@ -356,7 +367,10 @@ pub unsafe extern "C" fn smtl_device_new_sampler_state(
         Ok(d)
     })();
     match desc {
-        Ok(desc) => boxed("newSamplerStateWithDescriptor:", d.device.new_sampler_state(&desc)),
+        Ok(desc) => boxed(
+            "newSamplerStateWithDescriptor:",
+            d.device.new_sampler_state(&desc),
+        ),
         Err(e) => {
             set_error(e);
             std::ptr::null_mut()
@@ -370,7 +384,7 @@ release!(smtl_sampler_state_release, SamplerState);
 #[no_mangle]
 pub unsafe extern "C" fn smtl_texture_replace_region(
     t: *mut Texture,
-    region: *const u64,             // x, y, z, width, height, depth
+    region: *const u64, // x, y, z, width, height, depth
     level: u64,
     slice: u64,
     bytes: *const c_void,
@@ -440,7 +454,10 @@ pub unsafe extern "C" fn smtl_device_new_library_with_data(
 ) -> *mut Library {
     let d = handle!(d, std::ptr::null_mut());
     let data = std::slice::from_raw_parts(metallib as *const u8, len);
-    boxed("newLibraryWithData:error:", d.device.new_library_with_data(data))
+    boxed(
+        "newLibraryWithData:error:",
+        d.device.new_library_with_data(data),
+    )
 }
 
 #[no_mangle]
@@ -478,18 +495,18 @@ release!(smtl_function_release, Function);
 /// another type.
 fn constant_size(raw: u32) -> usize {
     let (first, scalar) = match raw {
-        3..=6 => (3, 4),        // float
-        16..=19 => (16, 2),     // half
-        29..=32 => (29, 4),     // int
-        33..=36 => (33, 4),     // uint
-        37..=40 => (37, 2),     // short
-        41..=44 => (41, 2),     // ushort
-        45..=48 => (45, 1),     // char
-        49..=52 => (49, 1),     // uchar
-        53..=56 => (53, 1),     // bool
-        81..=84 => (81, 8),     // long
-        85..=88 => (85, 8),     // ulong
-        121..=124 => (121, 2),  // bfloat
+        3..=6 => (3, 4),       // float
+        16..=19 => (16, 2),    // half
+        29..=32 => (29, 4),    // int
+        33..=36 => (33, 4),    // uint
+        37..=40 => (37, 2),    // short
+        41..=44 => (41, 2),    // ushort
+        45..=48 => (45, 1),    // char
+        49..=52 => (49, 1),    // uchar
+        53..=56 => (53, 1),    // bool
+        81..=84 => (81, 8),    // long
+        85..=88 => (85, 8),    // ulong
+        121..=124 => (121, 2), // bfloat
         _ => return 0,
     };
     (raw - first + 1) as usize * scalar
@@ -541,7 +558,15 @@ pub unsafe extern "C" fn smtl_library_new_function_with_constants(
         }
         let mut bytes = vec![0u8; size];
         let cname = CString::new(c.name()).unwrap_or_default();
-        if lookup(ctx, cname.as_ptr(), c.index(), ty.as_raw(), bytes.as_mut_ptr().cast(), size as u32) == 1 {
+        if lookup(
+            ctx,
+            cname.as_ptr(),
+            c.index(),
+            ty.as_raw(),
+            bytes.as_mut_ptr().cast(),
+            size as u32,
+        ) == 1
+        {
             values = values.with_index(c.index(), FunctionConstantValue::new(ty, bytes));
         }
     }
@@ -618,7 +643,8 @@ pub unsafe extern "C" fn smtl_device_new_render_pipeline(
 ) -> *mut RenderPipelineState {
     let d = handle!(d, std::ptr::null_mut());
     let vertex = handle!(vertex, std::ptr::null_mut());
-    let mut desc = RenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
+    let mut desc =
+        RenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
     if let Some(fragment) = fragment.as_mut() {
         desc.fragment = Some(StageSource::Function(fragment.function_descriptor()));
     }
@@ -736,14 +762,22 @@ fn render_descriptor(desc: &SmtlRenderPipelineDesc) -> Result<RenderPipelineDesc
             }
             v.attributes.insert(
                 i as u32,
-                VertexAttributeDescriptor::new(raw("MTLVertexFormat", a.format)?, a.offset, a.buffer_index),
+                VertexAttributeDescriptor::new(
+                    raw("MTLVertexFormat", a.format)?,
+                    a.offset,
+                    a.buffer_index,
+                ),
             );
         }
         for (i, l) in desc.layouts.iter().enumerate() {
             if l.stride == 0 && !used[i] {
                 continue;
             }
-            let mut layout = VertexBufferLayoutDescriptor::new(if l.stride == u32::MAX { None } else { Some(l.stride) });
+            let mut layout = VertexBufferLayoutDescriptor::new(if l.stride == u32::MAX {
+                None
+            } else {
+                Some(l.stride)
+            });
             layout.step_function = raw("MTLVertexStepFunction", l.step_function)?;
             layout.step_rate = l.step_rate;
             v.layouts.insert(i as u32, layout);
@@ -766,7 +800,8 @@ pub unsafe extern "C" fn smtl_device_new_render_pipeline_desc(
     match render_descriptor(desc) {
         Ok(rd) => boxed(
             "newRenderPipelineStateWithDescriptor:error:",
-            d.device.new_render_pipeline_state(&rd, &PipelineOptions::default()),
+            d.device
+                .new_render_pipeline_state(&rd, &PipelineOptions::default()),
         ),
         Err(e) => {
             set_error(e);
@@ -796,6 +831,31 @@ release!(smtl_cmdbuf_release, CommandBuffer);
 pub unsafe extern "C" fn smtl_cmdbuf_commit(c: *mut CommandBuffer) -> i32 {
     let c = handle!(c, -1);
     status("commit", c.commit())
+}
+
+/// A C callback and its context, carried to the runtime's handler threads.
+struct CHandler(unsafe extern "C" fn(*mut c_void), usize);
+
+/// `addCompletedHandler:` (scheduled = 0) / `addScheduledHandler:` (scheduled = 1): `f(ctx)`
+/// runs once on one of the runtime's handler threads; before commit only.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_cmdbuf_add_handler(
+    c: *mut CommandBuffer,
+    scheduled: i32,
+    f: unsafe extern "C" fn(*mut c_void),
+    ctx: *mut c_void,
+) -> i32 {
+    let c = handle!(c, -1);
+    let h = CHandler(f, ctx as usize);
+    let handler: metal2vulkan_runtime::Handler = Box::new(move |_| {
+        let h = h;
+        (h.0)(h.1 as *mut c_void)
+    });
+    if scheduled != 0 {
+        status("addScheduledHandler:", c.add_scheduled_handler(handler))
+    } else {
+        status("addCompletedHandler:", c.add_completed_handler(handler))
+    }
 }
 
 #[no_mangle]
@@ -835,11 +895,14 @@ pub unsafe extern "C" fn smtl_cmdbuf_status(c: *const CommandBuffer) -> u32 {
 pub struct SmtlComputeEncoder(Option<ComputeCommandEncoder>);
 
 #[no_mangle]
-pub unsafe extern "C" fn smtl_cmdbuf_compute_encoder(c: *mut CommandBuffer) -> *mut SmtlComputeEncoder {
+pub unsafe extern "C" fn smtl_cmdbuf_compute_encoder(
+    c: *mut CommandBuffer,
+) -> *mut SmtlComputeEncoder {
     let c = handle!(c, std::ptr::null_mut());
     boxed(
         "computeCommandEncoder",
-        c.compute_command_encoder().map(|e| SmtlComputeEncoder(Some(e))),
+        c.compute_command_encoder()
+            .map(|e| SmtlComputeEncoder(Some(e))),
     )
 }
 
@@ -862,7 +925,10 @@ pub unsafe extern "C" fn smtl_compute_set_pipeline(
 ) -> i32 {
     let enc = encoder!(e, "setComputePipelineState:");
     let p = handle!(p, -1);
-    status("setComputePipelineState:", enc.set_compute_pipeline_state(p))
+    status(
+        "setComputePipelineState:",
+        enc.set_compute_pipeline_state(p),
+    )
 }
 
 #[no_mangle]
@@ -873,7 +939,10 @@ pub unsafe extern "C" fn smtl_compute_set_buffer(
     index: u32,
 ) -> i32 {
     let enc = encoder!(e, "setBuffer:offset:atIndex:");
-    status("setBuffer:offset:atIndex:", enc.set_buffer(b.as_ref(), offset, index))
+    status(
+        "setBuffer:offset:atIndex:",
+        enc.set_buffer(b.as_ref(), offset, index),
+    )
 }
 
 #[no_mangle]
@@ -955,7 +1024,8 @@ pub unsafe extern "C" fn smtl_cmdbuf_render_encoder(
     }
     boxed(
         "renderCommandEncoderWithDescriptor:",
-        c.render_command_encoder(&pass).map(|e| SmtlRenderEncoder(Some(e))),
+        c.render_command_encoder(&pass)
+            .map(|e| SmtlRenderEncoder(Some(e))),
     )
 }
 
@@ -983,7 +1053,8 @@ pub struct SmtlStencilDesc {
 fn stencil(s: &SmtlStencilDesc) -> Result<StencilDescriptor, String> {
     let mut d = StencilDescriptor::default();
     d.stencil_compare_function = raw("MTLCompareFunction", s.compare)?;
-    d.stencil_failure_operation = raw::<StencilOperation>("MTLStencilOperation", s.stencil_failure)?;
+    d.stencil_failure_operation =
+        raw::<StencilOperation>("MTLStencilOperation", s.stencil_failure)?;
     d.depth_failure_operation = raw("MTLStencilOperation", s.depth_failure)?;
     d.depth_stencil_pass_operation = raw("MTLStencilOperation", s.depth_stencil_pass)?;
     d.read_mask = s.read_mask;
@@ -1014,7 +1085,10 @@ pub unsafe extern "C" fn smtl_device_new_depth_stencil_state(
         Ok(desc)
     })();
     match desc {
-        Ok(desc) => boxed("newDepthStencilStateWithDescriptor:", d.device.new_depth_stencil_state(&desc)),
+        Ok(desc) => boxed(
+            "newDepthStencilStateWithDescriptor:",
+            d.device.new_depth_stencil_state(&desc),
+        ),
         Err(e) => {
             set_error(e);
             std::ptr::null_mut()
@@ -1029,7 +1103,10 @@ pub unsafe extern "C" fn smtl_render_set_depth_stencil_state(
     s: *mut DepthStencilState,
 ) -> i32 {
     let enc = encoder!(e, "setDepthStencilState:");
-    status("setDepthStencilState:", enc.set_depth_stencil_state(s.as_ref()))
+    status(
+        "setDepthStencilState:",
+        enc.set_depth_stencil_state(s.as_ref()),
+    )
 }
 
 #[no_mangle]
@@ -1095,7 +1172,10 @@ pub unsafe extern "C" fn smtl_render_set_vertex_texture(
     index: u32,
 ) -> i32 {
     let enc = encoder!(e, "setVertexTexture:atIndex:");
-    status("setVertexTexture:atIndex:", enc.set_vertex_texture(t.as_ref(), index))
+    status(
+        "setVertexTexture:atIndex:",
+        enc.set_vertex_texture(t.as_ref(), index),
+    )
 }
 
 /// `setVertexSamplerState:atIndex:` (stage 0) / `setFragmentSamplerState:atIndex:` (stage 1)
@@ -1128,7 +1208,14 @@ pub unsafe extern "C" fn smtl_render_set_viewport(
     zfar: f64,
 ) -> i32 {
     let enc = encoder!(e, "setViewport:");
-    let v = Viewport { origin_x: x, origin_y: y, width: w, height: h, znear, zfar };
+    let v = Viewport {
+        origin_x: x,
+        origin_y: y,
+        width: w,
+        height: h,
+        znear,
+        zfar,
+    };
     status("setViewport:", enc.set_viewport(v))
 }
 
@@ -1141,7 +1228,15 @@ pub unsafe extern "C" fn smtl_render_set_scissor(
     h: u64,
 ) -> i32 {
     let enc = encoder!(e, "setScissorRect:");
-    status("setScissorRect:", enc.set_scissor_rect(ScissorRect { x, y, width: w, height: h }))
+    status(
+        "setScissorRect:",
+        enc.set_scissor_rect(ScissorRect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }),
+    )
 }
 
 /// Fixed-function state: cull mode, winding, fill mode (raw Metal values), blend colour.
@@ -1154,7 +1249,11 @@ pub unsafe extern "C" fn smtl_render_set_raster(
 ) -> i32 {
     let enc = encoder!(e, "setCullMode:");
     let r = (|| -> Result<(CullMode, Winding, TriangleFillMode), String> {
-        Ok((raw("MTLCullMode", cull)?, raw("MTLWinding", winding)?, raw("MTLTriangleFillMode", fill)?))
+        Ok((
+            raw("MTLCullMode", cull)?,
+            raw("MTLWinding", winding)?,
+            raw("MTLTriangleFillMode", fill)?,
+        ))
     })();
     match r {
         Ok((c, w, f)) => {
@@ -1197,13 +1296,24 @@ pub unsafe extern "C" fn smtl_render_draw_indexed(
     let enc = encoder!(e, "drawIndexedPrimitives:");
     let ib = handle!(index_buffer, -1);
     let r = (|| -> Result<(PrimitiveType, IndexType), String> {
-        Ok((raw("MTLPrimitiveType", primitive_type)?, raw("MTLIndexType", index_type)?))
+        Ok((
+            raw("MTLPrimitiveType", primitive_type)?,
+            raw("MTLIndexType", index_type)?,
+        ))
     })();
     match r {
         Ok((p, t)) => status(
             "drawIndexedPrimitives:",
-            enc.draw_indexed_primitives(p, index_count, t, ib, index_offset, instances.max(1),
-                base_vertex, base_instance),
+            enc.draw_indexed_primitives(
+                p,
+                index_count,
+                t,
+                ib,
+                index_offset,
+                instances.max(1),
+                base_vertex,
+                base_instance,
+            ),
         ),
         Err(e) => {
             set_error(e);
@@ -1220,7 +1330,10 @@ pub unsafe extern "C" fn smtl_render_set_vertex_buffer(
     index: u32,
 ) -> i32 {
     let enc = encoder!(e, "setVertexBuffer:offset:atIndex:");
-    status("setVertexBuffer:offset:atIndex:", enc.set_vertex_buffer(b.as_ref(), offset, index))
+    status(
+        "setVertexBuffer:offset:atIndex:",
+        enc.set_vertex_buffer(b.as_ref(), offset, index),
+    )
 }
 
 #[no_mangle]
@@ -1244,7 +1357,10 @@ pub unsafe extern "C" fn smtl_render_set_fragment_texture(
     index: u32,
 ) -> i32 {
     let enc = encoder!(e, "setFragmentTexture:atIndex:");
-    status("setFragmentTexture:atIndex:", enc.set_fragment_texture(t.as_ref(), index))
+    status(
+        "setFragmentTexture:atIndex:",
+        enc.set_fragment_texture(t.as_ref(), index),
+    )
 }
 
 #[no_mangle]
@@ -1360,8 +1476,8 @@ pub unsafe extern "C" fn smtl_blit_copy_texture(
     src: *mut Texture,
     src_slice: u64,
     src_level: u64,
-    src_origin: *const u64,         // x, y, z
-    size: *const u64,               // width, height, depth
+    src_origin: *const u64, // x, y, z
+    size: *const u64,       // width, height, depth
     dst: *mut Texture,
     dst_slice: u64,
     dst_level: u64,
@@ -1394,7 +1510,10 @@ pub unsafe extern "C" fn smtl_blit_copy_texture(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn smtl_blit_generate_mipmaps(e: *mut SmtlBlitEncoder, t: *mut Texture) -> i32 {
+pub unsafe extern "C" fn smtl_blit_generate_mipmaps(
+    e: *mut SmtlBlitEncoder,
+    t: *mut Texture,
+) -> i32 {
     let enc = encoder!(e, "generateMipmapsForTexture:");
     let t = handle!(t, -1);
     status("generateMipmapsForTexture:", enc.generate_mipmaps(t))

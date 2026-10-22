@@ -177,6 +177,9 @@ smtl_queue  *smtl_device_new_command_queue(smtl_device *d);
 void         smtl_queue_release(smtl_queue *q);
 smtl_cmdbuf *smtl_queue_command_buffer(smtl_queue *q);
 int          smtl_cmdbuf_commit(smtl_cmdbuf *c);
+/* addCompletedHandler: (scheduled 0) / addScheduledHandler: (1): f(ctx) runs
+ * once on one of the runtime's handler threads; before commit only */
+int          smtl_cmdbuf_add_handler(smtl_cmdbuf *c, int scheduled, void (*f)(void *ctx), void *ctx);
 /* 0 = completed, 1 = timed out, -1 = error (see smtl_last_error) */
 int          smtl_cmdbuf_wait(smtl_cmdbuf *c, uint32_t timeout_ms);
 /* MTLCommandBufferStatus raw value */

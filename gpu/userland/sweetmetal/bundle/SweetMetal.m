@@ -92,7 +92,51 @@ SMError(NSString *what)
 @interface SMBase : NSObject
 @end
 
+/* Live objects per class, to see what a client keeps (smstats). */
+static NSMutableDictionary<NSString *, NSNumber *> *smLive;
+
+static void
+smcount(Class c, int delta)
+{
+	@synchronized ([SMBase class]) {
+		if (smLive == nil) {
+			smLive = [NSMutableDictionary new];
+		}
+		NSString *k = NSStringFromClass(c);
+		smLive[k] = @(smLive[k].integerValue + delta);
+	}
+}
+
+/* every 500 command buffers: how many of each object are alive */
+static void
+smstats(void)
+{
+	static unsigned commits;
+	if (++commits % 500 != 0) {
+		return;
+	}
+	NSMutableString *line = [NSMutableString stringWithFormat:@"%u commits, live:", commits];
+	@synchronized ([SMBase class]) {
+		for (NSString *k in [smLive.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+			[line appendFormat:@" %@ %@", [k stringByReplacingOccurrencesOfString:@"SweetMetal"
+			    withString:@""], smLive[k]];
+		}
+	}
+	fprintf(stderr, "SweetMetal: %s\n", line.UTF8String);
+}
+
 @implementation SMBase
+- (instancetype)init
+{
+	if ((self = [super init]) != nil) {
+		smcount([self class], 1);
+	}
+	return self;
+}
+- (void)dealloc
+{
+	smcount([self class], -1);
+}
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
 {
 	NSMethodSignature *sig = [super methodSignatureForSelector:sel];
@@ -434,7 +478,6 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 @public
 	smtl_cmdbuf *_c;
 	id<MTLCommandQueue> _queue;
-	NSMutableArray<MTLCommandBufferHandler> *_completed;
 	NSMutableArray<MTLCommandBufferHandler> *_scheduled;
 }
 @property (copy, atomic) NSString *label;
@@ -668,6 +711,14 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 }
 @end
 
+/* A block handed to the runtime's handler threads: retained until it ran. */
+static void
+runHandler(void *ctx)
+{
+	void (^h)(void) = (__bridge_transfer void (^)(void))ctx;
+	h();
+}
+
 @implementation SweetMetalCommandBuffer
 - (id<MTLCommandQueue>)commandQueue { return _queue; }
 - (id<MTLDevice>)device { return _queue.device; }
@@ -723,12 +774,13 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 }
 - (void)addCompletedHandler:(MTLCommandBufferHandler)h
 {
-	if (_completed == nil) {
-		_completed = [NSMutableArray new];
+	/* run by the runtime once the GPU is done: no thread waits per buffer.
+	 * The block keeps the command buffer alive until then, as Metal does. */
+	void (^call)(void) = ^{ h(self); };
+	if (smtl_cmdbuf_add_handler(_c, 0, runHandler, (__bridge_retained void *)[call copy]) != 0) {
+		SMError(@"addCompletedHandler:");
 	}
-	[_completed addObject:[h copy]];
-}
-- (void)commit
+}- (void)commit
 {
 	if (smtl_cmdbuf_commit(_c) != 0) {
 		SMError(@"commit");
@@ -738,16 +790,7 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 		h(self);
 	}
 	_scheduled = nil;
-	if (_completed.count) {
-		/* completion handlers run off the committing thread, as Metal's do */
-		NSArray *handlers = [_completed copy];
-		dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
-			smtl_cmdbuf_wait(self->_c, 60000);
-			for (MTLCommandBufferHandler h in handlers) {
-				h(self);
-			}
-		});
-	}
+	smstats();
 }
 - (void)enqueue { }
 - (NSError *)error { return nil; }
