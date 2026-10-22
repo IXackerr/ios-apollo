@@ -23,7 +23,7 @@ jobs:
           mkdir -p out
           $CC -o out/sweetrun ios/sweetrun/sweetrun.c -framework IOKit -framework CoreFoundation
           $CC -Igpu/kernel -Igpu/userland/libsweetgpu -o out/gputest \
-            gpu/userland/gputest/gputest.c gpu/userland/libsweetgpu/sweetgpu.c \
+            gpu/userland/gputest/gputest.c gpu/userland/libsweetgpu/sweetgpu.c ios/sweetrun/sweetlog.c \
             -framework IOKit -framework CoreFoundation
           for f in out/*; do codesign -f -s - "$f"; done
           file out/*
