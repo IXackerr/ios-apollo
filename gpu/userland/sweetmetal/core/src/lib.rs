@@ -20,7 +20,7 @@ use metal2vulkan::pipeline::{
 use metal2vulkan_runtime::{
     BlitCommandEncoder, BlitOption, Buffer, ClearColor, CommandBuffer, CommandBufferStatus,
     CommandQueue, ComputeCommandEncoder, ComputePipelineState, Device, DeviceOptions, Function,
-    IoSurfacePlane, Library, LoadAction, Origin, PipelineOptions, RenderCommandEncoder,
+    HostMemory, IoSurfacePlane, Library, LoadAction, Origin, PipelineOptions, RenderCommandEncoder,
     RenderPassDescriptor, RenderPipelineState, ResourceOptions, Size, StoreAction, Texture,
     TextureDescriptor,
 };
@@ -175,6 +175,31 @@ pub unsafe extern "C" fn smtl_device_new_buffer_with_bytes(
     )
 }
 
+/// `newBufferWithBytesNoCopy:length:options:deallocator:` without a deallocator: the GPU uses
+/// the caller's pages at `bytes` (VK_EXT_external_memory_host); they must stay mapped while the
+/// buffer lives. Also how an IOSurface's memory becomes a buffer.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_device_new_buffer_no_copy(
+    d: *mut SmtlDevice,
+    bytes: *mut c_void,
+    length: u64,
+    options: u64,
+) -> *mut Buffer {
+    let d = handle!(d, std::ptr::null_mut());
+    let Some(pointer) = std::ptr::NonNull::new(bytes as *mut u8) else {
+        set_error("newBufferWithBytesNoCopy: NULL bytes".into());
+        return std::ptr::null_mut();
+    };
+    boxed(
+        "newBufferWithBytesNoCopy:length:options:deallocator:",
+        resource_options(options).and_then(|o| {
+            d.device
+                .new_buffer_with_bytes_no_copy(HostMemory::new(pointer), length, o, None)
+                .map_err(|e| format!("{e:?}"))
+        }),
+    )
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn smtl_buffer_contents(b: *const Buffer) -> *mut c_void {
     b.as_ref()
@@ -297,6 +322,35 @@ pub unsafe extern "C" fn smtl_library_new_function(
     boxed("newFunctionWithName:", l.new_function_with_name(&name))
 }
 release!(smtl_function_release, Function);
+
+/// `functionType`: the MTLFunctionType raw value, 0 when it cannot be told.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_function_type(f: *const Function) -> u32 {
+    f.as_ref()
+        .and_then(|f| f.function_type().ok())
+        .map_or(0, |t| t.as_raw())
+}
+
+/// `functionNames`: the library's function names, NUL-separated into `out` (`out_len` bytes,
+/// the list cut short where it does not fit); the bytes the whole list needs.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_library_function_names(
+    l: *const Library,
+    out: *mut c_char,
+    out_len: usize,
+) -> usize {
+    let Some(l) = l.as_ref() else { return 0 };
+    let mut list = Vec::new();
+    for name in l.function_names() {
+        list.extend_from_slice(name.as_bytes());
+        list.push(0);
+    }
+    if !out.is_null() {
+        let n = list.len().min(out_len);
+        std::ptr::copy_nonoverlapping(list.as_ptr(), out as *mut u8, n);
+    }
+    list.len()
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn smtl_device_new_compute_pipeline(

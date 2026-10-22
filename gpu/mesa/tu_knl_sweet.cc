@@ -168,6 +168,42 @@ sweet_bo_init_dmabuf(struct tu_device *dev, struct tu_bo **out_bo,
                     "sweet: memory import is not supported yet");
 }
 
+/* VK_EXT_external_memory_host: the caller's pages, wired and mapped into
+ * the GPU by the kernel. The CPU side already has them at ptr. */
+static VkResult
+sweet_bo_init_userptr(struct tu_device *dev, struct tu_bo **out_bo,
+                      void *ptr, uint64_t size)
+{
+   struct sgpu_import_user req = {
+      .addr = (uintptr_t) ptr,
+      .size = size,
+   };
+   int ret = sgpu_import_user(sweet_dev(dev), &req);
+   if (ret) {
+      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "sweet: IMPORT_USER of %" PRIu64 " bytes at %p failed (%s)",
+                       size, ptr, strerror(-ret));
+   }
+
+   struct tu_bo *bo = tu_device_lookup_bo(dev, req.id);
+   assert(bo && bo->gem_handle == 0);
+
+   *bo = (struct tu_bo) {
+      .gem_handle = req.id,
+      .size = size,
+      .iova = req.gpuaddr,
+      .name = tu_debug_bos_add(dev, size, "host pointer"),
+      .refcnt = 1,
+      .sweet_map = ptr,
+   };
+   bo->never_unmap = true;      /* the caller's mapping, not ours */
+
+   tu_dump_bo_init(dev, bo);
+   *out_bo = bo;
+   TU_RMV(bo_allocate, dev, bo);
+   return VK_SUCCESS;
+}
+
 static int
 sweet_bo_export_dmabuf(struct tu_device *dev, struct tu_bo *bo)
 {
@@ -741,6 +777,7 @@ static const struct tu_knl sweet_knl_funcs = {
       .bo_init = sweet_bo_init,
       .bo_init_dmabuf = sweet_bo_init_dmabuf,
       .bo_export_dmabuf = sweet_bo_export_dmabuf,
+      .bo_init_userptr = sweet_bo_init_userptr,
       .bo_map = sweet_bo_map,
       .bo_allow_dump = sweet_bo_allow_dump,
       .bo_finish = sweet_bo_finish,

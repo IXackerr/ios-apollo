@@ -26,7 +26,7 @@
 #include <stdint.h>
 
 #define SGPU_SERVICE_CLASS      "SweetAdreno"
-#define SGPU_UAPI_VERSION       1
+#define SGPU_UAPI_VERSION       2
 
 enum sgpu_selector {
 	SGPU_SEL_GET_INFO       = 0,    /* -> sgpu_info */
@@ -41,6 +41,7 @@ enum sgpu_selector {
 	SGPU_SEL_SYNC_CACHE     = 9,    /* sgpu_sync_cache */
 	SGPU_SEL_GPU_TIME       = 10,   /* -> sgpu_gpu_time */
 	SGPU_SEL_GET_STATUS     = 11,   /* -> sgpu_status (bring-up diagnostics) */
+	SGPU_SEL_IMPORT_USER    = 12,   /* sgpu_import_user -> same (v2) */
 	SGPU_SEL_COUNT
 };
 
@@ -110,6 +111,19 @@ struct sgpu_import_surface {
 	uint32_t reserved;
 	uint64_t gpuaddr;               /* out */
 	uint64_t size;                  /* out */
+};
+
+/*
+ * Map the caller's own pages into the GPU (VK_EXT_external_memory_host,
+ * newBufferWithBytesNoCopy:, the mapping of an IOSurface). The pages are
+ * wired until MEM_FREE.
+ */
+struct sgpu_import_user {
+	uint64_t addr;                  /* in: page-aligned address in the caller */
+	uint64_t size;                  /* in: whole pages */
+	uint32_t flags;                 /* in: SGPU_MEM_GPU_READONLY */
+	uint32_t id;                    /* out: memory handle (free with MEM_FREE) */
+	uint64_t gpuaddr;               /* out */
 };
 
 struct sgpu_sync_cache {

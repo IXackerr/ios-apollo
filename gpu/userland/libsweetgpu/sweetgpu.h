@@ -35,6 +35,8 @@ int  sgpu_mem_alloc(sgpu_dev *dev, struct sgpu_mem_alloc *req);
 int  sgpu_mem_free(sgpu_dev *dev, uint32_t id);
 int  sgpu_mem_sync(sgpu_dev *dev, uint32_t id, uint32_t op, uint64_t offset, uint64_t length);
 int  sgpu_import_surface(sgpu_dev *dev, struct sgpu_import_surface *req);
+/* Fills id and gpuaddr of *req: the caller's pages at addr, mapped for the GPU. */
+int  sgpu_import_user(sgpu_dev *dev, struct sgpu_import_user *req);
 
 int  sgpu_submit(sgpu_dev *dev, uint32_t ctx_id, const struct sgpu_ib *ibs,
     uint32_t num_ibs, uint32_t flags, uint32_t *timestamp);

@@ -207,6 +207,12 @@ sgpu_import_surface(sgpu_dev *dev, struct sgpu_import_surface *req)
 }
 
 int
+sgpu_import_user(sgpu_dev *dev, struct sgpu_import_user *req)
+{
+	return call(dev, SGPU_SEL_IMPORT_USER, req, sizeof(*req), req, sizeof(*req));
+}
+
+int
 sgpu_submit(sgpu_dev *dev, uint32_t ctx_id, const struct sgpu_ib *ibs, uint32_t num_ibs,
     uint32_t flags, uint32_t *timestamp)
 {

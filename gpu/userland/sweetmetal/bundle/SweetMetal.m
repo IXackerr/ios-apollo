@@ -88,6 +88,9 @@ SMError(NSString *what)
 @interface SweetMetalBuffer : SMBase <MTLBuffer> {
 @public
 	smtl_buffer *_b;
+	void (^_deallocator)(void *, NSUInteger);
+	void *_noCopyPointer;
+	NSUInteger _noCopyLength;
 	id<MTLDevice> _device;
 	MTLResourceOptions _options;
 }
@@ -103,7 +106,13 @@ SMError(NSString *what)
 - (MTLStorageMode)storageMode { return (MTLStorageMode)((_options >> 4) & 0xf); }
 - (MTLCPUCacheMode)cpuCacheMode { return (MTLCPUCacheMode)(_options & 0xf); }
 - (void)didModifyRange:(NSRange)range { /* unified memory: nothing to do */ }
-- (void)dealloc { smtl_buffer_release(_b); }
+- (void)dealloc
+{
+	smtl_buffer_release(_b);
+	if (_deallocator != nil) {
+		_deallocator(_noCopyPointer, _noCopyLength);
+	}
+}
 @end
 
 @interface SweetMetalTexture : SMBase <MTLTexture> {
@@ -159,6 +168,7 @@ SMError(NSString *what)
 @implementation SweetMetalFunction
 - (NSString *)name { return _name; }
 - (id<MTLDevice>)device { return _device; }
+- (MTLFunctionType)functionType { return (MTLFunctionType)smtl_function_type(_f); }
 - (void)dealloc { smtl_function_release(_f); }
 @end
 
@@ -184,6 +194,20 @@ SMError(NSString *what)
 	fn->_device = _device;
 	fn->_name = [name copy];
 	return fn;
+}
+- (NSArray<NSString *> *)functionNames
+{
+	size_t len = smtl_library_function_names(_l, NULL, 0);
+	char *buf = malloc(len + 1);
+	NSMutableArray *names = [NSMutableArray new];
+	if (buf != NULL) {
+		smtl_library_function_names(_l, buf, len);
+		for (size_t i = 0; i < len; i += strlen(buf + i) + 1) {
+			[names addObject:@(buf + i)];
+		}
+		free(buf);
+	}
+	return names;
 }
 - (void)dealloc { smtl_library_release(_l); }
 @end
@@ -609,6 +633,19 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 {
 	return wrapBuffer(self, smtl_device_new_buffer_with_bytes(_d, p, len, o), o);
 }
+- (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)p length:(NSUInteger)len
+    options:(MTLResourceOptions)o deallocator:(void (^)(void *, NSUInteger))dealloc
+{
+	SweetMetalBuffer *b = wrapBuffer(self, smtl_device_new_buffer_no_copy(_d, p, len, o), o);
+	/* the deallocator runs when our wrapper goes, after the GPU's last use of
+	 * it (command buffers retain their resources) */
+	if (b != nil && dealloc != nil) {
+		b->_deallocator = [dealloc copy];
+		b->_noCopyPointer = p;
+		b->_noCopyLength = len;
+	}
+	return b;
+}
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)desc
 {
@@ -629,30 +666,33 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 }
 
 /*
- * CoreAnimation's path: render into the IOSurface of a layer. The surface's
- * pages are imported into the GPU by SweetAdreno (IMPORT_SURFACE, the
- * SweetSurface id = IOSurfaceGetID) and stand behind a buffer; the texture
- * is plane `plane` of that buffer. TODO(next): the buffer must come from
- * turnip's import of that kernel object (sweet backend bo_init_dmabuf with
- * the surface id) and metal2vulkan's Device::new_buffer_with_vk_buffer;
- * until then this allocates a staging buffer and logs.
+ * CoreAnimation's path: render into the IOSurface of a layer. The GPU uses
+ * the surface's own pages, mapped in this process: a no-copy buffer over
+ * them (SweetAdreno IMPORT_USER through turnip's VK_EXT_external_memory_host)
+ * stands for the surface, and the texture is plane `plane` of that buffer.
  */
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)desc
     iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
 {
-	size_t bpr = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
-	size_t size = IOSurfaceGetAllocSize(surface);
 	size_t planes = IOSurfaceGetPlaneCount(surface);
+	size_t bpr = planes ? IOSurfaceGetBytesPerRowOfPlane(surface, plane) :
+	    IOSurfaceGetBytesPerRow(surface);
+	size_t page = (size_t)getpagesize();
+	size_t size = (IOSurfaceGetAllocSize(surface) + page - 1) & ~(page - 1);
+	IOSurfaceLock(surface, 0, NULL);
+	uint8_t *base = IOSurfaceGetBaseAddress(surface);
 	uint64_t offset = planes ? (uint64_t)((uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface, plane) -
-	    (uint8_t *)IOSurfaceGetBaseAddress(surface)) : 0;
-	SMLOG(@"iosurface %u %zux%zu plane %lu bpr %zu (import path pending, docs/METAL.md)",
-	    IOSurfaceGetID(surface), IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
-	    (unsigned long)plane, bpr);
-	SweetMetalBuffer *backing = wrapBuffer(self, smtl_device_new_buffer(_d, size, 0), 0);
-	if (backing == nil) {
+	    base) : 0;
+	IOSurfaceUnlock(surface, 0, NULL);
+	smtl_buffer *b = base ? smtl_device_new_buffer_no_copy(_d, base, size, 0) : NULL;
+	if (b == NULL) {
+		SMError([NSString stringWithFormat:@"iosurface %u (%zux%zu, %zu bytes at %p)",
+		    IOSurfaceGetID(surface), IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
+		    size, base]);
 		return nil;
 	}
-	smtl_texture *t = smtl_buffer_new_iosurface_texture(backing->_b, (uint32_t)desc.pixelFormat,
+	SweetMetalBuffer *backing = wrapBuffer(self, b, 0);
+	smtl_texture *t = smtl_buffer_new_iosurface_texture(b, (uint32_t)desc.pixelFormat,
 	    desc.width, desc.height, (uint32_t)desc.usage, offset, bpr, planes > 0);
 	if (t == NULL) {
 		SMError(@"newTextureWithDescriptor:iosurface:plane:");

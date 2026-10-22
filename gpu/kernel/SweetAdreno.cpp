@@ -308,6 +308,7 @@ class SweetAdrenoUserClient : public IOUserClient {
 	bool ibInClientMemory(uint64_t gpuaddr, uint64_t bytes);
 	IOReturn memAlloc(struct sgpu_mem_alloc *req);
 	IOReturn importSurface(struct sgpu_import_surface *req);
+	IOReturn importUser(struct sgpu_import_user *req);
 	IOReturn submit(struct sgpu_submit *req);
 	IOReturn waitTimestamp(const struct sgpu_wait_ts *req);
 	IOReturn syncCache(const struct sgpu_sync_cache *req);
@@ -476,6 +477,55 @@ SweetAdrenoUserClient::memAlloc(struct sgpu_mem_alloc *req)
 	req->gpuaddr = m->gpuaddr;
 	req->cpu_addr = m->userMap ? m->userMap->getAddress() : 0;
 	req->alloc_size = size;
+	return kIOReturnSuccess;
+}
+
+IOReturn
+SweetAdrenoUserClient::importUser(struct sgpu_import_user *req)
+{
+	if (req->size == 0 || req->size > (1ull << 32) || (req->addr & PAGE_MASK) ||
+	    (req->size & PAGE_MASK)) {
+		return kIOReturnBadArgument;
+	}
+	if (sgpu_wired + req->size > SGPU_MAX_WIRED) {
+		return kIOReturnNoMemory;
+	}
+	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(req->addr, req->size,
+	    kIODirectionInOut, fTask);
+	if (md == NULL) {
+		return kIOReturnNoMemory;
+	}
+	struct sgpu_umem *m = IOMallocType(struct sgpu_umem);
+	m->md = md;
+	m->size = req->size;
+	m->flags = req->flags;
+	sgpu_wired += req->size;        /* given back by sgpu_umem_destroy */
+	m->prepared = md->prepare() == kIOReturnSuccess;     /* wires the pages */
+	if (!m->prepared) {
+		sgpu_umem_destroy(m);
+		return kIOReturnVMError;
+	}
+	uint32_t prot = SGPU_PROT_READ;
+	if (!(req->flags & SGPU_MEM_GPU_READONLY)) {
+		prot |= SGPU_PROT_WRITE;
+	}
+	int err = sgpu_va_alloc(&sgpu_dev, false, req->size, PAGE_SIZE, &m->gpuaddr);
+	if (!err) {
+		err = sgpu_map_descriptor(m->md, m->gpuaddr, req->size, prot);
+		if (err) {
+			sgpu_va_free(&sgpu_dev, m->gpuaddr, req->size);
+		}
+	}
+	if (err) {
+		m->gpuaddr = 0;
+		sgpu_umem_destroy(m);
+		return sgpu_ioreturn(err);
+	}
+	m->id = allocId();
+	m->next = fMem;
+	fMem = m;
+	req->id = m->id;
+	req->gpuaddr = m->gpuaddr;
 	return kIOReturnSuccess;
 }
 
@@ -657,6 +707,7 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		struct sgpu_mem_alloc      alloc;
 		struct sgpu_mem_free       free;
 		struct sgpu_import_surface import;
+		struct sgpu_import_user    user;
 		struct sgpu_wait_ts        wait;
 		struct sgpu_read_ts        rts;
 		struct sgpu_sync_cache     sync;
@@ -728,6 +779,15 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		}
 		if (ret == kIOReturnSuccess) {
 			ret = struct_out(args, &u.import, sizeof(u.import));
+		}
+		break;
+	case SGPU_SEL_IMPORT_USER:
+		ret = struct_in(args, &u.user, sizeof(u.user));
+		if (ret == kIOReturnSuccess) {
+			ret = importUser(&u.user);
+		}
+		if (ret == kIOReturnSuccess) {
+			ret = struct_out(args, &u.user, sizeof(u.user));
 		}
 		break;
 	case SGPU_SEL_SYNC_CACHE:

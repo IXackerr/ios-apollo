@@ -59,6 +59,10 @@ uint64_t     smtl_device_registry_id(const smtl_device *d);
 smtl_buffer *smtl_device_new_buffer(smtl_device *d, uint64_t length, uint64_t options);
 smtl_buffer *smtl_device_new_buffer_with_bytes(smtl_device *d, const void *bytes, uint64_t length,
     uint64_t options);
+/* newBufferWithBytesNoCopy: the GPU uses the caller's pages at bytes, which
+ * stay mapped while the buffer lives (also an IOSurface's memory) */
+smtl_buffer *smtl_device_new_buffer_no_copy(smtl_device *d, void *bytes, uint64_t length,
+    uint64_t options);
 void        *smtl_buffer_contents(const smtl_buffer *b);  /* NULL for private storage */
 uint64_t     smtl_buffer_length(const smtl_buffer *b);
 uint64_t     smtl_buffer_gpu_address(const smtl_buffer *b);
@@ -80,6 +84,10 @@ smtl_library  *smtl_device_new_library_with_air(smtl_device *d, const void *bitc
 void           smtl_library_release(smtl_library *l);
 smtl_function *smtl_library_new_function(smtl_library *l, const char *name);
 void           smtl_function_release(smtl_function *f);
+uint32_t       smtl_function_type(const smtl_function *f);      /* MTLFunctionType, 0 unknown */
+/* the function names, NUL-separated into out (cut short where they do not
+ * fit); returns the bytes the whole list needs */
+size_t         smtl_library_function_names(const smtl_library *l, char *out, size_t out_len);
 
 smtl_compute_pipeline *smtl_device_new_compute_pipeline(smtl_device *d, smtl_function *f);
 uint64_t smtl_compute_pipeline_max_threads(const smtl_compute_pipeline *p);

@@ -9,13 +9,15 @@
  *   MTLComputePipelineState / MTLRenderPipelineDescriptor /
  *   MTLRenderPassDescriptor, verified against the CPU; QuartzCore's
  *   default.metallib through -newLibraryWithURL:error:, as QuartzCore
- *   loads it.
+ *   loads it; and a triangle drawn into an IOSurface, read back by the CPU
+ *   from the surface's own memory, as CoreAnimation's output is.
  *
  * Files (mkadt.py --run-file): bundle (SweetMetal), core, sweetvk, vk,
  * plist (Info.plist), metallib (test.metallib). Started by ios/sweetrun.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
 #include <sys/stat.h>
 #include "sweetrun.h"
@@ -125,6 +127,79 @@ test_render(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibrary> lib)
 	CHECK(other == 0 && cover > 0.31 && cover < 0.33, "render pixels");
 }
 
+/* CoreAnimation's path: draw into an IOSurface, then the CPU (in CA's case
+ * the display) reads the surface's memory. */
+static void
+test_iosurface(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibrary> lib)
+{
+	const int w = 256, h = 256;
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h),
+		(id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfacePixelFormat: @('BGRA'),
+	};
+	IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(surf != NULL, "IOSurfaceCreate");
+	if (surf == NULL) {
+		return;
+	}
+	MTLTextureDescriptor *td = [MTLTextureDescriptor
+	    texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	id<MTLTexture> t = [dev newTextureWithDescriptor:td iosurface:surf plane:0];
+	CHECK(t != nil, "texture over IOSurface %u", IOSurfaceGetID(surf));
+	NSError *err = nil;
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"tri_vertex"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"tri_fragment"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	id<MTLRenderPipelineState> p = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+	if (t == nil || p == nil) {
+		CFRelease(surf);
+		return;
+	}
+	float color[4] = { 0.25f, 1.0f, 0.5f, 1.0f };
+	id<MTLBuffer> cbuf = [dev newBufferWithBytes:color length:sizeof(color)
+	    options:MTLResourceStorageModeShared];
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = t;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:p];
+	[re setFragmentBuffer:cbuf offset:0 atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[re endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+
+	IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+	const uint8_t *base = IOSurfaceGetBaseAddress(surf);
+	size_t bpr = IOSurfaceGetBytesPerRow(surf);
+	/* BGRA8 in memory: clear red = 00 00 ff ff, triangle = 80 ff 40 ff */
+	const uint32_t clear = 0xffff0000u, tri = 0xff40ff80u;
+	uint32_t ntri = 0, other = 0, center = 0, corner = 0;
+	for (int y = 0; y < h; y++) {
+		const uint32_t *row = (const uint32_t *)(base + y * bpr);
+		for (int x = 0; x < w; x++) {
+			if (row[x] == tri) {
+				ntri++;
+			} else if (row[x] != clear) {
+				other++;
+			}
+		}
+	}
+	center = ((const uint32_t *)(base + (h / 2) * bpr))[w / 2];
+	corner = ((const uint32_t *)base)[0];
+	IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+	double cover = (double)ntri / (w * h);
+	printf("iosurface %u (bpr %zu): triangle %.2f %%, center %#x corner %#x, %u other pixels\n",
+	    IOSurfaceGetID(surf), bpr, cover * 100, center, corner, other);
+	CHECK(other == 0 && cover > 0.31 && cover < 0.33, "IOSurface pixels");
+	CFRelease(surf);
+}
+
 int
 main(void)
 {
@@ -170,6 +245,7 @@ main(void)
 		if (q && lib) {
 			test_compute(dev, q, lib);
 			test_render(dev, q, lib);
+			test_iosurface(dev, q, lib);
 		}
 		NSURL *qc = [[NSBundle bundleWithPath:@"/System/Library/Frameworks/QuartzCore.framework"]
 		    URLForResource:@"default" withExtension:@"metallib"];

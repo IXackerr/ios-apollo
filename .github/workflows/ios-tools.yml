@@ -51,7 +51,7 @@ jobs:
           $CC -Igpu/userland/sweetmetal/core/include -Iios/sweetrun -o out/smtltest \
             gpu/userland/smtltest/smtltest.c ios/sweetrun/sweetlog.c -framework IOKit -framework CoreFoundation -lz
           $CC -fobjc-arc -fmodules -Iios/sweetrun -o out/mtltest gpu/userland/mtltest/mtltest.m \
-            ios/sweetrun/sweetlog.c -framework Foundation -framework Metal -framework IOKit \
+            ios/sweetrun/sweetlog.c -framework Foundation -framework Metal -framework IOKit -framework IOSurface \
             -framework CoreFoundation -lz
           for f in out/*; do [ "${f%.metallib}" = "$f" ] && codesign -f -s - "$f"; done
           file out/*

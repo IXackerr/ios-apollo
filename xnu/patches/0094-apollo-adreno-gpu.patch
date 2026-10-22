@@ -4593,7 +4593,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_uapi.h
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,198 @@
 +/*
 + * sweet_gpu_uapi.h - user/kernel interface of the SWEET Adreno driver.
 + *
@@ -4622,7 +4622,7 @@
 +#include <stdint.h>
 +
 +#define SGPU_SERVICE_CLASS      "SweetAdreno"
-+#define SGPU_UAPI_VERSION       1
++#define SGPU_UAPI_VERSION       2
 +
 +enum sgpu_selector {
 +	SGPU_SEL_GET_INFO       = 0,    /* -> sgpu_info */
@@ -4637,6 +4637,7 @@
 +	SGPU_SEL_SYNC_CACHE     = 9,    /* sgpu_sync_cache */
 +	SGPU_SEL_GPU_TIME       = 10,   /* -> sgpu_gpu_time */
 +	SGPU_SEL_GET_STATUS     = 11,   /* -> sgpu_status (bring-up diagnostics) */
++	SGPU_SEL_IMPORT_USER    = 12,   /* sgpu_import_user -> same (v2) */
 +	SGPU_SEL_COUNT
 +};
 +
@@ -4706,6 +4707,19 @@
 +	uint32_t reserved;
 +	uint64_t gpuaddr;               /* out */
 +	uint64_t size;                  /* out */
++};
++
++/*
++ * Map the caller's own pages into the GPU (VK_EXT_external_memory_host,
++ * newBufferWithBytesNoCopy:, the mapping of an IOSurface). The pages are
++ * wired until MEM_FREE.
++ */
++struct sgpu_import_user {
++	uint64_t addr;                  /* in: page-aligned address in the caller */
++	uint64_t size;                  /* in: whole pages */
++	uint32_t flags;                 /* in: SGPU_MEM_GPU_READONLY */
++	uint32_t id;                    /* out: memory handle (free with MEM_FREE) */
++	uint64_t gpuaddr;               /* out */
 +};
 +
 +struct sgpu_sync_cache {
@@ -4872,7 +4886,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,780 @@
+@@ -0,0 +1,840 @@
 +/*
 + * SweetAdreno - IOKit front end of the SWEET Adreno 650 driver.
 + *
@@ -5183,6 +5197,7 @@
 +	bool ibInClientMemory(uint64_t gpuaddr, uint64_t bytes);
 +	IOReturn memAlloc(struct sgpu_mem_alloc *req);
 +	IOReturn importSurface(struct sgpu_import_surface *req);
++	IOReturn importUser(struct sgpu_import_user *req);
 +	IOReturn submit(struct sgpu_submit *req);
 +	IOReturn waitTimestamp(const struct sgpu_wait_ts *req);
 +	IOReturn syncCache(const struct sgpu_sync_cache *req);
@@ -5351,6 +5366,55 @@
 +	req->gpuaddr = m->gpuaddr;
 +	req->cpu_addr = m->userMap ? m->userMap->getAddress() : 0;
 +	req->alloc_size = size;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetAdrenoUserClient::importUser(struct sgpu_import_user *req)
++{
++	if (req->size == 0 || req->size > (1ull << 32) || (req->addr & PAGE_MASK) ||
++	    (req->size & PAGE_MASK)) {
++		return kIOReturnBadArgument;
++	}
++	if (sgpu_wired + req->size > SGPU_MAX_WIRED) {
++		return kIOReturnNoMemory;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(req->addr, req->size,
++	    kIODirectionInOut, fTask);
++	if (md == NULL) {
++		return kIOReturnNoMemory;
++	}
++	struct sgpu_umem *m = IOMallocType(struct sgpu_umem);
++	m->md = md;
++	m->size = req->size;
++	m->flags = req->flags;
++	sgpu_wired += req->size;        /* given back by sgpu_umem_destroy */
++	m->prepared = md->prepare() == kIOReturnSuccess;     /* wires the pages */
++	if (!m->prepared) {
++		sgpu_umem_destroy(m);
++		return kIOReturnVMError;
++	}
++	uint32_t prot = SGPU_PROT_READ;
++	if (!(req->flags & SGPU_MEM_GPU_READONLY)) {
++		prot |= SGPU_PROT_WRITE;
++	}
++	int err = sgpu_va_alloc(&sgpu_dev, false, req->size, PAGE_SIZE, &m->gpuaddr);
++	if (!err) {
++		err = sgpu_map_descriptor(m->md, m->gpuaddr, req->size, prot);
++		if (err) {
++			sgpu_va_free(&sgpu_dev, m->gpuaddr, req->size);
++		}
++	}
++	if (err) {
++		m->gpuaddr = 0;
++		sgpu_umem_destroy(m);
++		return sgpu_ioreturn(err);
++	}
++	m->id = allocId();
++	m->next = fMem;
++	fMem = m;
++	req->id = m->id;
++	req->gpuaddr = m->gpuaddr;
 +	return kIOReturnSuccess;
 +}
 +
@@ -5532,6 +5596,7 @@
 +		struct sgpu_mem_alloc      alloc;
 +		struct sgpu_mem_free       free;
 +		struct sgpu_import_surface import;
++		struct sgpu_import_user    user;
 +		struct sgpu_wait_ts        wait;
 +		struct sgpu_read_ts        rts;
 +		struct sgpu_sync_cache     sync;
@@ -5603,6 +5668,15 @@
 +		}
 +		if (ret == kIOReturnSuccess) {
 +			ret = struct_out(args, &u.import, sizeof(u.import));
++		}
++		break;
++	case SGPU_SEL_IMPORT_USER:
++		ret = struct_in(args, &u.user, sizeof(u.user));
++		if (ret == kIOReturnSuccess) {
++			ret = importUser(&u.user);
++		}
++		if (ret == kIOReturnSuccess) {
++			ret = struct_out(args, &u.user, sizeof(u.user));
 +		}
 +		break;
 +	case SGPU_SEL_SYNC_CACHE:

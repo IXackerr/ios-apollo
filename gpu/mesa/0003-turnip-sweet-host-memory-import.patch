@@ -1,0 +1,257 @@
+turnip: VK_EXT_external_memory_host for the sweet backend
+
+Imports the caller's pages through SweetAdreno IMPORT_USER (UAPI 2), so
+Metal's newBufferWithBytesNoCopy: and the mapping of an IOSurface can be
+used by the GPU without a copy.
+---
+diff --git a/src/freedreno/vulkan/sweet/sweet_gpu_uapi.h b/src/freedreno/vulkan/sweet/sweet_gpu_uapi.h
+index 49d2229..fd23ee3 100644
+--- a/src/freedreno/vulkan/sweet/sweet_gpu_uapi.h
++++ b/src/freedreno/vulkan/sweet/sweet_gpu_uapi.h
+@@ -26,7 +26,7 @@
+ #include <stdint.h>
+ 
+ #define SGPU_SERVICE_CLASS      "SweetAdreno"
+-#define SGPU_UAPI_VERSION       1
++#define SGPU_UAPI_VERSION       2
+ 
+ enum sgpu_selector {
+ 	SGPU_SEL_GET_INFO       = 0,    /* -> sgpu_info */
+@@ -41,6 +41,7 @@ enum sgpu_selector {
+ 	SGPU_SEL_SYNC_CACHE     = 9,    /* sgpu_sync_cache */
+ 	SGPU_SEL_GPU_TIME       = 10,   /* -> sgpu_gpu_time */
+ 	SGPU_SEL_GET_STATUS     = 11,   /* -> sgpu_status (bring-up diagnostics) */
++	SGPU_SEL_IMPORT_USER    = 12,   /* sgpu_import_user -> same (v2) */
+ 	SGPU_SEL_COUNT
+ };
+ 
+@@ -112,6 +113,19 @@ struct sgpu_import_surface {
+ 	uint64_t size;                  /* out */
+ };
+ 
++/*
++ * Map the caller's own pages into the GPU (VK_EXT_external_memory_host,
++ * newBufferWithBytesNoCopy:, the mapping of an IOSurface). The pages are
++ * wired until MEM_FREE.
++ */
++struct sgpu_import_user {
++	uint64_t addr;                  /* in: page-aligned address in the caller */
++	uint64_t size;                  /* in: whole pages */
++	uint32_t flags;                 /* in: SGPU_MEM_GPU_READONLY */
++	uint32_t id;                    /* out: memory handle (free with MEM_FREE) */
++	uint64_t gpuaddr;               /* out */
++};
++
+ struct sgpu_sync_cache {
+ 	uint32_t id;
+ 	uint32_t op;                    /* SGPU_CACHE_* */
+diff --git a/src/freedreno/vulkan/sweet/sweetgpu.c b/src/freedreno/vulkan/sweet/sweetgpu.c
+index bb6295d..381e997 100644
+--- a/src/freedreno/vulkan/sweet/sweetgpu.c
++++ b/src/freedreno/vulkan/sweet/sweetgpu.c
+@@ -206,6 +206,12 @@ sgpu_import_surface(sgpu_dev *dev, struct sgpu_import_surface *req)
+ 	return call(dev, SGPU_SEL_IMPORT_SURFACE, req, sizeof(*req), req, sizeof(*req));
+ }
+ 
++int
++sgpu_import_user(sgpu_dev *dev, struct sgpu_import_user *req)
++{
++	return call(dev, SGPU_SEL_IMPORT_USER, req, sizeof(*req), req, sizeof(*req));
++}
++
+ int
+ sgpu_submit(sgpu_dev *dev, uint32_t ctx_id, const struct sgpu_ib *ibs, uint32_t num_ibs,
+     uint32_t flags, uint32_t *timestamp)
+diff --git a/src/freedreno/vulkan/sweet/sweetgpu.h b/src/freedreno/vulkan/sweet/sweetgpu.h
+index 4133c35..c53d860 100644
+--- a/src/freedreno/vulkan/sweet/sweetgpu.h
++++ b/src/freedreno/vulkan/sweet/sweetgpu.h
+@@ -35,6 +35,8 @@ int  sgpu_mem_alloc(sgpu_dev *dev, struct sgpu_mem_alloc *req);
+ int  sgpu_mem_free(sgpu_dev *dev, uint32_t id);
+ int  sgpu_mem_sync(sgpu_dev *dev, uint32_t id, uint32_t op, uint64_t offset, uint64_t length);
+ int  sgpu_import_surface(sgpu_dev *dev, struct sgpu_import_surface *req);
++/* Fills id and gpuaddr of *req: the caller's pages at addr, mapped for the GPU. */
++int  sgpu_import_user(sgpu_dev *dev, struct sgpu_import_user *req);
+ 
+ int  sgpu_submit(sgpu_dev *dev, uint32_t ctx_id, const struct sgpu_ib *ibs,
+     uint32_t num_ibs, uint32_t flags, uint32_t *timestamp);
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 278965f..e51ed30 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -329,6 +329,7 @@ get_device_extensions(const struct tu_physical_device *device,
+       .EXT_extended_dynamic_state2 = true,
+       .EXT_extended_dynamic_state3 = true,
+       .EXT_external_memory_dma_buf = !device->no_external_handles,
++      .EXT_external_memory_host = device->instance->knl->bo_init_userptr != NULL,
+       .EXT_filter_cubic = device->info->props.has_tex_filter_cubic,
+       .EXT_fragment_density_map = true,
+       .EXT_fragment_density_map_offset = true,
+@@ -1352,6 +1353,9 @@ tu_get_properties(struct tu_physical_device *pdevice,
+    /* VK_KHR_push_descriptor */
+    props->maxPushDescriptors = MAX_PUSH_DESCRIPTORS;
+ 
++   /* VK_EXT_external_memory_host: the kernel maps whole host pages */
++   props->minImportedHostPointerAlignment = MAX2(os_page_size, 4096);
++
+    /* VK_EXT_transform_feedback */
+    if (pdevice->info->props.is_a702) {
+        /* a702 only 32 streamout ram entries.. 1 stream, 64 components */
+@@ -3702,8 +3706,15 @@ tu_AllocateMemory(VkDevice _device,
+ 
+    const VkImportMemoryFdInfoKHR *fd_info =
+       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
+-
+-   if (fd_info && fd_info->handleType) {
++   const VkImportMemoryHostPointerInfoEXT *host_info =
++      vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
++
++   if (host_info && host_info->handleType) {
++      assert(host_info->handleType ==
++             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT);
++      result = tu_bo_init_userptr(device, &mem->bo, host_info->pHostPointer,
++                                  pAllocateInfo->allocationSize);
++   } else if (fd_info && fd_info->handleType) {
+       assert(fd_info->handleType ==
+                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
+              fd_info->handleType ==
+@@ -3874,6 +3885,30 @@ tu_allocate_lazy_memory(struct tu_device *dev,
+ }
+ 
+ 
++VKAPI_ATTR VkResult VKAPI_CALL
++tu_GetMemoryHostPointerPropertiesEXT(
++   VkDevice _device,
++   VkExternalMemoryHandleTypeFlagBits handleType,
++   const void *pHostPointer,
++   VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
++{
++   VK_FROM_HANDLE(tu_device, device, _device);
++   const struct tu_physical_device *pdev = device->physical_device;
++
++   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT)
++      return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++
++   uint32_t bits = 0;
++   for (uint32_t i = 0; i < pdev->memory.type_count; i++) {
++      VkMemoryPropertyFlags f = pdev->memory.types[i];
++      if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
++          (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
++         bits |= 1u << i;
++   }
++   pMemoryHostPointerProperties->memoryTypeBits = bits;
++   return VK_SUCCESS;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ tu_FreeMemory(VkDevice _device,
+               VkDeviceMemory _mem,
+diff --git a/src/freedreno/vulkan/tu_knl.cc b/src/freedreno/vulkan/tu_knl.cc
+index 696b52b..d115201 100644
+--- a/src/freedreno/vulkan/tu_knl.cc
++++ b/src/freedreno/vulkan/tu_knl.cc
+@@ -85,6 +85,22 @@ tu_bo_init_new_explicit_iova(struct tu_device *dev,
+    return VK_SUCCESS;
+ }
+ 
++VkResult
++tu_bo_init_userptr(struct tu_device *dev,
++                   struct tu_bo **bo,
++                   void *ptr,
++                   uint64_t size)
++{
++   if (!dev->instance->knl->bo_init_userptr)
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   VkResult result = dev->instance->knl->bo_init_userptr(dev, bo, ptr, size);
++   if (result != VK_SUCCESS)
++      return result;
++   if (!(*bo)->unique_id)
++      (*bo)->unique_id = (*bo)->gem_handle;
++   return VK_SUCCESS;
++}
++
+ VkResult
+ tu_bo_init_dmabuf(struct tu_device *dev,
+                   struct tu_bo **bo,
+diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
+index e3769ed..de7c129 100644
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -146,6 +146,9 @@ struct tu_knl {
+    VkResult (*bo_init_dmabuf)(struct tu_device *dev, struct tu_bo **out_bo,
+                               uint64_t size, enum tu_bo_alloc_flags flags, int prime_fd);
+    int (*bo_export_dmabuf)(struct tu_device *dev, struct tu_bo *bo);
++   /* VK_EXT_external_memory_host: the caller's pages at ptr, whole pages */
++   VkResult (*bo_init_userptr)(struct tu_device *dev, struct tu_bo **out_bo,
++                               void *ptr, uint64_t size);
+    VkResult (*bo_alloc_lazy)(struct tu_device *dev, struct tu_bo *bo);
+    VkResult (*bo_map)(struct tu_device *dev, struct tu_bo *bo, void *placed_addr);
+    void (*bo_allow_dump)(struct tu_device *dev, struct tu_bo *bo);
+@@ -226,6 +229,12 @@ tu_bo_init_dmabuf(struct tu_device *dev,
+ int
+ tu_bo_export_dmabuf(struct tu_device *dev, struct tu_bo *bo);
+ 
++VkResult
++tu_bo_init_userptr(struct tu_device *dev,
++                   struct tu_bo **bo,
++                   void *ptr,
++                   uint64_t size);
++
+ void
+ tu_bo_finish(struct tu_device *dev, struct tu_bo *bo);
+ 
+diff --git a/src/freedreno/vulkan/tu_knl_sweet.cc b/src/freedreno/vulkan/tu_knl_sweet.cc
+index 80baf8e..b07481a 100644
+--- a/src/freedreno/vulkan/tu_knl_sweet.cc
++++ b/src/freedreno/vulkan/tu_knl_sweet.cc
+@@ -168,6 +168,42 @@ sweet_bo_init_dmabuf(struct tu_device *dev, struct tu_bo **out_bo,
+                     "sweet: memory import is not supported yet");
+ }
+ 
++/* VK_EXT_external_memory_host: the caller's pages, wired and mapped into
++ * the GPU by the kernel. The CPU side already has them at ptr. */
++static VkResult
++sweet_bo_init_userptr(struct tu_device *dev, struct tu_bo **out_bo,
++                      void *ptr, uint64_t size)
++{
++   struct sgpu_import_user req = {
++      .addr = (uintptr_t) ptr,
++      .size = size,
++   };
++   int ret = sgpu_import_user(sweet_dev(dev), &req);
++   if (ret) {
++      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                       "sweet: IMPORT_USER of %" PRIu64 " bytes at %p failed (%s)",
++                       size, ptr, strerror(-ret));
++   }
++
++   struct tu_bo *bo = tu_device_lookup_bo(dev, req.id);
++   assert(bo && bo->gem_handle == 0);
++
++   *bo = (struct tu_bo) {
++      .gem_handle = req.id,
++      .size = size,
++      .iova = req.gpuaddr,
++      .name = tu_debug_bos_add(dev, size, "host pointer"),
++      .refcnt = 1,
++      .sweet_map = ptr,
++   };
++   bo->never_unmap = true;      /* the caller's mapping, not ours */
++
++   tu_dump_bo_init(dev, bo);
++   *out_bo = bo;
++   TU_RMV(bo_allocate, dev, bo);
++   return VK_SUCCESS;
++}
++
+ static int
+ sweet_bo_export_dmabuf(struct tu_device *dev, struct tu_bo *bo)
+ {
+@@ -741,6 +777,7 @@ static const struct tu_knl sweet_knl_funcs = {
+       .bo_init = sweet_bo_init,
+       .bo_init_dmabuf = sweet_bo_init_dmabuf,
+       .bo_export_dmabuf = sweet_bo_export_dmabuf,
++      .bo_init_userptr = sweet_bo_init_userptr,
+       .bo_map = sweet_bo_map,
+       .bo_allow_dump = sweet_bo_allow_dump,
+       .bo_finish = sweet_bo_finish,
