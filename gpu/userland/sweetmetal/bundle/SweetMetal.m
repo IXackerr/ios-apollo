@@ -488,6 +488,7 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 	smtl_cmdbuf *_c;
 	id<MTLCommandQueue> _queue;
 	NSMutableArray<MTLCommandBufferHandler> *_scheduled;
+	dispatch_semaphore_t _slot;     /* the queue's in-flight slot this buffer holds */
 }
 @property (copy, atomic) NSString *label;
 @end
@@ -794,15 +795,26 @@ runHandler(void *ctx)
 static void
 countCompleted(void *ctx)
 {
-	(void)ctx;
 	__atomic_fetch_add(&smCompleted, 1, __ATOMIC_RELAXED);
+	if (ctx != NULL) {
+		dispatch_semaphore_signal((__bridge_transfer dispatch_semaphore_t)ctx);
+	}
 }
 
 - (void)commit
 {
-	/* every buffer reports its completion, for smstats */
-	smtl_cmdbuf_add_handler(_c, 0, countCompleted, NULL);
+	/* every buffer reports its completion, for smstats, and gives its
+	 * queue slot back then */
+	dispatch_semaphore_t slot = _slot;
+	if (smtl_cmdbuf_add_handler(_c, 0, countCompleted,
+	    slot ? (__bridge_retained void *)slot : NULL) == 0) {
+		_slot = nil;
+	}
 	if (smtl_cmdbuf_commit(_c) != 0) {
+		/* a refused commit runs no handler: the slot is free again */
+		if (slot != nil && _slot == nil) {
+			dispatch_semaphore_signal(slot);
+		}
 		SMError(@"commit");
 		return;
 	}
@@ -836,29 +848,57 @@ countCompleted(void *ctx)
 	 * once the command buffer completes (docs/METAL.md, drawables) */
 	[self addCompletedHandler:^(id<MTLCommandBuffer> cb) { [drawable present]; }];
 }
-- (void)dealloc { smtl_cmdbuf_release(_c); }
+- (void)dealloc
+{
+	/* never committed (or its handler not taken): give the slot back here */
+	if (_slot != nil) {
+		dispatch_semaphore_signal(_slot);
+	}
+	smtl_cmdbuf_release(_c);
+}
 @end
 
 @interface SweetMetalCommandQueue : SMBase <MTLCommandQueue> {
 @public
 	smtl_queue *_q;
 	id<MTLDevice> _device;
+	dispatch_semaphore_t _slots;
 }
 @property (copy, atomic) NSString *label;
 @end
 
 @implementation SweetMetalCommandQueue
 - (id<MTLDevice>)device { return _device; }
+/*
+ * As Metal's queue (maxCommandBufferCount), a new command buffer waits
+ * while too many of the queue's are not yet completed: the producer is
+ * paced by the GPU, and what in-flight buffers hold (staging copies of
+ * IOSurface textures among it) stays bounded.
+ */
+#define SM_IN_FLIGHT    4
+#define SM_SLOT_WAIT_MS 1000
+
 - (id<MTLCommandBuffer>)commandBuffer
 {
+	/* bounded, so that a client holding uncommitted buffers (or making
+	 * one in a completed handler) is slowed down, not stopped */
+	BOOL slot = dispatch_semaphore_wait(_slots,
+	    dispatch_time(DISPATCH_TIME_NOW, SM_SLOT_WAIT_MS * NSEC_PER_MSEC)) == 0;
+	if (!slot) {
+		SMLOG(@"commandBuffer: no slot free after %d ms", SM_SLOT_WAIT_MS);
+	}
 	smtl_cmdbuf *c = smtl_queue_command_buffer(_q);
 	if (c == NULL) {
+		if (slot) {
+			dispatch_semaphore_signal(_slots);
+		}
 		SMError(@"commandBuffer");
 		return nil;
 	}
 	SweetMetalCommandBuffer *cb = [SweetMetalCommandBuffer new];
 	cb->_c = c;
 	cb->_queue = self;
+	cb->_slot = slot ? _slots : nil;
 	return cb;
 }
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
@@ -1067,6 +1107,7 @@ processAllowed(void)
 	SweetMetalCommandQueue *queue = [SweetMetalCommandQueue new];
 	queue->_q = q;
 	queue->_device = self;
+	queue->_slots = dispatch_semaphore_create(SM_IN_FLIGHT);
 	return queue;
 }
 - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)n
