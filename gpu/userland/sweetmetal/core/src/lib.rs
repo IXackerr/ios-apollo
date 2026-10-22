@@ -17,7 +17,7 @@ use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::metal::{
     CompareFunction, CullMode, IndexType, PixelFormat, PrimitiveType, StencilOperation,
-    TextureUsage, TriangleFillMode, Winding,
+    TextureSwizzle, TextureSwizzleChannels, TextureType, TextureUsage, TriangleFillMode, Winding,
 };
 use metal2vulkan::pipeline::{
     ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor,
@@ -245,7 +245,103 @@ fn texture_descriptor(
         TextureDescriptor::texture_2d(pixel_format(pixel_format_raw)?, width, height, mipmapped);
     desc.usage = TextureUsage::try_from(usage).map_err(|e| format!("MTLTextureUsage: {e:?}"))?;
     desc.resource_options = resource_options(options)?;
+    // Apple's GPUs of the A11's generation compress nothing: a texture no command wrote reads
+    // zero there, where the runtime would show a newer GPU's magenta pattern.
+    desc.allow_gpu_optimized_contents = false;
     Ok(desc)
+}
+
+/// MTLTextureDescriptor, raw Metal values.
+#[repr(C)]
+pub struct SmtlTextureDesc {
+    texture_type: u32,
+    pixel_format: u32,
+    width: u64,
+    height: u64,
+    depth: u64,
+    mipmap_level_count: u64,
+    sample_count: u64,
+    array_length: u64,
+    usage: u32,
+    swizzle: [u8; 4],
+    resource_options: u64,
+}
+
+fn full_texture_descriptor(d: &SmtlTextureDesc) -> Result<TextureDescriptor, String> {
+    let mut desc = texture_descriptor(
+        d.pixel_format,
+        d.width,
+        d.height,
+        false,
+        d.usage,
+        d.resource_options,
+    )?;
+    desc.texture_type = TextureType::try_from(d.texture_type)
+        .map_err(|e| format!("MTLTextureType {}: {e:?}", d.texture_type))?;
+    desc.depth = d.depth.max(1);
+    desc.mipmap_level_count = d.mipmap_level_count.max(1);
+    desc.sample_count = d.sample_count.max(1);
+    desc.array_length = d.array_length.max(1);
+    let channel = |raw: u8| {
+        TextureSwizzle::try_from(raw as u32).map_err(|e| format!("MTLTextureSwizzle: {e:?}"))
+    };
+    desc.swizzle = TextureSwizzleChannels {
+        red: channel(d.swizzle[0])?,
+        green: channel(d.swizzle[1])?,
+        blue: channel(d.swizzle[2])?,
+        alpha: channel(d.swizzle[3])?,
+    };
+    Ok(desc)
+}
+
+/// `newTextureWithDescriptor:` with every field of the descriptor.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_device_new_texture(
+    d: *mut SmtlDevice,
+    desc: *const SmtlTextureDesc,
+) -> *mut Texture {
+    let d = handle!(d, std::ptr::null_mut());
+    let Some(desc) = desc.as_ref() else {
+        set_error("newTextureWithDescriptor: NULL descriptor".to_owned());
+        return std::ptr::null_mut();
+    };
+    boxed(
+        "newTextureWithDescriptor:",
+        full_texture_descriptor(desc)
+            .and_then(|desc| d.device.new_texture(&desc).map_err(|e| format!("{e:?}"))),
+    )
+}
+
+/// What a texture is, for its MTLTexture properties.
+#[repr(C)]
+pub struct SmtlTextureInfo {
+    texture_type: u32,
+    pixel_format: u32,
+    width: u64,
+    height: u64,
+    depth: u64,
+    mipmap_level_count: u64,
+    sample_count: u64,
+    array_length: u64,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smtl_texture_info(t: *const Texture, out: *mut SmtlTextureInfo) -> i32 {
+    let (Some(t), Some(out)) = (t.as_ref(), out.as_mut()) else {
+        set_error("smtl_texture_info: NULL".to_owned());
+        return -1;
+    };
+    *out = SmtlTextureInfo {
+        texture_type: t.texture_type().as_raw(),
+        pixel_format: t.pixel_format().as_raw(),
+        width: t.width(),
+        height: t.height(),
+        depth: t.depth(),
+        mipmap_level_count: t.mipmap_level_count(),
+        sample_count: t.sample_count(),
+        array_length: t.array_length(),
+    };
+    0
 }
 
 #[no_mangle]
@@ -984,6 +1080,115 @@ pub struct SmtlColorAttachment {
     pub load_action: u32,
     pub store_action: u32,
     pub clear: [f64; 4],
+}
+
+/// One attachment of MTLRenderPassDescriptor, raw Metal values: a color one's clear color in
+/// `clear`, a depth one's clear depth in `clear[0]`, a stencil one's clear value in `clear[0]`.
+#[repr(C)]
+pub struct SmtlAttachment {
+    pub texture: *mut Texture,
+    pub load_action: u32,
+    pub store_action: u32,
+    pub level: u32,
+    pub slice: u32,
+    pub depth_plane: u32,
+    pub resolve_level: u32,
+    pub resolve_texture: *mut Texture,
+    pub resolve_slice: u32,
+    pub resolve_depth_plane: u32,
+    pub clear: [f64; 4],
+}
+
+/// MTLRenderPassDescriptor.
+#[repr(C)]
+pub struct SmtlRenderPass {
+    pub colors: [SmtlAttachment; 8],
+    pub depth: SmtlAttachment,
+    pub stencil: SmtlAttachment,
+    pub render_target_array_length: u32,
+    pub render_target_width: u32,
+    pub render_target_height: u32,
+    pub default_raster_sample_count: u32,
+}
+
+fn actions(a: &SmtlAttachment) -> Result<(LoadAction, StoreAction), String> {
+    Ok((
+        LoadAction::from_raw(a.load_action as u64).map_err(|e| format!("MTLLoadAction: {e:?}"))?,
+        StoreAction::from_raw(a.store_action as u64)
+            .map_err(|e| format!("MTLStoreAction: {e:?}"))?,
+    ))
+}
+
+unsafe fn render_pass(p: &SmtlRenderPass) -> Result<RenderPassDescriptor, String> {
+    let mut pass = RenderPassDescriptor::new();
+    for (i, a) in p.colors.iter().enumerate() {
+        if a.texture.is_null() || i >= pass.color_attachments.len() {
+            continue;
+        }
+        let slot = &mut pass.color_attachments[i];
+        slot.texture = a.texture.as_ref().cloned();
+        (slot.load_action, slot.store_action) = actions(a)?;
+        slot.level = a.level as u64;
+        slot.slice = a.slice as u64;
+        slot.depth_plane = a.depth_plane as u64;
+        slot.resolve_texture = a.resolve_texture.as_ref().cloned();
+        slot.resolve_level = a.resolve_level as u64;
+        slot.resolve_slice = a.resolve_slice as u64;
+        slot.resolve_depth_plane = a.resolve_depth_plane as u64;
+        slot.clear_color = ClearColor::new(a.clear[0], a.clear[1], a.clear[2], a.clear[3]);
+    }
+    if !p.depth.texture.is_null() {
+        let (a, slot) = (&p.depth, &mut pass.depth_attachment);
+        slot.texture = a.texture.as_ref().cloned();
+        (slot.load_action, slot.store_action) = actions(a)?;
+        slot.level = a.level as u64;
+        slot.slice = a.slice as u64;
+        slot.depth_plane = a.depth_plane as u64;
+        slot.resolve_texture = a.resolve_texture.as_ref().cloned();
+        slot.resolve_level = a.resolve_level as u64;
+        slot.resolve_slice = a.resolve_slice as u64;
+        slot.resolve_depth_plane = a.resolve_depth_plane as u64;
+        slot.clear_depth = a.clear[0];
+    }
+    if !p.stencil.texture.is_null() {
+        let (a, slot) = (&p.stencil, &mut pass.stencil_attachment);
+        slot.texture = a.texture.as_ref().cloned();
+        (slot.load_action, slot.store_action) = actions(a)?;
+        slot.level = a.level as u64;
+        slot.slice = a.slice as u64;
+        slot.depth_plane = a.depth_plane as u64;
+        slot.resolve_texture = a.resolve_texture.as_ref().cloned();
+        slot.resolve_level = a.resolve_level as u64;
+        slot.resolve_slice = a.resolve_slice as u64;
+        slot.resolve_depth_plane = a.resolve_depth_plane as u64;
+        slot.clear_stencil = a.clear[0] as u32;
+    }
+    pass.render_target_array_length = p.render_target_array_length as u64;
+    pass.render_target_width = p.render_target_width as u64;
+    pass.render_target_height = p.render_target_height as u64;
+    pass.default_raster_sample_count = p.default_raster_sample_count as u64;
+    Ok(pass)
+}
+
+/// `renderCommandEncoderWithDescriptor:` with every attachment and its level and slice.
+#[no_mangle]
+pub unsafe extern "C" fn smtl_cmdbuf_render_pass_encoder(
+    c: *mut CommandBuffer,
+    p: *const SmtlRenderPass,
+) -> *mut SmtlRenderEncoder {
+    let c = handle!(c, std::ptr::null_mut());
+    let Some(p) = p.as_ref() else {
+        set_error("renderCommandEncoderWithDescriptor: NULL descriptor".to_owned());
+        return std::ptr::null_mut();
+    };
+    boxed(
+        "renderCommandEncoderWithDescriptor:",
+        render_pass(p).and_then(|pass| {
+            c.render_command_encoder(&pass)
+                .map(|e| SmtlRenderEncoder(Some(e)))
+                .map_err(|e| format!("{e:?}"))
+        }),
+    )
 }
 
 pub struct SmtlRenderEncoder(Option<RenderCommandEncoder>);

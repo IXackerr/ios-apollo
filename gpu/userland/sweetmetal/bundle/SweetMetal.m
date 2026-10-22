@@ -89,6 +89,13 @@ SMError(NSString *what)
 
 /* ---------------------------------------------------------------- */
 /* Unknown-selector logging (shared by every class)                 */
+/* a call into the runtime that it refused: logged, as Metal's validation would stop it */
+#define SMCHECK(call) do { \
+	if ((call) != 0) { \
+		SMError(@#call); \
+	} \
+} while (0)
+
 /* ---------------------------------------------------------------- */
 
 @interface SMBase : NSObject
@@ -296,6 +303,9 @@ smstats(void)
 	id _image;                      /* SweetSurfaceImage the texture lies on */
 	uint8_t *_cpu;                  /* with _image: the texels in this process */
 	NSUInteger _cpuRow, _cpuTexel;  /* their bytes per row and per texel */
+	struct smtl_texture_info _info; /* what the runtime made (smTextureInfo) */
+	MTLStorageMode _storage;
+	MTLTextureSwizzleChannels _swizzle;
 }
 @property (copy, atomic) NSString *label;
 @end
@@ -305,16 +315,31 @@ smstats(void)
 - (MTLPixelFormat)pixelFormat { return _format; }
 - (NSUInteger)width { return _width; }
 - (NSUInteger)height { return _height; }
-- (NSUInteger)depth { return 1; }
-- (NSUInteger)mipmapLevelCount { return 1; }
-- (NSUInteger)arrayLength { return 1; }
-- (NSUInteger)sampleCount { return 1; }
-- (MTLTextureType)textureType { return MTLTextureType2D; }
+- (NSUInteger)depth { return _info.depth ? _info.depth : 1; }
+- (NSUInteger)mipmapLevelCount { return _info.mipmap_level_count ? _info.mipmap_level_count : 1; }
+- (NSUInteger)arrayLength { return _info.array_length ? _info.array_length : 1; }
+- (NSUInteger)sampleCount { return _info.sample_count ? _info.sample_count : 1; }
+- (MTLTextureType)textureType
+{
+	return _info.mipmap_level_count ? (MTLTextureType)_info.texture_type : MTLTextureType2D;
+}
+- (MTLTextureSwizzleChannels)swizzle
+{
+	if (_swizzle.red == 0 && _swizzle.green == 0 && _swizzle.blue == 0 && _swizzle.alpha == 0) {
+		return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
+		    MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
+	}
+	return _swizzle;
+}
+- (BOOL)allowGPUOptimizedContents { return NO; }
 - (MTLTextureUsage)usage { return _usage; }
 - (IOSurfaceRef)iosurface { return _iosurface; }
 - (NSUInteger)iosurfacePlane { return _plane; }
 - (BOOL)isFramebufferOnly { return NO; }
-- (MTLStorageMode)storageMode { return _iosurface ? MTLStorageModeShared : MTLStorageModePrivate; }
+- (MTLStorageMode)storageMode
+{
+	return _iosurface ? MTLStorageModeShared : _storage;
+}
 - (MTLCPUCacheMode)cpuCacheMode { return MTLCPUCacheModeDefaultCache; }
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
 - (uint64_t)protectionOptions { return 0; }
@@ -400,6 +425,23 @@ regionBytes(MTLRegion r, NSUInteger bpr, NSUInteger bpi)
 }
 @end
 
+/* A new texture object over t, its properties as the runtime made them. */
+static SweetMetalTexture *
+smTexture(smtl_texture *t, id<MTLDevice> device, MTLTextureDescriptor *desc)
+{
+	SweetMetalTexture *tex = [SweetMetalTexture new];
+	tex->_t = t;
+	tex->_device = device;
+	tex->_format = desc.pixelFormat;
+	tex->_width = desc.width;
+	tex->_height = desc.height;
+	tex->_usage = desc.usage;
+	tex->_storage = desc.storageMode;
+	tex->_swizzle = desc.swizzle;
+	smtl_texture_info(t, &tex->_info);
+	return tex;
+}
+
 /* textures over a buffer: after SweetMetalTexture, whose ivars they set */
 @implementation SweetMetalBuffer (Textures)
 - (id<MTLTexture>)newTextureOver:(MTLTextureDescriptor *)desc offset:(NSUInteger)off
@@ -419,6 +461,7 @@ regionBytes(MTLRegion r, NSUInteger bpr, NSUInteger bpi)
 	tex->_height = desc.height;
 	tex->_usage = desc.usage;
 	tex->_backing = self;
+	smtl_texture_info(tex->_t, &tex->_info);
 	return tex;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)desc offset:(NSUInteger)off
@@ -631,43 +674,43 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 @implementation SweetMetalRenderEncoder
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)s
 {
-	smtl_render_set_pipeline(_e, ((SweetMetalRenderPipelineState *)s)->_p);
+	SMCHECK(smtl_render_set_pipeline(_e, ((SweetMetalRenderPipelineState *)s)->_p));
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i
 {
-	smtl_render_set_vertex_buffer(_e, b ? ((SweetMetalBuffer *)b)->_b : NULL, o, (uint32_t)i);
+	SMCHECK(smtl_render_set_vertex_buffer(_e, b ? ((SweetMetalBuffer *)b)->_b : NULL, o, (uint32_t)i));
 }
 - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i
 {
-	smtl_render_set_fragment_buffer(_e, b ? ((SweetMetalBuffer *)b)->_b : NULL, o, (uint32_t)i);
+	SMCHECK(smtl_render_set_fragment_buffer(_e, b ? ((SweetMetalBuffer *)b)->_b : NULL, o, (uint32_t)i));
 }
 - (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i
 {
-	smtl_render_set_buffer_offset(_e, 0, o, (uint32_t)i);
+	SMCHECK(smtl_render_set_buffer_offset(_e, 0, o, (uint32_t)i));
 }
 - (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i
 {
-	smtl_render_set_buffer_offset(_e, 1, o, (uint32_t)i);
+	SMCHECK(smtl_render_set_buffer_offset(_e, 1, o, (uint32_t)i));
 }
 - (void)setVertexBytes:(const void *)b length:(NSUInteger)n atIndex:(NSUInteger)i
 {
-	smtl_render_set_bytes(_e, 0, b, n, (uint32_t)i);
+	SMCHECK(smtl_render_set_bytes(_e, 0, b, n, (uint32_t)i));
 }
 - (void)setFragmentBytes:(const void *)b length:(NSUInteger)n atIndex:(NSUInteger)i
 {
-	smtl_render_set_bytes(_e, 1, b, n, (uint32_t)i);
+	SMCHECK(smtl_render_set_bytes(_e, 1, b, n, (uint32_t)i));
 }
 - (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i
 {
-	smtl_render_set_vertex_texture(_e, t ? ((SweetMetalTexture *)t)->_t : NULL, (uint32_t)i);
+	SMCHECK(smtl_render_set_vertex_texture(_e, t ? ((SweetMetalTexture *)t)->_t : NULL, (uint32_t)i));
 }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i
 {
-	smtl_render_set_sampler(_e, 0, s ? ((SweetMetalSamplerState *)s)->_s : NULL, (uint32_t)i);
+	SMCHECK(smtl_render_set_sampler(_e, 0, s ? ((SweetMetalSamplerState *)s)->_s : NULL, (uint32_t)i));
 }
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i
 {
-	smtl_render_set_sampler(_e, 1, s ? ((SweetMetalSamplerState *)s)->_s : NULL, (uint32_t)i);
+	SMCHECK(smtl_render_set_sampler(_e, 1, s ? ((SweetMetalSamplerState *)s)->_s : NULL, (uint32_t)i));
 }
 /* SPI QuartzCore uses: a texture and its sampler in one call */
 - (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti
@@ -678,30 +721,30 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 }
 - (void)setViewport:(MTLViewport)v
 {
-	smtl_render_set_viewport(_e, v.originX, v.originY, v.width, v.height, v.znear, v.zfar);
+	SMCHECK(smtl_render_set_viewport(_e, v.originX, v.originY, v.width, v.height, v.znear, v.zfar));
 }
 - (void)setScissorRect:(MTLScissorRect)r
 {
-	smtl_render_set_scissor(_e, r.x, r.y, r.width, r.height);
+	SMCHECK(smtl_render_set_scissor(_e, r.x, r.y, r.width, r.height));
 }
 - (void)setCullMode:(MTLCullMode)m
 {
 	_cull = m;
-	smtl_render_set_raster(_e, (uint32_t)_cull, (uint32_t)_winding, (uint32_t)_fill);
+	SMCHECK(smtl_render_set_raster(_e, (uint32_t)_cull, (uint32_t)_winding, (uint32_t)_fill));
 }
 - (void)setFrontFacingWinding:(MTLWinding)w
 {
 	_winding = w;
-	smtl_render_set_raster(_e, (uint32_t)_cull, (uint32_t)_winding, (uint32_t)_fill);
+	SMCHECK(smtl_render_set_raster(_e, (uint32_t)_cull, (uint32_t)_winding, (uint32_t)_fill));
 }
 - (void)setTriangleFillMode:(MTLTriangleFillMode)f
 {
 	_fill = f;
-	smtl_render_set_raster(_e, (uint32_t)_cull, (uint32_t)_winding, (uint32_t)_fill);
+	SMCHECK(smtl_render_set_raster(_e, (uint32_t)_cull, (uint32_t)_winding, (uint32_t)_fill));
 }
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a
 {
-	smtl_render_set_blend_color(_e, r, g, b, a);
+	SMCHECK(smtl_render_set_blend_color(_e, r, g, b, a));
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)p indexCount:(NSUInteger)n
     indexType:(MTLIndexType)t indexBuffer:(id<MTLBuffer>)ib indexBufferOffset:(NSUInteger)o
@@ -728,32 +771,32 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 - (void)drawPrimitives:(MTLPrimitiveType)p vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n
     instanceCount:(NSUInteger)ic baseInstance:(NSUInteger)bi
 {
-	smtl_render_draw_primitives(_e, (uint32_t)p, s, n, ic, bi);
+	SMCHECK(smtl_render_draw_primitives(_e, (uint32_t)p, s, n, ic, bi));
 }
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)s
 {
-	smtl_render_set_depth_stencil_state(_e, s ? ((SweetMetalDepthStencilState *)s)->_s : NULL);
+	SMCHECK(smtl_render_set_depth_stencil_state(_e, s ? ((SweetMetalDepthStencilState *)s)->_s : NULL));
 }
 - (void)setStencilReferenceValue:(uint32_t)v
 {
-	smtl_render_set_stencil_reference(_e, v, v);
+	SMCHECK(smtl_render_set_stencil_reference(_e, v, v));
 }
 - (void)setStencilFrontReferenceValue:(uint32_t)front backReferenceValue:(uint32_t)back
 {
-	smtl_render_set_stencil_reference(_e, front, back);
+	SMCHECK(smtl_render_set_stencil_reference(_e, front, back));
 }
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i
 {
-	smtl_render_set_fragment_texture(_e, t ? ((SweetMetalTexture *)t)->_t : NULL, (uint32_t)i);
+	SMCHECK(smtl_render_set_fragment_texture(_e, t ? ((SweetMetalTexture *)t)->_t : NULL, (uint32_t)i));
 }
 - (void)drawPrimitives:(MTLPrimitiveType)p vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n
 {
-	smtl_render_draw_primitives(_e, (uint32_t)p, s, n, 1, 0);
+	SMCHECK(smtl_render_draw_primitives(_e, (uint32_t)p, s, n, 1, 0));
 }
 - (void)drawPrimitives:(MTLPrimitiveType)p vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n
     instanceCount:(NSUInteger)ic
 {
-	smtl_render_draw_primitives(_e, (uint32_t)p, s, n, ic, 0);
+	SMCHECK(smtl_render_draw_primitives(_e, (uint32_t)p, s, n, ic, 0));
 }
 - (void)endEncoding
 {
@@ -775,16 +818,16 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 - (void)copyFromBuffer:(id<MTLBuffer>)src sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)dst
     destinationOffset:(NSUInteger)dof size:(NSUInteger)size
 {
-	smtl_blit_copy_buffer(_e, ((SweetMetalBuffer *)src)->_b, so, ((SweetMetalBuffer *)dst)->_b,
-	    dof, size);
+	SMCHECK(smtl_blit_copy_buffer(_e, ((SweetMetalBuffer *)src)->_b, so, ((SweetMetalBuffer *)dst)->_b,
+	    dof, size));
 }
 - (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)slice
     sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)origin sourceSize:(MTLSize)size
     toBuffer:(id<MTLBuffer>)dst destinationOffset:(NSUInteger)off
     destinationBytesPerRow:(NSUInteger)bpr destinationBytesPerImage:(NSUInteger)bpi
 {
-	smtl_blit_copy_texture_to_buffer(_e, ((SweetMetalTexture *)src)->_t, slice, level, origin.x,
-	    origin.y, size.width, size.height, ((SweetMetalBuffer *)dst)->_b, off, bpr, bpi);
+	SMCHECK(smtl_blit_copy_texture_to_buffer(_e, ((SweetMetalTexture *)src)->_t, slice, level, origin.x,
+	    origin.y, size.width, size.height, ((SweetMetalBuffer *)dst)->_b, off, bpr, bpi));
 }
 - (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl
     sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)dst
@@ -805,7 +848,7 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 }
 - (void)endEncoding
 {
-	smtl_blit_end(_e);
+	SMCHECK(smtl_blit_end(_e));
 	_e = NULL;
 }
 @end
@@ -820,21 +863,21 @@ lookupConstant(void *ctx, const char *name, uint32_t index, uint32_t type, void 
 @implementation SweetMetalComputeEncoder
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)s
 {
-	smtl_compute_set_pipeline(_e, ((SweetMetalComputePipelineState *)s)->_p);
+	SMCHECK(smtl_compute_set_pipeline(_e, ((SweetMetalComputePipelineState *)s)->_p));
 }
 - (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i
 {
-	smtl_compute_set_buffer(_e, b ? ((SweetMetalBuffer *)b)->_b : NULL, o, (uint32_t)i);
+	SMCHECK(smtl_compute_set_buffer(_e, b ? ((SweetMetalBuffer *)b)->_b : NULL, o, (uint32_t)i));
 }
 - (void)dispatchThreads:(MTLSize)grid threadsPerThreadgroup:(MTLSize)tg
 {
-	smtl_compute_dispatch_threads(_e, grid.width, grid.height, grid.depth, tg.width, tg.height,
-	    tg.depth);
+	SMCHECK(smtl_compute_dispatch_threads(_e, grid.width, grid.height, grid.depth, tg.width, tg.height,
+	    tg.depth));
 }
 - (void)dispatchThreadgroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)tg
 {
-	smtl_compute_dispatch_threads(_e, groups.width * tg.width, groups.height * tg.height,
-	    groups.depth * tg.depth, tg.width, tg.height, tg.depth);
+	SMCHECK(smtl_compute_dispatch_threads(_e, groups.width * tg.width, groups.height * tg.height,
+	    groups.depth * tg.depth, tg.width, tg.height, tg.depth));
 }
 - (void)endEncoding
 {
@@ -857,16 +900,41 @@ runHandler(void *ctx)
 - (id<MTLCommandQueue>)commandQueue { return _queue; }
 - (id<MTLDevice>)device { return _queue.device; }
 - (MTLCommandBufferStatus)status { return (MTLCommandBufferStatus)smtl_cmdbuf_status(_c); }
+static void
+smAttachment(struct smtl_attachment *to, MTLRenderPassAttachmentDescriptor *a)
+{
+	to->texture = ((SweetMetalTexture *)a.texture)->_t;
+	to->load_action = (uint32_t)a.loadAction;
+	to->store_action = (uint32_t)a.storeAction;
+	to->level = (uint32_t)a.level;
+	to->slice = (uint32_t)a.slice;
+	to->depth_plane = (uint32_t)a.depthPlane;
+	if (a.resolveTexture != nil) {
+		to->resolve_texture = ((SweetMetalTexture *)a.resolveTexture)->_t;
+		to->resolve_level = (uint32_t)a.resolveLevel;
+		to->resolve_slice = (uint32_t)a.resolveSlice;
+		to->resolve_depth_plane = (uint32_t)a.resolveDepthPlane;
+	}
+}
+
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d
 {
-	struct smtl_color_attachment ca[8];
-	uint32_t n = 0;
+	struct smtl_render_pass pass = {
+		.render_target_array_length = (uint32_t)d.renderTargetArrayLength,
+		.render_target_width = (uint32_t)d.renderTargetWidth,
+		.render_target_height = (uint32_t)d.renderTargetHeight,
+		.default_raster_sample_count = (uint32_t)d.defaultRasterSampleCount,
+	};
 	for (uint32_t i = 0; i < 8; i++) {
 		MTLRenderPassColorAttachmentDescriptor *a = d.colorAttachments[i];
 		if (a.texture == nil) {
 			continue;
 		}
-		n = i + 1;
+		smAttachment(&pass.colors[i], a);
+		pass.colors[i].clear[0] = a.clearColor.red;
+		pass.colors[i].clear[1] = a.clearColor.green;
+		pass.colors[i].clear[2] = a.clearColor.blue;
+		pass.colors[i].clear[3] = a.clearColor.alpha;
 		SweetMetalTexture *t = (SweetMetalTexture *)a.texture;
 		if (t->_image != nil && t->_iosurface != NULL) {
 			uint32_t sid = IOSurfaceGetID(t->_iosurface);
@@ -878,14 +946,16 @@ runHandler(void *ctx)
 				_surfaces[_surfaceCount++] = sid;
 			}
 		}
-		ca[i] = (struct smtl_color_attachment){
-			.texture = ((SweetMetalTexture *)a.texture)->_t,
-			.load_action = (uint32_t)a.loadAction,
-			.store_action = (uint32_t)a.storeAction,
-			.clear = { a.clearColor.red, a.clearColor.green, a.clearColor.blue, a.clearColor.alpha },
-		};
 	}
-	smtl_render_encoder *e = smtl_cmdbuf_render_encoder(_c, ca, n);
+	if (d.depthAttachment.texture != nil) {
+		smAttachment(&pass.depth, d.depthAttachment);
+		pass.depth.clear[0] = d.depthAttachment.clearDepth;
+	}
+	if (d.stencilAttachment.texture != nil) {
+		smAttachment(&pass.stencil, d.stencilAttachment);
+		pass.stencil.clear[0] = d.stencilAttachment.clearStencil;
+	}
+	smtl_render_encoder *e = smtl_cmdbuf_render_pass_encoder(_c, &pass);
 	if (e == NULL) {
 		SMError(@"renderCommandEncoderWithDescriptor:");
 		return nil;
@@ -1417,20 +1487,26 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)desc
 {
-	smtl_texture *t = smtl_device_new_texture_2d(_d, (uint32_t)desc.pixelFormat, desc.width,
-	    desc.height, desc.mipmapLevelCount > 1, (uint32_t)desc.usage, desc.resourceOptions);
+	MTLTextureSwizzleChannels sw = desc.swizzle;
+	struct smtl_texture_desc d = {
+		.texture_type = (uint32_t)desc.textureType,
+		.pixel_format = (uint32_t)desc.pixelFormat,
+		.width = desc.width,
+		.height = desc.height,
+		.depth = desc.depth,
+		.mipmap_level_count = desc.mipmapLevelCount,
+		.sample_count = desc.sampleCount,
+		.array_length = desc.arrayLength,
+		.usage = (uint32_t)desc.usage,
+		.swizzle = { sw.red, sw.green, sw.blue, sw.alpha },
+		.resource_options = desc.resourceOptions,
+	};
+	smtl_texture *t = smtl_device_new_texture(_d, &d);
 	if (t == NULL) {
 		SMError(@"newTextureWithDescriptor:");
 		return nil;
 	}
-	SweetMetalTexture *tex = [SweetMetalTexture new];
-	tex->_t = t;
-	tex->_device = self;
-	tex->_format = desc.pixelFormat;
-	tex->_width = desc.width;
-	tex->_height = desc.height;
-	tex->_usage = desc.usage;
-	return tex;
+	return smTexture(t, self, desc);
 }
 
 /* The imports of the surfaces seen last, by key */
@@ -1498,6 +1574,7 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 	tex->_cpu = base;
 	tex->_cpuRow = bpr;
 	tex->_cpuTexel = IOSurfaceGetBytesPerElement(surface);
+	smtl_texture_info(tex->_t, &tex->_info);
 	return tex;
 }
 
@@ -1566,6 +1643,7 @@ wrapBuffer(SweetMetalDevice *d, smtl_buffer *b, MTLResourceOptions o)
 	tex->_iosurface = (IOSurfaceRef)CFRetain(surface);
 	tex->_plane = plane;
 	tex->_backing = backing;
+	smtl_texture_info(tex->_t, &tex->_info);
 	return tex;
 }
 

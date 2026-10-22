@@ -84,6 +84,22 @@ smtl_texture *smtl_buffer_new_texture(smtl_buffer *b, uint32_t pixel_format, uin
     uint64_t height, uint32_t usage, uint64_t offset, uint64_t bytes_per_row, int linear);
 void          smtl_texture_release(smtl_texture *t);
 
+/* MTLTextureDescriptor, raw Metal values */
+struct smtl_texture_desc {
+	uint32_t texture_type, pixel_format;
+	uint64_t width, height, depth, mipmap_level_count, sample_count, array_length;
+	uint32_t usage;
+	uint8_t  swizzle[4];            /* MTLTextureSwizzle of red, green, blue, alpha */
+	uint64_t resource_options;
+};
+smtl_texture *smtl_device_new_texture(smtl_device *d, const struct smtl_texture_desc *desc);
+/* what the runtime made, for the MTLTexture properties */
+struct smtl_texture_info {
+	uint32_t texture_type, pixel_format;
+	uint64_t width, height, depth, mipmap_level_count, sample_count, array_length;
+};
+int smtl_texture_info(const smtl_texture *t, struct smtl_texture_info *out);
+
 /* newTextureWithDescriptor:iosurface:plane: with no copy: a linear image over the surface's
  * pages (`size` bytes mapped at `pages`), its texels at offset/bytes_per_row. NULL where the
  * format or layout has none; the caller then uses smtl_buffer_new_iosurface_texture. */
@@ -215,6 +231,23 @@ struct smtl_color_attachment {
 };
 smtl_render_encoder *smtl_cmdbuf_render_encoder(smtl_cmdbuf *c,
     const struct smtl_color_attachment *colors, uint32_t color_count);
+/* one attachment of MTLRenderPassDescriptor: clear color, or clear depth / stencil in clear[0] */
+struct smtl_attachment {
+	smtl_texture *texture;
+	uint32_t      load_action, store_action;        /* MTLLoadAction, MTLStoreAction */
+	uint32_t      level, slice, depth_plane;
+	uint32_t      resolve_level;
+	smtl_texture *resolve_texture;
+	uint32_t      resolve_slice, resolve_depth_plane;
+	double        clear[4];
+};
+struct smtl_render_pass {
+	struct smtl_attachment colors[8];
+	struct smtl_attachment depth, stencil;
+	uint32_t render_target_array_length, render_target_width, render_target_height;
+	uint32_t default_raster_sample_count;
+};
+smtl_render_encoder *smtl_cmdbuf_render_pass_encoder(smtl_cmdbuf *c, const struct smtl_render_pass *p);
 int smtl_render_set_pipeline(smtl_render_encoder *e, smtl_render_pipeline *p);
 int smtl_render_set_vertex_buffer(smtl_render_encoder *e, smtl_buffer *b, uint64_t offset, uint32_t index);
 int smtl_render_set_fragment_buffer(smtl_render_encoder *e, smtl_buffer *b, uint64_t offset, uint32_t index);
