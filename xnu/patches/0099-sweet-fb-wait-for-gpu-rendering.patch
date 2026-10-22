@@ -1,0 +1,109 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -116,6 +116,7 @@
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
++	uint32_t      fBusyTicks;     /* ticks the latest frame waited for the GPU */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+@@ -123,7 +124,7 @@
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+-	void present(const uint8_t *rec);
++	bool present(const uint8_t *rec);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -268,7 +269,12 @@
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+-		fb->present(rec);
++		if (!fb->present(rec)) {
++			/* not rendered yet: show it (or a newer one) next tick */
++			IOLockLock(fb->fLock);
++			fb->fDirty = true;
++			IOLockUnlock(fb->fLock);
++		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -328,6 +334,25 @@
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 
++	/*
++	 * A swap names its surfaces as soon as their rendering is submitted:
++	 * wait while the GPU still writes one (a few ticks at most, should a
++	 * renderer go away without saying it is done).
++	 */
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		if (!(mask & (1u << layer)) || id == 0) {
++			continue;
++		}
++		SweetSurface *s = sweet_surface_copy(id);
++		bool busy = s != NULL && s->gpuWrites != 0;
++		OSSafeReleaseNULL(s);
++		if (busy && fBusyTicks < 6) {
++			fBusyTicks++;
++			return false;
++		}
++	}
++	fBusyTicks = 0;
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+@@ -422,6 +447,7 @@
+ 		}
+ 		s->release();
+ 	}
++	return true;
+ }
+ 
+ bool
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -14,6 +14,7 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <libkern/c++/OSObject.h>
++#include <libkern/OSAtomic.h>
+ #include <mach/mach_types.h>
+ 
+ #define SWEET_SURFACE_MAX_PLANES        20
+@@ -39,14 +40,30 @@
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	volatile UInt32           gpuWrites;    /* GPU work writing the pixels, in flight */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { gpuWrites = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+ 	uintptr_t kernelAddress();
+ };
+ 
++/*
++ * Count GPU work that writes the surface, submitted (+1) or complete (-1),
++ * as the GPU driver learns of it: the framebuffer does not show a surface
++ * the GPU is still rendering. Never below 0.
++ */
++static inline void
++sweet_surface_gpu_writes(SweetSurface *s, int32_t delta)
++{
++	UInt32 old, now;
++	do {
++		old = s->gpuWrites;
++		now = (int32_t)old + delta < 0 ? 0 : (UInt32)((int32_t)old + delta);
++	} while (!OSCompareAndSwap(old, now, &s->gpuWrites));
++}
++
+ /* Retained surface for an id, or NULL. */
+ SweetSurface *sweet_surface_copy(uint32_t id);
+ 
