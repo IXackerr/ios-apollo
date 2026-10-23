@@ -123,6 +123,9 @@ static smtl_device *smDev;      /* for smstats' work counts */
 static uint64_t smLatencySum, smLatencyMax;    /* commit to completion, mach ticks */
 static uint64_t smGpuSum, smGpuMax, smGpuCount; /* GPUEndTime - GPUStartTime, ns */
 static uint64_t smEncodeSum, smEncodeMax;      /* commandBuffer to commit, mach ticks */
+/* commit to GPUStartTime and GPUEndTime to the completed handler, ns (CLOCK_MONOTONIC_RAW,
+ * the runtime's host clock off macOS) */
+static uint64_t smStartLagSum, smDoneLagSum, smLagCount;
 
 /*
  * Which command buffers may still run, for what outlives the textures they
@@ -217,13 +220,17 @@ smstats(void)
 	uint64_t gmax = __atomic_exchange_n(&smGpuMax, 0, __ATOMIC_RELAXED);
 	uint64_t gn = __atomic_exchange_n(&smGpuCount, 0, __ATOMIC_RELAXED);
 	uint64_t esum = __atomic_exchange_n(&smEncodeSum, 0, __ATOMIC_RELAXED);
+	uint64_t ssum = __atomic_exchange_n(&smStartLagSum, 0, __ATOMIC_RELAXED);
+	uint64_t dsum = __atomic_exchange_n(&smDoneLagSum, 0, __ATOMIC_RELAXED);
+	uint64_t ln = __atomic_exchange_n(&smLagCount, 0, __ATOMIC_RELAXED);
 	uint64_t emax = __atomic_exchange_n(&smEncodeMax, 0, __ATOMIC_RELAXED);
 	NSMutableString *line = [NSMutableString stringWithFormat:
 	    @"%u commits (%.1f/s), encode %.1f ms (max %.1f), %u completed, latency %.1f ms "
-	    "(max %.1f), GPU %.1f ms (max %.1f), live:", commits, per_s, esum * ms / 50, emax * ms,
-	    done,
+	    "(max %.1f), GPU %.1f ms (max %.1f), commit-to-GPU %.1f ms, GPU-to-handler %.1f ms, "
+	    "live:", commits, per_s, esum * ms / 50, emax * ms, done,
 	    done > done_before ? sum * ms / (done - done_before) : 0, max * ms,
-	    gn ? gsum / 1e6 / gn : 0, gmax / 1e6];
+	    gn ? gsum / 1e6 / gn : 0, gmax / 1e6, ln ? ssum / 1e6 / ln : -1.0,
+	    ln ? dsum / 1e6 / ln : -1.0];
 	done_before = done;
 	@synchronized ([SMBase class]) {
 		for (NSString *k in [smLive.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
@@ -1187,6 +1194,7 @@ struct smDone {
 	void *slot;             /* retained dispatch_semaphore_t, or NULL */
 	uint64_t seq;
 	uint64_t committed;     /* mach_absolute_time */
+	uint64_t committedRaw;  /* CLOCK_MONOTONIC_RAW, ns */
 	int given;              /* the slot and seq went back already */
 	uint32_t surfaces[8];   /* IOSurfaces marked busy for the framebuffer */
 	unsigned surfaceCount;
@@ -1224,6 +1232,14 @@ countCompleted(void *ctx)
 	    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
 	}
 	double start, end;
+	uint64_t nowRaw = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+	if (d->cb != NULL && smtl_cmdbuf_gpu_times(d->cb, &start, &end) == 0 && end >= start &&
+	    start * 1e9 >= d->committedRaw && end * 1e9 <= nowRaw) {
+		__atomic_fetch_add(&smStartLagSum, (uint64_t)(start * 1e9) - d->committedRaw,
+		    __ATOMIC_RELAXED);
+		__atomic_fetch_add(&smDoneLagSum, nowRaw - (uint64_t)(end * 1e9), __ATOMIC_RELAXED);
+		__atomic_fetch_add(&smLagCount, 1, __ATOMIC_RELAXED);
+	}
 	if (d->cb != NULL && smtl_cmdbuf_gpu_times(d->cb, &start, &end) == 0 && end >= start) {
 		uint64_t gpu = (uint64_t)((end - start) * 1e9);
 		__atomic_fetch_add(&smGpuSum, gpu, __ATOMIC_RELAXED);
@@ -1258,6 +1274,7 @@ countCompleted(void *ctx)
 	d->slot = _slot ? (__bridge_retained void *)_slot : NULL;
 	d->seq = _seq;
 	d->committed = mach_absolute_time();
+	d->committedRaw = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
 	if (smtl_cmdbuf_add_handler(_c, 0, countCompleted, d) != 0) {
 		/* nothing will call it: keep the slot and seq for -dealloc */
 		if (d->slot != NULL) {
