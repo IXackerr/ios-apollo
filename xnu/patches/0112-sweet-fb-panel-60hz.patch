@@ -1,0 +1,118 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -68,6 +68,15 @@
+ #define INTF_FRAME_LINE_COUNT_EN        0x0a8
+ #define INTF_FRAME_COUNT                0x0ac
+ #define INTF_LINE_COUNT                 0x0b0
++#define INTF_CONFIG                     0x004
++#define  INTF_CONFIG_PROG_FETCH         (1u << 31)
++#define INTF_PROG_FETCH_START           0x170
++
++/* The DSI controller's video timing (/arm-io/disp0 "dsi-reg") */
++#define DSI_VIDEO_MODE_TOTAL            0x02c   /* (v total - 1) << 16 | (h total - 1) */
++#define DSI_TIMING_FLUSH                0x1e4
++#define CTL_INTF_FLUSH                  0x110
++#define CTL_FLUSH_INTF                  (1u << 31)
+ 
+ /*
+  * The display processor's source pipes and control paths (SDE, /arm-io/disp0
+@@ -128,6 +137,8 @@
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 	void scanoutSetup(IOService *provider);
++	bool panelRate(IOService *provider, volatile uint32_t *intf, uint32_t lines, uint32_t hperiod,
++	    uint64_t hz);
+ 	void flipSetup(IOService *provider);
+ 	void flipTo(uint32_t buffer);
+ 	void scanoutWaitBlanking();
+@@ -400,6 +411,69 @@
+ 	fPixels = fBuf[buffer];
+ }
+ 
++/*
++ * The panel's refresh rate (boot-arg sweetfb_panel_hz, default 60). apollo's
++ * panel runs at 144 Hz from the boot and changes rate by its vertical front
++ * porch alone (dfps_immediate_porch_mode_vfp, rates 144 to 30): the DSI
++ * controller's and the timing engine's frame lengths grow by the same
++ * lines, the visible ones unchanged. The iPhone X userland renders at 60
++ * at most. Returns whether the rate changed.
++ */
++bool
++AppleCLCD::panelRate(IOService *provider, volatile uint32_t *intf, uint32_t lines,
++    uint32_t hperiod, uint64_t hz)
++{
++	uint32_t want = 60;
++	PE_parse_boot_argn("sweetfb_panel_hz", &want, sizeof(want));
++	OSData *dsiReg = OSDynamicCast(OSData, provider->getProperty("dsi-reg"));
++	OSData *mdpReg = OSDynamicCast(OSData, provider->getProperty("mdp-reg"));
++	if (want == 0 || want + 5 >= hz || dsiReg == NULL || dsiReg->getLength() < 16 ||
++	    mdpReg == NULL || mdpReg->getLength() < 16) {
++		return false;
++	}
++	const uint64_t *d = (const uint64_t *)dsiReg->getBytesNoCopy();
++	const uint64_t *m = (const uint64_t *)mdpReg->getBytesNoCopy();
++	vm_offset_t dsiMap = ml_io_map((vm_offset_t)d[0], (vm_size_t)round_page(d[1]));
++	vm_offset_t mdp = ml_io_map((vm_offset_t)m[0], (vm_size_t)round_page(m[1]));
++	if (dsiMap == 0 || mdp == 0) {
++		return false;
++	}
++	volatile uint32_t *dsi = (volatile uint32_t *)dsiMap;
++	uint32_t total = dsi[DSI_VIDEO_MODE_TOTAL / 4];
++	if ((total >> 16) + 1 != lines) {
++		IOLog("SWEET FB: rate: DSI frame of %u lines, the timing engine's %u: unchanged\n",
++		    (total >> 16) + 1, lines);
++		return false;
++	}
++	volatile uint32_t *ctl = NULL;
++	for (unsigned i = 0; i < 6 && ctl == NULL; i++) {
++		volatile uint32_t *c = (volatile uint32_t *)(mdp + 0x2000 + 0x200 * i);
++		if (c[CTL_INTF_ACTIVE / 4] != 0) {
++			ctl = c;
++		}
++	}
++	uint32_t active = ctl != NULL ? ctl[CTL_INTF_ACTIVE / 4] : 0;
++	if (ctl == NULL) {
++		return false;
++	}
++	uint32_t newLines = (uint32_t)((uint64_t)lines * hz / want);
++	uint32_t delta = newLines - lines;
++	uint32_t config = intf[INTF_CONFIG / 4];
++	IOLog("SWEET FB: rate: %llu Hz to %u Hz, frame %u to %u lines, prefetch %s at %#x\n",
++	    hz, want, lines, newLines, (config & INTF_CONFIG_PROG_FETCH) ? "on" : "off",
++	    intf[INTF_PROG_FETCH_START / 4]);
++	dsi[DSI_VIDEO_MODE_TOTAL / 4] = ((newLines - 1) << 16) | (total & 0xffff);
++	dsi[DSI_TIMING_FLUSH / 4] = 1;
++	intf[INTF_VSYNC_PERIOD_F0 / 4] = newLines * hperiod;
++	if (config & INTF_CONFIG_PROG_FETCH) {
++		intf[INTF_PROG_FETCH_START / 4] += delta * hperiod;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ctl[CTL_INTF_FLUSH / 4] = active;
++	ctl[CTL_FLUSH / 4] = CTL_FLUSH_INTF;
++	return true;
++}
++
+ void
+ AppleCLCD::scanoutSetup(IOService *provider)
+ {
+@@ -439,6 +513,20 @@
+ 		IOLog("SWEET FB: scanout not followed: plain 60 Hz ticks\n");
+ 		return;
+ 	}
++	if (panelRate(provider, intf, lines, hperiod, (uint64_t)frames * 1000000000ull / ns)) {
++		/* measure the new rate */
++		lines = intf[INTF_VSYNC_PERIOD_F0 / 4] / hperiod;
++		IOSleep(100);
++		f0 = intf[INTF_FRAME_COUNT / 4];
++		t0 = mach_absolute_time();
++		IOSleep(500);
++		frames = intf[INTF_FRAME_COUNT / 4] - f0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		if (frames == 0) {
++			IOLog("SWEET FB: scanout stopped after the rate change\n");
++			return;
++		}
++	}
+ 	fLines = lines;
+ 	fActiveStart = vstart;
+ 	fActiveEnd = vend;

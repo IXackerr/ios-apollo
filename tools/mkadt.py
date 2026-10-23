@@ -111,6 +111,8 @@ BOARDS = {
         # the MDP (mdss_mdp@ae00000) and the boot framebuffer region
         # (cont_splash_region): the framebuffer flips between two frames
         mdp=(0x0ae00000, 0x30000),
+        # DSI0 (mdss_dsi_ctrl0@ae94000), the panel's link: its video timing
+        dsi=(0x0ae94000, 0x400),
         # cores in DT order: the boot core, the four Cortex-A77s, then the
         # other A55s, so that cpus=5 runs on the big cores and one little one
         cpu_order=[0, 4, 5, 6, 7, 1, 2, 3],
@@ -323,7 +325,8 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
         ] + ([('intf-reg', u64(*b['intf']))] if 'intf' in b else [])
-          + ([('mdp-reg', u64(*b['mdp'])), ('fb-region', u64(FB, FB_SIZE))] if 'mdp' in b else []))])
+          + ([('mdp-reg', u64(*b['mdp'])), ('fb-region', u64(FB, FB_SIZE))] if 'mdp' in b else [])
+          + ([('dsi-reg', u64(*b['dsi']))] if 'dsi' in b else []))])
 
     fbcon = node('sweet-fbcon', [
         ph(),
