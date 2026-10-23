@@ -1,0 +1,236 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -69,6 +69,17 @@
+ #define INTF_FRAME_COUNT                0x0ac
+ #define INTF_LINE_COUNT                 0x0b0
+ 
++/*
++ * The display processor's source pipes and control paths (SDE, /arm-io/disp0
++ * "mdp-reg"): offsets from the MDP base, as qcom,sde-sspp-off and
++ * qcom,sde-ctl-off give them, and each pipe's flush bit.
++ */
++#define SSPP_SRC0_ADDR                  0x014
++#define CTL_FLUSH                       0x018
++#define CTL_INTF_ACTIVE                 0x0f4
++static const uint32_t sspp_offs[] = { 0x5000, 0x7000, 0x9000, 0xb000, 0x25000, 0x27000, 0x29000, 0x2b000 };
++static const uint8_t sspp_flush[] = { 0, 1, 2, 18, 11, 12, 24, 25 };
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -117,6 +128,8 @@
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 	void scanoutSetup(IOService *provider);
++	void flipSetup(IOService *provider);
++	void flipTo(uint32_t buffer);
+ 	void scanoutWaitBlanking();
+ 	uint32_t nextTickUS();
+ 
+@@ -144,6 +157,20 @@
+ 	uint32_t      fActiveStart, fActiveEnd;     /* the visible lines */
+ 	uint32_t      fLineNS;        /* time per line */
+ 	uint32_t      fFrames;        /* panel frames per tick */
++	/*
++	 * Page flipping (flipSetup): two frames in the boot framebuffer's
++	 * memory, the panel scanning one while the next is copied into the
++	 * other, then flipped to at the next frame start.
++	 */
++	volatile uint32_t *fSsppAddr;   /* a pipe source address, NULL: copy in place */
++	volatile uint32_t *fSrc[8];     /* every source address that reads the frame */
++	uint32_t      fSrcDelta[8];     /* ... and where in it */
++	uint32_t      fSrcCount;
++	volatile uint32_t *fCtlFlush;
++	uint32_t      fFlushBit;
++	uint64_t      fBufPhys[2];
++	uintptr_t     fBuf[2];
++	uint32_t      fFront;
+ 	/* per 10 s, logged: swaps, frames shown, ticks a frame waited for the GPU, copy time */
+ 	uint32_t      fStatSwaps, fStatShown, fStatBusy;
+ 	uint64_t      fStatCopyNS, fStatStart;
+@@ -240,6 +267,7 @@
+ 	fGpuSnoops = coherent == 1;
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	scanoutSetup(provider);
++	flipSetup(provider);
+ 	fVsync->setTimeoutUS(nextTickUS());
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -259,6 +287,119 @@
+  * It writes rows several times faster than the panel fetches them, so it
+  * stays ahead of the fetch all the way down.
+  */
++/*
++ * Flip between two frames instead of copying into the one the panel scans:
++ * a copy made while the panel fetches the same lines showed parts of two
++ * frames. The boot framebuffer region (cont-splash, 23 MiB on apollo) holds
++ * two; the pipe that scans it (found by its source address) takes the other
++ * at the next frame start after a flush. sweetfb_flip=0 keeps copying in
++ * place.
++ */
++void
++AppleCLCD::flipSetup(IOService *provider)
++{
++	uint32_t flip = 1;
++	PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
++	OSData *mdp = OSDynamicCast(OSData, provider->getProperty("mdp-reg"));
++	OSData *region = OSDynamicCast(OSData, provider->getProperty("fb-region"));
++	if (!flip || mdp == NULL || mdp->getLength() < 16 || region == NULL ||
++	    region->getLength() < 16) {
++		return;
++	}
++	const uint64_t *r = (const uint64_t *)mdp->getBytesNoCopy();
++	const uint64_t *fbr = (const uint64_t *)region->getBytesNoCopy();
++	uint64_t frame = round_page((uint64_t)fRowBytes * fHeight);
++	if (fbr[0] != fPhys || fbr[1] < 2 * frame) {
++		IOLog("SWEET FB: flip: framebuffer region %#llx+%#llx holds no two frames\n",
++		    fbr[0], fbr[1]);
++		return;
++	}
++	vm_offset_t base = ml_io_map((vm_offset_t)r[0], (vm_size_t)round_page(r[1]));
++	if (base == 0) {
++		return;
++	}
++	/*
++	 * Every pipe plane address inside the frame: a panel wider than one
++	 * mixer takes a pipe per half (or a pipe's two rectangles), each
++	 * reading its columns of the same frame.
++	 */
++	volatile uint32_t *sspp = NULL;
++	uint32_t bit = 0;
++	fSrcCount = 0;
++	for (unsigned i = 0; i < sizeof(sspp_offs) / sizeof(sspp_offs[0]); i++) {
++		for (unsigned plane = 0; plane < 4; plane++) {
++			volatile uint32_t *p = (volatile uint32_t *)(base + sspp_offs[i] + SSPP_SRC0_ADDR +
++			    4 * plane);
++			uint32_t a = *p;
++			if (a >= (uint32_t)fPhys && a < (uint32_t)(fPhys + frame) && fSrcCount < 8) {
++				fSrc[fSrcCount] = p;
++				fSrcDelta[fSrcCount++] = a - (uint32_t)fPhys;
++				sspp = p;
++				bit |= 1u << sspp_flush[i];
++				IOLog("SWEET FB: flip: pipe at %#x plane %u reads the frame at +%#x\n",
++				    sspp_offs[i], plane, a - (uint32_t)fPhys);
++			}
++		}
++	}
++	volatile uint32_t *ctl = NULL;
++	for (unsigned i = 0; i < 6; i++) {
++		volatile uint32_t *c = (volatile uint32_t *)(base + 0x2000 + 0x200 * i);
++		uint32_t active = c[CTL_INTF_ACTIVE / 4];
++		if (active != 0 && ctl == NULL) {
++			ctl = c + CTL_FLUSH / 4;
++			IOLog("SWEET FB: flip: control path %u (interfaces %#x)\n", i, active);
++		}
++	}
++	if (sspp == NULL || ctl == NULL) {
++		IOLog("SWEET FB: flip: no pipe or control path found, copying in place\n");
++		return;
++	}
++	/* the second frame: copy the first into it, then check a flush latches */
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)(fPhys + frame),
++	    (IOByteCount)frame, kIODirectionInOut);
++	IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(md);
++	if (map == NULL) {
++		return;
++	}
++	fBufPhys[0] = fPhys;
++	fBufPhys[1] = fPhys + frame;
++	fBuf[0] = fPixels;
++	fBuf[1] = (uintptr_t)map->getVirtualAddress();
++	for (uint32_t y = 0; y < fHeight; y++) {
++		memcpy((void *)(fBuf[1] + (uint64_t)y * fRowBytes), (const void *)(fBuf[0] + (uint64_t)y * fRowBytes),
++		    (size_t)fWidth * 4);
++	}
++	fSsppAddr = sspp;
++	fCtlFlush = ctl;
++	fFlushBit = bit;
++	fFront = 0;
++	flipTo(1);
++	for (int i = 0; i < 50 && (*fCtlFlush & fFlushBit); i++) {
++		IOSleep(1);
++	}
++	if (*fCtlFlush & fFlushBit) {
++		IOLog("SWEET FB: flip: the flush did not latch (%#x), copying in place\n", *fCtlFlush);
++		fSsppAddr = NULL;
++		return;
++	}
++	IOLog("SWEET FB: flipping between %#llx and %#llx (pipe now at %#x)\n", fBufPhys[0], fBufPhys[1],
++	    *fSsppAddr);
++}
++
++/* Scan buffer next from the next frame start on. */
++void
++AppleCLCD::flipTo(uint32_t buffer)
++{
++	for (uint32_t i = 0; i < fSrcCount; i++) {
++		*fSrc[i] = (uint32_t)fBufPhys[buffer] + fSrcDelta[i];
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*fCtlFlush = fFlushBit;
++	fFront = buffer;
++	fPixels = fBuf[buffer];
++}
++
+ void
+ AppleCLCD::scanoutSetup(IOService *provider)
+ {
+@@ -317,11 +458,11 @@
+ 	IOLog("SWEET FB: following the scanout, %llu Hz, a tick every %u frames\n", hz, fFrames);
+ }
+ 
+-/* Spin (2 ms at most) until the panel fetches no visible line. */
++/* Spin (2 ms at most) until the panel fetches no visible line; flipping needs no wait. */
+ void
+ AppleCLCD::scanoutWaitBlanking()
+ {
+-	if (fIntf == NULL) {
++	if (fIntf == NULL || fSsppAddr != NULL) {
+ 		return;
+ 	}
+ 	uint64_t deadline;
+@@ -531,6 +672,19 @@
+ 		}
+ 	}
+ 
++	/*
++	 * Flipping: copy into the frame the panel does not scan, once the last
++	 * flip latched (the panel left it), and flip to it below.
++	 */
++	uintptr_t target = fPixels;
++	if (fSsppAddr != NULL) {
++		for (int i = 0; i < 20 && (*fCtlFlush & fFlushBit); i++) {
++			IODelay(500);
++		}
++		target = fBuf[fFront ^ 1];
++	}
++	bool copied = false;
++
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -611,7 +765,7 @@
+ 			/* dim: each channel shifted right by dim bits */
+ 			uint64_t keep = (uint64_t)((0xffu >> dim) * 0x01010101u) * 0x100000001ull;
+ 			for (int32_t y = 0; y < h; y++) {
+-				void *to = (void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4);
++				void *to = (void *)(target + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4);
+ 				const void *from = (const void *)(src + s->offset +
+ 				    (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
+ 				if (dim == 0) {
+@@ -624,9 +778,14 @@
+ 					t32[x] = (uint32_t)((f32[x] >> dim) & keep);
+ 				}
+ 			}
++			copied = true;
+ 		}
+ 		s->release();
+ 	}
++	if (fSsppAddr != NULL && copied) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		flipTo(fFront ^ 1);
++	}
+ 	if (dim == 0) {
+ 		IOLockLock(fLock);
+ 		if (rec != fShown) {

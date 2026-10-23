@@ -108,6 +108,12 @@ BOARDS = {
         # SDE INTF_1, the DSI panel's timing engine (mdss_mdp@ae00000,
         # qcom,sde-intf-off 0x6b800): the framebuffer follows its scanout
         intf=(0x0ae6b800, 0x800),
+        # the MDP (mdss_mdp@ae00000) and the boot framebuffer region
+        # (cont_splash_region): the framebuffer flips between two frames
+        mdp=(0x0ae00000, 0x30000),
+        # cores in DT order: the boot core, the four Cortex-A77s, then the
+        # other A55s, so that cpus=5 runs on the big cores and one little one
+        cpu_order=[0, 4, 5, 6, 7, 1, 2, 3],
     ),
 }
 
@@ -255,18 +261,21 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # SWEET SMP: all eight cores in physical-core order (0-5 Cortex-A55,
-    # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one
-    # and uses cpus=N to select an initial prefix (N <= 8).
+    # SWEET SMP: all eight cores, in physical-core order (sweet: 0-5
+    # Cortex-A55, 6-7 Cortex-A76) or the board's cpu_order, one homogeneous
+    # cluster. The kernel defaults to one and uses cpus=N to select an
+    # initial prefix (N <= 8): the scheduler knows no big and little cores,
+    # so a prefix of big ones keeps every thread on them.
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
-    for core in range(1 if qemu else 8):
-        cpu_nodes.append(node(f'cpu{core}', [
+    order = [0] if qemu else b.get('cpu_order', list(range(8)))
+    for index, core in enumerate(order):
+        cpu_nodes.append(node(f'cpu{index}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr(b['cpu_compat']) + cstr('ARM,v8')),
             ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
-            ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
+            ('cpu-id', u32(index)),  # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
             ('die-cluster-id', u32(0)),
@@ -313,7 +322,8 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', phys_base=None, m
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
-        ] + ([('intf-reg', u64(*b['intf']))] if 'intf' in b else []))])
+        ] + ([('intf-reg', u64(*b['intf']))] if 'intf' in b else [])
+          + ([('mdp-reg', u64(*b['mdp'])), ('fb-region', u64(FB, FB_SIZE))] if 'mdp' in b else []))])
 
     fbcon = node('sweet-fbcon', [
         ph(),
