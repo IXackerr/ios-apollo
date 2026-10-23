@@ -1,0 +1,50 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -791,23 +791,34 @@
+ 		break;
+ 	case kSweetFBSwapWait: {
+ 		/*
+-		 * Until the swap is shown: the panel scans the frame it was copied
+-		 * into, and the swap's surfaces may be drawn into again only once
+-		 * a later one is. 50 ms at most.
++		 * IOMobileFramebufferSwapWait(id, options, timeout ms). A swap is
++		 * complete once its frame is copied into the panel (or a later
++		 * one is): its surfaces may be drawn into again. Id 0 is every
++		 * swap made. Options bit 31 asks without waiting: CoreAnimation
++		 * keeps three pages in flight and polls this to recycle the older
++		 * ones, kIOReturnBusy meaning not yet; blocking there serialized
++		 * its frames. Otherwise wait, until the timeout if one is given.
+ 		 */
+ 		uint32_t id = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+-		static uint32_t logged;
+-		if (logged < 8) {
+-			logged++;
+-			IOLog("SWEET FB: SwapWait %u (%llu, %llu), shown %u\n", id,
+-			    args->scalarInputCount > 1 ? args->scalarInput[1] : 0,
+-			    args->scalarInputCount > 2 ? args->scalarInput[2] : 0, fFB->fShownSwap);
+-		}
++		bool poll = args->scalarInputCount > 1 && (args->scalarInput[1] & 0x80000000ull);
++		uint64_t ms = args->scalarInputCount > 2 && args->scalarInput[2] ? args->scalarInput[2] : 1000;
+ 		uint64_t deadline;
+-		clock_interval_to_deadline(50, NSEC_PER_MSEC, &deadline);
++		clock_interval_to_deadline((uint32_t)(ms > 1000 ? 1000 : ms), NSEC_PER_MSEC, &deadline);
+ 		IOLockLock(fFB->fLock);
+-		while (id != 0 && (int32_t)(fFB->fShownSwap - id) < 0 && !fFB->fPowerOff &&
+-		    mach_absolute_time() < deadline) {
++		for (;;) {
++			bool done = fFB->fPowerOff ||
++			    (id != 0 ? (int32_t)(fFB->fShownSwap - id) >= 0 : !fFB->fDirty);
++			if (done) {
++				break;
++			}
++			if (poll) {
++				ret = kIOReturnBusy;
++				break;
++			}
++			if (mach_absolute_time() >= deadline) {
++				ret = kIOReturnTimeout;
++				break;
++			}
+ 			IOLockSleepDeadline(fFB->fLock, &fFB->fShownSwap, deadline, THREAD_UNINT);
+ 		}
+ 		IOLockUnlock(fFB->fLock);
