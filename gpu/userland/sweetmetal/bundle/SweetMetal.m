@@ -1529,12 +1529,22 @@ processAllowed(void)
 		}
 		return YES;
 	}
+	/* names, "*" for every process, "-name" to leave one out */
 	NSData *d = CFBridgingRelease(v);
 	const char *p = d.bytes, *end = p + d.length, *me = getprogname();
+	BOOL all = NO;
 	for (; p < end; p += strlen(p) + 1) {
+		if (p[0] == '-' && strcmp(p + 1, me) == 0) {
+			SMLOG(@"no device for %s (left out in /sweet-metal processes)", me);
+			return NO;
+		}
 		if (strcmp(p, me) == 0) {
 			return YES;
 		}
+		all |= strcmp(p, "*") == 0;
+	}
+	if (all) {
+		return YES;
 	}
 	SMLOG(@"no device for %s (not in /sweet-metal processes)", me);
 	return NO;

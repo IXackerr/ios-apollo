@@ -28,7 +28,8 @@ Vulkan driver.
 --metal-file NAME=FILE (repeatable) adds /sweet-metal: the Metal driver
 the SweetMetal loader on the root unpacks (gpu/userland/sweetmetal/loader),
 the same encoding plus an "id" that changes with the files; with
---metal-processes only the processes named get a Metal device from it, and
+--metal-processes only the processes named get a Metal device from it ("*"
+for all, "-name" to leave one out), and
 --metal-env K=V,... sets environment variables (metal2vulkan's diagnostics)
 before the driver makes its device.
 
