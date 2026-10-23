@@ -1,0 +1,18 @@
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -106,6 +106,15 @@
+ {
+ 	sweet_surface_count(&s->gpuWrites, delta);
+ 	sweet_surface_publish_use(s);
++	/*
++	 * New contents: bump the seed (u32 at +0xc of the state page), as a
++	 * client's unlock after writing does. A reader that keeps a copy of
++	 * the surface (the Metal driver's optimal copies) sees the GPU writes
++	 * of other processes there.
++	 */
++	if (delta < 0 && s->state != NULL) {
++		OSIncrementAtomic((volatile SInt32 *)((uint8_t *)s->state->getBytesNoCopy() + 0xc));
++	}
+ }
+ 
+ /* Count GPU work that reads the surface, submitted (+1) or complete (-1). */
