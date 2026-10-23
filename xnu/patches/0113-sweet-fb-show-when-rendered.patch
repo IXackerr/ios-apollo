@@ -1,0 +1,203 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -133,9 +133,14 @@
+ 
+ 	IOWorkLoop         *fWorkLoop;
+ 	IOTimerEventSource *fVsync;
++	IOTimerEventSource *fReady;   /* shows a waiting frame as soon as it is rendered */
++	uint32_t            fTickPresent;   /* showPending runs for a vsync tick */
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	static void readyFired(OSObject *owner, IOTimerEventSource *sender);
++	static void surfaceReady(void);
++	void showPending();
+ 	void scanoutSetup(IOService *provider);
+ 	bool panelRate(IOService *provider, volatile uint32_t *intf, uint32_t lines, uint32_t hperiod,
+ 	    uint64_t hz);
+@@ -197,6 +202,8 @@
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++static AppleCLCD *sweet_fb_main;  /* the display surfaceReady wakes */
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -263,6 +270,10 @@
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
++	fReady = IOTimerEventSource::timerEventSource(this, &AppleCLCD::readyFired);
++	if (fReady != NULL && fWorkLoop->addEventSource(fReady) != kIOReturnSuccess) {
++		OSSafeReleaseNULL(fReady);
++	}
+ 	/*
+ 	 * 60 Hz: with the GPU rendering (sweetmetal=1) the copy is the only
+ 	 * work a frame costs the CPU. CPU rendering is better off with fewer
+@@ -279,6 +290,10 @@
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	scanoutSetup(provider);
+ 	flipSetup(provider);
++	if (fSsppAddr != NULL && fReady != NULL) {
++		sweet_fb_main = this;
++		sweet_surface_ready_hook = &AppleCLCD::surfaceReady;
++	}
+ 	fVsync->setTimeoutUS(nextTickUS());
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -635,8 +650,62 @@
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+-	uint8_t *rec = NULL;
++	IOLockUnlock(fb->fLock);
+ 	if (flush) {
++		fb->fTickPresent = 1;
++		fb->showPending();
++		fb->fTickPresent = 0;
++	}
++	uint64_t elapsed;
++	absolutetime_to_nanoseconds(mach_absolute_time() - fb->fStatStart, &elapsed);
++	if (elapsed >= 10ull * NSEC_PER_SEC) {
++		if (fb->fStatSwaps != 0) {
++			IOLog("SWEET FB: 10 s: %u swaps, %u frames shown (copy %llu us), %u ticks waited "
++			    "for the GPU\n", fb->fStatSwaps, fb->fStatShown,
++			    fb->fStatShown ? fb->fStatCopyNS / fb->fStatShown / 1000 : 0, fb->fStatBusy);
++		}
++		fb->fStatSwaps = fb->fStatShown = fb->fStatBusy = 0;
++		fb->fStatCopyNS = 0;
++		fb->fStatStart = mach_absolute_time();
++	}
++	sender->setTimeoutUS(fb->nextTickUS());
++}
++
++/*
++ * Flipping (flipSetup), a frame needs no particular moment to be copied: it
++ * is shown at the frame start after its flip. So a frame waiting for its
++ * rendering is shown as soon as the GPU is done (surfaceReady), and a frame
++ * already rendered as soon as it is swapped, instead of at the next tick.
++ */
++void
++AppleCLCD::surfaceReady(void)
++{
++	AppleCLCD *fb = sweet_fb_main;
++	if (fb != NULL && fb->fReady != NULL) {
++		fb->fReady->setTimeoutUS(1);
++	}
++}
++
++void
++AppleCLCD::readyFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	IOLockLock(fb->fLock);
++	bool show = fb->fDirty && !fb->fPowerOff;
++	IOLockUnlock(fb->fLock);
++	if (show) {
++		fb->showPending();
++	}
++}
++
++/* Show the latest swap, or keep it pending while the GPU still renders it. */
++void
++AppleCLCD::showPending()
++{
++	AppleCLCD *fb = this;
++	IOLockLock(fb->fLock);
++	uint8_t *rec = NULL;
++	if (fb->fDirty) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+@@ -660,19 +729,6 @@
+ 		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	uint64_t elapsed;
+-	absolutetime_to_nanoseconds(mach_absolute_time() - fb->fStatStart, &elapsed);
+-	if (elapsed >= 10ull * NSEC_PER_SEC) {
+-		if (fb->fStatSwaps != 0) {
+-			IOLog("SWEET FB: 10 s: %u swaps, %u frames shown (copy %llu us), %u ticks waited "
+-			    "for the GPU\n", fb->fStatSwaps, fb->fStatShown,
+-			    fb->fStatShown ? fb->fStatCopyNS / fb->fStatShown / 1000 : 0, fb->fStatBusy);
+-		}
+-		fb->fStatSwaps = fb->fStatShown = fb->fStatBusy = 0;
+-		fb->fStatCopyNS = 0;
+-		fb->fStatStart = mach_absolute_time();
+-	}
+-	sender->setTimeoutUS(fb->nextTickUS());
+ }
+ 
+ void
+@@ -720,6 +776,9 @@
+ 	fDirty = true;
+ 	fStatSwaps++;
+ 	IOLockUnlock(fLock);
++	if (fSsppAddr != NULL && fReady != NULL) {
++		fReady->setTimeoutUS(1);
++	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+@@ -744,7 +803,7 @@
+ 		bool busy = s != NULL && s->gpuWrites != 0;
+ 		OSSafeReleaseNULL(s);
+ 		if (busy && dim == 0 && fBusyTicks < 6) {
+-			fBusyTicks++;
++			fBusyTicks += fTickPresent;     /* only ticks count to the limit */
+ 			return false;
+ 		}
+ 	}
+@@ -766,8 +825,12 @@
+ 	 */
+ 	uintptr_t target = fPixels;
+ 	if (fSsppAddr != NULL) {
+-		for (int i = 0; i < 20 && (*fCtlFlush & fFlushBit); i++) {
+-			IODelay(500);
++		if (*fCtlFlush & fFlushBit) {
++			/* the last flip is still pending: the panel may scan either frame */
++			if (fReady != NULL) {
++				fReady->setTimeoutUS(1000);
++			}
++			return false;
+ 		}
+ 		target = fBuf[fFront ^ 1];
+ 	}
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -168,6 +168,8 @@
+ 	}
+ }
+ 
++void (*volatile sweet_surface_ready_hook)(void);
++
+ SweetSurface *
+ sweet_surface_copy(uint32_t id)
+ {
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -62,6 +62,12 @@
+ 	uintptr_t kernelAddress();
+ };
+ 
++/*
++ * Called (from any thread) when the GPU work writing a surface completed and
++ * none is left: the framebuffer shows a frame waiting for it at once.
++ */
++extern void (*volatile sweet_surface_ready_hook)(void);
++
+ /* Add delta to a count, never below 0. */
+ static inline void
+ sweet_surface_count(volatile UInt32 *count, int32_t delta)
+@@ -106,6 +112,10 @@
+ {
+ 	sweet_surface_count(&s->gpuWrites, delta);
+ 	sweet_surface_publish_use(s);
++	void (*ready)(void) = sweet_surface_ready_hook;
++	if (delta < 0 && s->gpuWrites == 0 && ready != NULL) {
++		ready();
++	}
+ 	/*
+ 	 * New contents: bump the seed (u32 at +0xc of the state page), as a
+ 	 * client's unlock after writing does. A reader that keeps a copy of
