@@ -1132,7 +1132,13 @@ smAttachment(struct smtl_attachment *to, MTLRenderPassAttachmentDescriptor *a)
 			while (k < _surfaceCount && _surfaces[k] != sid) {
 				k++;
 			}
-			if (k == _surfaceCount && k < 8) {
+			/*
+			 * Busy from now on, not from the commit: CoreAnimation swaps
+			 * a frame (and the framebuffer may show it) before it commits
+			 * the command buffer that renders it.
+			 */
+			if (k == _surfaceCount && k < 8 && smGpu != NULL &&
+			    sgpu_surface_busy(smGpu, sid, 1) == 0) {
 				_surfaces[_surfaceCount++] = sid;
 			}
 		}
@@ -1287,11 +1293,10 @@ countCompleted(void *ctx)
 		_seq = 0;
 		d->cb = smtl_cmdbuf_retain(_c);
 		/* the framebuffer shows these surfaces only once this completes */
-		for (unsigned i = 0; smGpu != NULL && i < _surfaceCount; i++) {
-			if (sgpu_surface_busy(smGpu, _surfaces[i], 1) == 0) {
-				d->surfaces[d->surfaceCount++] = _surfaces[i];
-			}
+		for (unsigned i = 0; i < _surfaceCount; i++) {
+			d->surfaces[d->surfaceCount++] = _surfaces[i];
 		}
+		_surfaceCount = 0;
 		/* and its clients do not draw into what it reads (IOSurfaceIsInUse) */
 		for (unsigned i = 0; smGpu != NULL && i < _readCount; i++) {
 			if (sgpu_surface_use(smGpu, _reads[i], 1) == 0) {
@@ -1364,6 +1369,9 @@ countCompleted(void *ctx)
 	smtl_cmdbuf_release(_c);
 	for (SweetSurfaceImage *im in _written) {
 		__atomic_fetch_sub(&im->_writers, 1, __ATOMIC_ACQ_REL);
+	}
+	for (unsigned i = 0; i < _surfaceCount; i++) {
+		sgpu_surface_busy(smGpu, _surfaces[i], -1);
 	}
 	if (_seq != 0) {
 		smSeqDone(_seq);
