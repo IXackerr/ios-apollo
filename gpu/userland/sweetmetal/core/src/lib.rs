@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use metal2vulkan::bind::SamplerDescriptor;
+use metal2vulkan::device::{ContainmentPolicy, GuestIsolation, Unorm8LinearFilterPolicy};
 use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::metal::{
@@ -111,6 +112,16 @@ pub unsafe extern "C" fn smtl_device_create(
     shader_cache_dir: *const c_char,
 ) -> *mut SmtlDevice {
     let mut options = DeviceOptions::default();
+    // The shaders are the system's own (CoreAnimation's, the system frameworks'), not an
+    // untrusted guest's: no containment of their accesses and no isolation between them, which
+    // cost every load, store and sample bounds checks. And the device's own linear filter of
+    // 8-bit textures where the runtime measured it within one code of Metal's. SWEETMETAL_SAFE
+    // keeps the untrusted-guest policy.
+    if std::env::var_os("SWEETMETAL_SAFE").is_none() {
+        options.policy.containment = ContainmentPolicy::UnsafeOff;
+        options.policy.isolation = GuestIsolation::Off;
+        options.policy.unorm8_linear_filter = Unorm8LinearFilterPolicy::DeviceWithinOneCode;
+    }
     if !vulkan_library.is_null() {
         options.loader = Some(PathBuf::from(
             CStr::from_ptr(vulkan_library)
