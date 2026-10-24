@@ -141,7 +141,13 @@ print_top(const char *what, int (*cmp)(const void *, const void *))
 				    info.dli_fname;
 			}
 		}
-		fprintf(stderr, "smprof %s %5.1f%% %s`%s\n", what, 100.0 * v / samples, image, name);
+		/* symbols the shared cache strips: the address, symbolized offline */
+		if (strcmp(name, "<redacted>") == 0 || strcmp(name, "?") == 0) {
+			fprintf(stderr, "smprof %s %5.1f%% %s`%#lx\n", what, 100.0 * v / samples, image,
+			    (unsigned long)sorted[i].addr);
+		} else {
+			fprintf(stderr, "smprof %s %5.1f%% %s`%s\n", what, 100.0 * v / samples, image, name);
+		}
 	}
 }
 
