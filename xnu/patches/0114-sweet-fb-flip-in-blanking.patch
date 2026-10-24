@@ -1,0 +1,102 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -186,7 +186,11 @@
+ 	uint32_t      fFlushBit;
+ 	uint64_t      fBufPhys[2];
+ 	uintptr_t     fBuf[2];
+-	uint32_t      fFront;
++	uint32_t      fFront;         /* the frame the panel scans (or will, once latched) */
++	bool          fBackReady;     /* the other frame holds the next frame to show */
++	uint32_t      fFlipFrame;     /* the timing engine's frame count at the last flip */
++	uint32_t      fFlipsLogged;
++	bool flipLatched();
+ 	/* per 10 s, logged: swaps, frames shown, ticks a frame waited for the GPU, copy time */
+ 	uint32_t      fStatSwaps, fStatShown, fStatBusy;
+ 	uint64_t      fStatCopyNS, fStatStart;
+@@ -413,6 +417,18 @@
+ 	    *fSsppAddr);
+ }
+ 
++/*
++ * The last flip is in effect: a frame started since (the pipe takes its
++ * address at a frame start) and the flush is consumed. Only then may the
++ * frame the panel left be written.
++ */
++bool
++AppleCLCD::flipLatched()
++{
++	return !(*fCtlFlush & fFlushBit) &&
++	    (fIntf == NULL || fIntf[INTF_FRAME_COUNT / 4] != fFlipFrame);
++}
++
+ /* Scan buffer next from the next frame start on. */
+ void
+ AppleCLCD::flipTo(uint32_t buffer)
+@@ -424,6 +440,16 @@
+ 	*fCtlFlush = fFlushBit;
+ 	fFront = buffer;
+ 	fPixels = fBuf[buffer];
++	if (fIntf != NULL) {
++		fFlipFrame = fIntf[INTF_FRAME_COUNT / 4];
++		if (fFlipsLogged < 12) {
++			fFlipsLogged++;
++			uint32_t line = fIntf[INTF_LINE_COUNT / 4], flush = *fCtlFlush;
++			IODelay(50);
++			IOLog("SWEET FB: flip at line %u (frame %u): flush %#x, 50 us later %#x line %u\n",
++			    line, fFlipFrame, flush, *fCtlFlush, fIntf[INTF_LINE_COUNT / 4]);
++		}
++	}
+ }
+ 
+ /*
+@@ -561,11 +587,11 @@
+ 	IOLog("SWEET FB: following the scanout, %llu Hz, a tick every %u frames\n", hz, fFrames);
+ }
+ 
+-/* Spin (2 ms at most) until the panel fetches no visible line; flipping needs no wait. */
++/* Spin (2 ms at most) until the panel fetches no visible line. */
+ void
+ AppleCLCD::scanoutWaitBlanking()
+ {
+-	if (fIntf == NULL || fSsppAddr != NULL) {
++	if (fIntf == NULL) {
+ 		return;
+ 	}
+ 	uint64_t deadline;
+@@ -600,6 +626,11 @@
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	fb->scanoutWaitBlanking();
++	/* the frame copied since the last tick, flipped to in the blanking */
++	if (fb->fSsppAddr != NULL && fb->fBackReady && fb->flipLatched()) {
++		fb->flipTo(fb->fFront ^ 1);
++		fb->fBackReady = false;
++	}
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	uint64_t values[6] = {
+@@ -821,12 +852,12 @@
+ 
+ 	/*
+ 	 * Flipping: copy into the frame the panel does not scan, once the last
+-	 * flip latched (the panel left it), and flip to it below.
++	 * flip is in effect (the panel left that frame); the next vsync tick
++	 * flips to it, in the vertical blanking.
+ 	 */
+ 	uintptr_t target = fPixels;
+ 	if (fSsppAddr != NULL) {
+-		if (*fCtlFlush & fFlushBit) {
+-			/* the last flip is still pending: the panel may scan either frame */
++		if (!flipLatched()) {
+ 			if (fReady != NULL) {
+ 				fReady->setTimeoutUS(1000);
+ 			}
+@@ -935,7 +966,7 @@
+ 	}
+ 	if (fSsppAddr != NULL && copied) {
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+-		flipTo(fFront ^ 1);
++		fBackReady = true;
+ 	}
+ 	if (dim == 0) {
+ 		IOLockLock(fLock);
