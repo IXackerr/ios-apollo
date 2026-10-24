@@ -122,12 +122,13 @@ by_total(const void *a, const void *b)
 }
 
 static void
-print_top(const char *what, int (*cmp)(const void *, const void *))
+print_top(const char *what, int (*cmp)(const void *, const void *), const char *only)
 {
 	static struct slot sorted[SLOTS];
 	memcpy(sorted, slots, sizeof(sorted));
 	qsort(sorted, SLOTS, sizeof(sorted[0]), cmp);
-	for (int i = 0; i < SHOW && sorted[i].addr != 0; i++) {
+	int shown = 0;
+	for (int i = 0; i < SLOTS && shown < SHOW && sorted[i].addr != 0; i++, shown++) {
 		uint32_t v = cmp == by_self ? sorted[i].self : sorted[i].total;
 		if (v == 0) {
 			break;
@@ -140,6 +141,11 @@ print_top(const char *what, int (*cmp)(const void *, const void *))
 				image = strrchr(info.dli_fname, '/') ? strrchr(info.dli_fname, '/') + 1 :
 				    info.dli_fname;
 			}
+		}
+		if (only != NULL && strcmp(image, only) != 0) {
+			sorted[i].addr = 0;     /* not shown: let the next take its place */
+			shown--;
+			continue;
 		}
 		/* symbols the shared cache strips: the address, symbolized offline */
 		if (strcmp(name, "<redacted>") == 0 || strcmp(name, "?") == 0) {
@@ -165,8 +171,10 @@ run(void *arg)
 		if (tick % 10000 == 0 && samples != 0) {
 			fprintf(stderr, "smprof: %u busy samples (%u waiting, %u lost) of the committing "
 			    "thread\n", samples, idle, lost);
-			print_top("self ", by_self);
-			print_top("total", by_total);
+			print_top("self ", by_self, NULL);
+			print_top("total", by_total, NULL);
+			/* the translation's own functions, callers and callees alike */
+			print_top("core ", by_total, "libsweetmetal_core.dylib");
 			memset(slots, 0, sizeof(slots));
 			samples = lost = idle = 0;
 		}
