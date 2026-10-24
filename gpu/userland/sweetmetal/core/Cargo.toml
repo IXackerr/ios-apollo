@@ -20,3 +20,7 @@ ash = { version = "0.38", default-features = false, features = ["std"] }
 
 [profile.release]
 panic = "abort"
+# The runtime's per-draw work is spread thin over many small functions across
+# its crates: whole-program optimization lets them inline into one another.
+lto = "fat"
+codegen-units = 1

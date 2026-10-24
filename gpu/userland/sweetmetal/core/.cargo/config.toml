@@ -1,0 +1,4 @@
+# The phone's big cores (Cortex-A77 and its prime twin, ARMv8.2-A with dot
+# products, half floats and RCpc): code for them, not for the A7 baseline.
+[target.aarch64-apple-ios]
+rustflags = ["-C", "target-cpu=cortex-a77"]
