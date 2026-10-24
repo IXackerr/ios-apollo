@@ -18,7 +18,7 @@
 
 #define SLOTS   4096
 #define DEPTH   48
-#define SHOW    25
+#define SHOW    45
 
 struct slot {
 	uintptr_t addr;         /* symbol start, 0 = free */
@@ -28,7 +28,7 @@ struct slot {
 
 static _Atomic thread_act_t target = MACH_PORT_NULL;
 static struct slot slots[SLOTS];
-static uint32_t samples, lost;
+static uint32_t samples, lost, idle;
 
 static struct slot *
 slot_for(uintptr_t pc)
@@ -81,6 +81,16 @@ sample(thread_act_t t)
 	thread_resume(t);
 	if (depth == 0) {
 		lost++;
+		return;
+	}
+	/* a thread waiting (for a message or a condition) does no work: count it apart */
+	Dl_info info;
+	if (dladdr((void *)pcs[0], &info) != 0 && info.dli_sname != NULL &&
+	    (strcmp(info.dli_sname, "mach_msg2_trap") == 0 ||
+	    strcmp(info.dli_sname, "__psynch_cvwait") == 0 ||
+	    strcmp(info.dli_sname, "__psynch_mutexwait") == 0 ||
+	    strcmp(info.dli_sname, "__semwait_signal") == 0)) {
+		idle++;
 		return;
 	}
 	samples++;
@@ -147,12 +157,12 @@ run(void *arg)
 			sample(t);
 		}
 		if (tick % 10000 == 0 && samples != 0) {
-			fprintf(stderr, "smprof: %u samples (%u lost) of the committing thread\n",
-			    samples, lost);
+			fprintf(stderr, "smprof: %u busy samples (%u waiting, %u lost) of the committing "
+			    "thread\n", samples, idle, lost);
 			print_top("self ", by_self);
 			print_top("total", by_total);
 			memset(slots, 0, sizeof(slots));
-			samples = lost = 0;
+			samples = lost = idle = 0;
 		}
 	}
 	return NULL;
